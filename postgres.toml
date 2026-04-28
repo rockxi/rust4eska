@@ -1,0 +1,12 @@
+[app]
+name = "postgres"
+node_selector = "home"
+
+[container]
+image = "postgres:latest"
+restart = "always"
+ports = ["5432:5432"]
+
+[env]
+POSTGRES_PASSWORD = "mysecretpassword"
+
