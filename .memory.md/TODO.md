@@ -29,6 +29,20 @@
 - [x] r4a-server не занимает порт 80 (только 8080)
 - [x] r4a-agent и r4a-tui обновлены на порт 8080
 
+## Каскадное обновление агентов
+
+- [x] r4a-server: эндпоинты /api/agent-binary, /api/agent-checksum, /api/update/*
+- [x] r4a-agent: auto-update loop (poll каждые 30 сек, self-replace + exit)
+- [x] r4a-tui: экран Update (t=test, u=trigger)
+- [x] Задеплоено на asus + home
+
+## TUI — Git экран
+
+- [x] r4a-server: GET /api/git/repos — листинг bare-репозиториев
+- [x] r4a-tui: Screen::Git — вкладка с именами и clone URL репозиториев
+- [x] r4a-server: POST /api/git/repos — создание нового bare-репозитория
+- [x] r4a-tui: клавиша `n` на Git-экране — ввод имени и создание репозитория
+
 ## Следующие шаги (backend)
 
 - [ ] r4a-store: Raft консенсус + Sled БД

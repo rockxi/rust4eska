@@ -1,7 +1,15 @@
 use anyhow::Result;
-use axum::{Json, Router, extract::State, http::StatusCode, routing::{any, get, post}};
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::State,
+    http::{StatusCode, header},
+    response::Response,
+    routing::{any, get, post},
+};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -95,11 +103,31 @@ struct PeerInfo {
     vram_total_mb: Option<u64>,
 }
 
+const AGENT_BINARY_PATH: &str = "/usr/local/bin/r4a-agent";
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum AgentUpdateStatus {
+    Unknown,
+    Pending,
+    Updating,
+    Updated,
+    Failed(String),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AgentUpdateState {
+    status: AgentUpdateStatus,
+    checksum: Option<String>,
+}
+
 #[derive(Clone)]
 struct AppState {
     master_pub_key: String,
     peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
     next_ip: Arc<Mutex<u8>>,
+    update_pending: Arc<Mutex<bool>>,
+    agent_update_states: Arc<Mutex<HashMap<String, AgentUpdateState>>>,
 }
 
 #[derive(Serialize)]
@@ -198,6 +226,8 @@ async fn init() -> Result<()> {
         master_pub_key: identity.public_key.clone(),
         peers: Arc::new(Mutex::new(peers_map)),
         next_ip: Arc::new(Mutex::new(next_ip)),
+        update_pending: Arc::new(Mutex::new(false)),
+        agent_update_states: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -205,6 +235,14 @@ async fn init() -> Result<()> {
         .route("/api/join", post(join_handler))
         .route("/api/nodes", get(nodes_handler))
         .route("/api/metrics", post(metrics_handler))
+        .route("/api/git/repos", get(git_repos_handler).post(git_create_repo_handler))
+        .route("/api/agent-binary", get(agent_binary_handler))
+        .route("/api/agent-checksum", get(agent_checksum_handler))
+        .route("/api/update/test", post(update_test_handler))
+        .route("/api/update/trigger", post(update_trigger_handler))
+        .route("/api/update/poll", get(update_poll_handler))
+        .route("/api/update/report", post(update_report_handler))
+        .route("/api/update/status", get(update_status_handler))
         .nest_service(
             "/git",
             Router::new()
@@ -346,6 +384,187 @@ fn query_vram() -> (Option<u64>, Option<u64>) {
         Some((u, t)) => (Some(u), Some(t)),
         None => (None, None),
     }
+}
+
+#[derive(Serialize)]
+struct RepoInfo {
+    name: String,
+    clone_url: String,
+}
+
+async fn git_repos_handler() -> Json<Vec<RepoInfo>> {
+    let git_root = r4a_git_registry::default_git_root();
+    let mut repos = vec![];
+    if let Ok(entries) = std::fs::read_dir(&git_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join("HEAD").exists() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let clone_url = format!("http://{}:{}/git/{}", MASTER_VPN_IP, API_PORT, name);
+                repos.push(RepoInfo { name, clone_url });
+            }
+        }
+    }
+    repos.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(repos)
+}
+
+#[derive(Deserialize)]
+struct CreateRepoRequest {
+    name: String,
+}
+
+async fn git_create_repo_handler(
+    Json(req): Json<CreateRepoRequest>,
+) -> Result<Json<RepoInfo>, (StatusCode, String)> {
+    let name = req.name.trim().to_string();
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, "invalid repo name".to_string()));
+    }
+    let repo_name = if name.ends_with(".git") { name.clone() } else { format!("{}.git", name) };
+    let path = r4a_git_registry::default_git_root().join(&repo_name);
+    if path.exists() {
+        return Err((StatusCode::CONFLICT, format!("repository '{}' already exists", repo_name)));
+    }
+    r4a_git_registry::init_repo(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let clone_url = format!("http://{}:{}/git/{}", MASTER_VPN_IP, API_PORT, repo_name);
+    info!("Created git repository: {}", repo_name);
+    Ok(Json(RepoInfo { name: repo_name, clone_url }))
+}
+
+fn sha256_file(path: &str) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+async fn agent_binary_handler() -> Response {
+    match tokio::fs::read(AGENT_BINARY_PATH).await {
+        Ok(data) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"r4a-agent\"",
+            )
+            .body(Body::from(data))
+            .unwrap(),
+        Err(e) => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from(format!("binary not found: {e}")))
+            .unwrap(),
+    }
+}
+
+#[derive(Serialize)]
+struct ChecksumResponse {
+    checksum: String,
+}
+
+async fn agent_checksum_handler() -> Result<Json<ChecksumResponse>, (StatusCode, String)> {
+    match sha256_file(AGENT_BINARY_PATH) {
+        Some(checksum) => Ok(Json(ChecksumResponse { checksum })),
+        None => Err((StatusCode::NOT_FOUND, "binary not found".to_string())),
+    }
+}
+
+#[derive(Serialize)]
+struct TestResponse {
+    ok: bool,
+    checksum: Option<String>,
+    message: String,
+}
+
+async fn update_test_handler() -> Json<TestResponse> {
+    match sha256_file(AGENT_BINARY_PATH) {
+        Some(checksum) => {
+            info!("Update test: agent binary ok, sha256={}", &checksum[..16]);
+            Json(TestResponse {
+                ok: true,
+                checksum: Some(checksum),
+                message: "binary OK".to_string(),
+            })
+        }
+        None => Json(TestResponse {
+            ok: false,
+            checksum: None,
+            message: format!("binary not found at {AGENT_BINARY_PATH}"),
+        }),
+    }
+}
+
+async fn update_trigger_handler(State(state): State<AppState>) -> StatusCode {
+    *state.update_pending.lock().unwrap() = true;
+    info!("Update triggered for all agents");
+    StatusCode::OK
+}
+
+#[derive(Serialize)]
+struct UpdatePollResponse {
+    update_pending: bool,
+    checksum: Option<String>,
+}
+
+async fn update_poll_handler(State(state): State<AppState>) -> Json<UpdatePollResponse> {
+    let update_pending = *state.update_pending.lock().unwrap();
+    let checksum = if update_pending { sha256_file(AGENT_BINARY_PATH) } else { None };
+    Json(UpdatePollResponse { update_pending, checksum })
+}
+
+#[derive(Deserialize)]
+struct UpdateReport {
+    agent_vpn_ip: String,
+    checksum: String,
+    status: String,
+}
+
+async fn update_report_handler(
+    State(state): State<AppState>,
+    Json(report): Json<UpdateReport>,
+) -> StatusCode {
+    let update_status = match report.status.as_str() {
+        "updated" => AgentUpdateStatus::Updated,
+        "updating" => AgentUpdateStatus::Updating,
+        "failed" => AgentUpdateStatus::Failed("reported failure".to_string()),
+        _ => AgentUpdateStatus::Unknown,
+    };
+    info!("Update report from {}: status={}", report.agent_vpn_ip, report.status);
+    state.agent_update_states.lock().unwrap().insert(
+        report.agent_vpn_ip,
+        AgentUpdateState { status: update_status, checksum: Some(report.checksum) },
+    );
+    StatusCode::OK
+}
+
+#[derive(Serialize)]
+struct UpdateStatusResponse {
+    master_checksum: Option<String>,
+    update_pending: bool,
+    agents: HashMap<String, AgentUpdateStateDto>,
+}
+
+#[derive(Serialize)]
+struct AgentUpdateStateDto {
+    status: String,
+    checksum: Option<String>,
+}
+
+async fn update_status_handler(State(state): State<AppState>) -> Json<UpdateStatusResponse> {
+    let master_checksum = sha256_file(AGENT_BINARY_PATH);
+    let update_pending = *state.update_pending.lock().unwrap();
+    let states = state.agent_update_states.lock().unwrap();
+    let agents = states.iter().map(|(ip, s)| {
+        let status_str = match &s.status {
+            AgentUpdateStatus::Unknown => "unknown",
+            AgentUpdateStatus::Pending => "pending",
+            AgentUpdateStatus::Updating => "updating",
+            AgentUpdateStatus::Updated => "updated",
+            AgentUpdateStatus::Failed(_) => "failed",
+        }.to_string();
+        (ip.clone(), AgentUpdateStateDto { status: status_str, checksum: s.checksum.clone() })
+    }).collect();
+    Json(UpdateStatusResponse { master_checksum, update_pending, agents })
 }
 
 fn get_external_ip() -> String {
