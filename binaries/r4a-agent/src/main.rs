@@ -64,6 +64,8 @@ enum ServiceAction {
     Enable {
         #[arg(long)]
         master: String,
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Остановить и удалить сервис
     Disable,
@@ -103,8 +105,11 @@ async fn main() -> Result<()> {
 fn handle_service(action: ServiceAction) -> Result<()> {
     let manager = r4a_service::ServiceManager::detect()?;
     match action {
-        ServiceAction::Enable { master } => {
-            let exec = format!("/usr/local/bin/r4a-agent connect --master {}", master);
+        ServiceAction::Enable { master, name } => {
+            let mut exec = format!("/usr/local/bin/r4a-agent connect --master {}", master);
+            if let Some(n) = name {
+                exec.push_str(&format!(" --name {}", n));
+            }
             manager.enable("r4a-agent", "r4a Agent Node", &exec)?;
         }
         ServiceAction::Disable => {

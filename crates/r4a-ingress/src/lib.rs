@@ -19,12 +19,19 @@ impl ProxyHttp for IngressProxy {
         if let Ok(Some(data)) = self.store.get("core", b"manifests") {
             if let Ok(manifests) = serde_json::from_slice::<HashMap<String, Manifest>>(&data) {
                 for manifest in manifests.values() {
-                    if host.starts_with(&manifest.app.name) {
+                    let match_domain = if let Some(ing) = &manifest.ingress {
+                        host == ing.domain || host.starts_with(&manifest.app.name)
+                    } else {
+                        host.starts_with(&manifest.app.name)
+                    };
+
+                    if match_domain {
+                        let target_port = manifest.ingress.as_ref().map(|i| i.container_port).unwrap_or(8080);
                         if let Ok(Some(nodes_data)) = self.store.get("core", b"peers") {
                             if let Ok(peers) = serde_json::from_slice::<HashMap<String, r4a_core::PeerInfo>>(&nodes_data) {
                                 for peer in peers.values() {
                                     if peer.name == manifest.app.node_selector || manifest.app.node_selector == "all" {
-                                        let target_addr = format!("{}:8080", peer.ip);
+                                        let target_addr = format!("{}:{}", peer.ip, target_port);
                                         return Ok(Box::new(HttpPeer::new(
                                             target_addr,
                                             false,

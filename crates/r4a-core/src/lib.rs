@@ -8,6 +8,7 @@ pub struct Manifest {
     pub app: AppConfig,
     pub container: Option<ContainerConfig>,
     pub systemd: Option<SystemdConfig>,
+    pub ingress: Option<IngressConfig>,
     #[serde(default)]
     pub env: HashMap<String, String>,
 }
@@ -16,6 +17,12 @@ pub struct Manifest {
 pub struct AppConfig {
     pub name: String,
     pub node_selector: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressConfig {
+    pub domain: String,
+    pub container_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

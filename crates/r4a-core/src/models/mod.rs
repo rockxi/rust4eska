@@ -19,6 +19,7 @@ pub struct PeerInfo {
     pub ram_total_mb: Option<u64>,
     pub vram_used_mb: Option<u64>,
     pub vram_total_mb: Option<u64>,
+    pub last_seen: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,4 +80,5 @@ pub struct NodeInfo {
     pub ram_total_mb: Option<u64>,
     pub vram_used_mb: Option<u64>,
     pub vram_total_mb: Option<u64>,
+    pub last_seen: Option<u64>,
 }

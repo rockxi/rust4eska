@@ -21,10 +21,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 use sysinfo::System;
-use tracing::{info, warn};
+use tracing::{info, warn, error, debug};
 
 const WG_PORT: u16 = 51820;
 const API_PORT: u16 = 8080;
+const INGRESS_PORT: u16 = 8000;
 
 fn state_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -225,6 +226,10 @@ async fn join_master(first_master_url: &str, name: Option<String>) -> Result<()>
 async fn init(my_vpn_ip: &str, _store: Option<Store>) -> Result<()> {
     let identity = load_identity()?;
     let store = Store::open(state_dir().join("db"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     let mut peers = load_peers(&store);
     let my_endpoint = format!("{}:{}", get_external_ip(), WG_PORT);
@@ -244,6 +249,7 @@ async fn init(my_vpn_ip: &str, _store: Option<Store>) -> Result<()> {
                 ram_total_mb: None,
                 vram_used_mb: None,
                 vram_total_mb: None,
+                last_seen: Some(now),
             },
         );
         save_peers(&store, &peers).await;
@@ -327,6 +333,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
                 vram_used_mb,
                 vram_total_mb,
             };
+
             
             let masters: Vec<String> = {
                 let peers = broadcast_state.peers.lock().unwrap();
@@ -376,21 +383,36 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     let manifest_state = state.clone();
     tokio::spawn(async move {
         let repo_path = r4a_git_registry::default_git_root().join("manifests.git");
+        info!("Starting manifest parsing loop for {}", repo_path.display());
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            if let Ok(files) = r4a_git_registry::list_files(&repo_path, "main", ".toml") {
-                let mut current_manifests = HashMap::new();
-                for file in files {
-                    if let Ok(content) = r4a_git_registry::read_file(&repo_path, "main", &file) {
-                        if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
-                            current_manifests.insert(manifest.app.name.clone(), manifest);
+            match r4a_git_registry::list_files(&repo_path, "main", ".toml") {
+                Ok(files) => {
+                    let mut current_manifests = HashMap::new();
+                    for file in files {
+                        match r4a_git_registry::read_file(&repo_path, "main", &file) {
+                            Ok(content) => {
+                                match toml::from_str::<Manifest>(&content) {
+                                    Ok(manifest) => {
+                                        info!("Parsed manifest: {} for node: {}", manifest.app.name, manifest.app.node_selector);
+                                        current_manifests.insert(manifest.app.name.clone(), manifest);
+                                    }
+                                    Err(e) => warn!("Failed to parse manifest file {}: {}", file, e),
+                                }
+                            }
+                            Err(e) => warn!("Failed to read manifest file {}: {}", file, e),
+                        }
+                    }
+                    
+                    if !current_manifests.is_empty() {
+                        let json = serde_json::to_vec(&current_manifests).unwrap_or_default();
+                        if let Err(e) = manifest_state.store.put("core", b"manifests", &json).await {
+                            error!("Failed to save manifests to store: {}", e);
                         }
                     }
                 }
-                
-                if !current_manifests.is_empty() {
-                    let json = serde_json::to_vec(&current_manifests).unwrap_or_default();
-                    let _ = manifest_state.store.put("core", b"manifests", &json).await;
+                Err(e) => {
+                    debug!("Could not list manifest files: {}", e);
                 }
             }
         }
@@ -422,35 +444,30 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", API_PORT)).await?;
     info!("API listening on 0.0.0.0:{}", API_PORT);
 
-    if let Ok(ingress_listener) = tokio::net::TcpListener::bind(format!("{}:80", my_vpn_ip)).await {
-        info!("Ingress listening on {}:80", my_vpn_ip);
-        let app_for_ingress = app.clone();
-        tokio::spawn(async move {
-            let _ = axum::serve(ingress_listener, app_for_ingress).await;
-        });
-    } else {
-        warn!("Could not bind Ingress to {}:80 (port likely occupied). Use :8080", my_vpn_ip);
-    }
-
     info!("Public key: {}", identity.public_key);
     info!("My VPN IP: {}", my_vpn_ip);
     info!("Waiting for agents and other masters...");
 
     let pingora_store = store.clone();
-    let pingora_ip = my_vpn_ip.clone();
-    tokio::spawn(async move {
-        let mut my_server = pingora::server::Server::new(None).unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let mut my_server = pingora::server::Server::new(None).expect("Failed to create Pingora server");
         my_server.bootstrap();
         
         let mut proxy = pingora::proxy::http_proxy_service(
             &my_server.configuration,
             r4a_ingress::IngressProxy { store: pingora_store }
         );
-        proxy.add_tcp(&format!("{}:80", pingora_ip));
+        
+        let addr = format!("0.0.0.0:{}", INGRESS_PORT);
+        proxy.add_tcp(&addr);
         
         my_server.add_service(proxy);
+        info!("Pingora Ingress starting on {}", addr);
         my_server.run_forever();
     });
+
 
     axum::serve(listener, app.clone()).await?;
     Ok(())
@@ -500,6 +517,7 @@ async fn join_handler(
             ram_total_mb: None,
             vram_used_mb: None,
             vram_total_mb: None,
+            last_seen: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
         },
     );
 
@@ -523,11 +541,16 @@ async fn metrics_handler(
 ) -> StatusCode {
     let mut peers = state.peers.lock().unwrap();
     if let Some(peer) = peers.values_mut().find(|p| p.ip == report.agent_vpn_ip) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         peer.cpu_percent = Some(report.cpu_percent);
         peer.ram_used_mb = Some(report.ram_used_mb);
         peer.ram_total_mb = Some(report.ram_total_mb);
         peer.vram_used_mb = report.vram_used_mb;
         peer.vram_total_mb = report.vram_total_mb;
+        peer.last_seen = Some(now);
     }
     StatusCode::OK
 }
@@ -537,6 +560,10 @@ async fn nodes_handler(State(state): State<AppState>) -> Json<Vec<NodeInfo>> {
     sys.refresh_all();
     let master_name = System::host_name().unwrap_or_else(|| "master".to_string());
     let (master_vram_used, master_vram_total) = query_vram();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     let mut nodes = vec![NodeInfo {
         ip: state.my_vpn_ip.clone(),
@@ -547,10 +574,20 @@ async fn nodes_handler(State(state): State<AppState>) -> Json<Vec<NodeInfo>> {
         ram_total_mb: Some(sys.total_memory() / 1024 / 1024),
         vram_used_mb: master_vram_used,
         vram_total_mb: master_vram_total,
+        last_seen: Some(now),
     }];
 
     for peer in state.peers.lock().unwrap().values() {
         if peer.ip == state.my_vpn_ip { continue; } 
+        
+        if let Some(ls) = peer.last_seen {
+            if now - ls > 600 {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
         nodes.push(NodeInfo {
             ip: peer.ip.clone(),
             name: peer.name.clone(),
@@ -560,6 +597,7 @@ async fn nodes_handler(State(state): State<AppState>) -> Json<Vec<NodeInfo>> {
             ram_total_mb: peer.ram_total_mb,
             vram_used_mb: peer.vram_used_mb,
             vram_total_mb: peer.vram_total_mb,
+            last_seen: peer.last_seen,
         });
     }
 
