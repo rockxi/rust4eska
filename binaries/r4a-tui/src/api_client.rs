@@ -1,24 +1,7 @@
 use anyhow::Result;
+pub use r4a_core::{NodeInfo, RepoInfo};
 use serde::Deserialize;
 use std::collections::HashMap;
-
-#[derive(Deserialize, Clone)]
-pub struct NodeInfo {
-    pub ip: String,
-    pub name: String,
-    pub role: String,
-    pub cpu_percent: Option<f32>,
-    pub ram_used_mb: Option<u64>,
-    pub ram_total_mb: Option<u64>,
-    pub vram_used_mb: Option<u64>,
-    pub vram_total_mb: Option<u64>,
-}
-
-#[derive(Deserialize, Clone)]
-pub struct RepoInfo {
-    pub name: String,
-    pub clone_url: String,
-}
 
 #[derive(Deserialize, Clone)]
 pub struct AgentUpdateInfo {

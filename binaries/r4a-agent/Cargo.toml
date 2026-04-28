@@ -8,6 +8,8 @@ name = "r4a-agent"
 path = "src/main.rs"
 
 [dependencies]
+r4a-core = { workspace = true }
+r4a-worker = { workspace = true }
 r4a-vpn = { path = "../../crates/r4a-vpn" }
 tokio = { workspace = true }
 clap = { workspace = true }

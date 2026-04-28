@@ -5,6 +5,7 @@
 - **asus** (rockxi-zenbook) — master-нода, Ubuntu 24.04, kernel 6.17, Tailscale IP 100.97.158.58
 - **home** (DESKTOP-HIL871U) — agent-нода, Ubuntu 24.04 WSL2, kernel 6.6, Tailscale IP 100.116.148.12
 - SSH через Tailscale: `ssh asus` / `ssh home` (конфиг в ~/.ssh/config)
+- **Роли**: asus — единственный Master, home — Agent (multi-master конфигурация для home была отменена).
 
 ## Компиляция и деплой
 
@@ -90,6 +91,15 @@
 - VRAM через `nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits`
 - Если nvidia-smi нет — поля `null` / показывается `—` в TUI
 - asus: GPU 2048 MB VRAM; home: GPU 16311 MB VRAM
+
+## Реализация манифестов (2026-04-28)
+- Создан крейт `r4a-core` с моделями `Manifest`, `NodeInfo` и др.
+- Мастер автоматически парсит `.toml` файлы из `manifests.git` и сохраняет в Sled.
+- Агент (`r4a-agent`) использует `r4a-worker` (Bollard) для запуска контейнеров на основе манифестов.
+- Переход на **Pingora** в `r4a-server` для Ingress-проксирования.
+
+## Нюансы сборки
+- **Pingora** требует `cmake` для сборки зависимостей (zlib-ng). При деплое на хосты убедиться в наличии `cmake`.
 
 ## Имена нод
 

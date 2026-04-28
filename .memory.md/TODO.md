@@ -50,4 +50,5 @@
 - [x] r4a-store: Консенсус (Raft-lite) + Sled БД
 - [x] Multi-Master VPN: `r4a-server join-master`, репликация состояния по HTTP
 - [x] DNS Load Balancing: Агент прописывает все IP-адреса мастеров для `master.local`
+- [x] Перевести `home` из master обратно в agent
 - [ ] r4a-ingress: Pingora вместо Axum

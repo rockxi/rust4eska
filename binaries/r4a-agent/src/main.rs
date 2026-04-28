@@ -1,21 +1,17 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use r4a_core::{Identity, JoinRequest, JoinResponse, Manifest, MetricsReport};
+use r4a_worker::Reconciler;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use sysinfo::System;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 fn state_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home).join(".r4a-agent")
-}
-
-#[derive(Serialize, Deserialize)]
-struct Identity {
-    private_key: String,
-    public_key: String,
 }
 
 fn load_identity() -> Result<Identity> {
@@ -73,33 +69,6 @@ enum ServiceAction {
     Disable,
 }
 
-#[derive(Serialize)]
-struct JoinRequest {
-    pub_key: String,
-    name: String,
-    role: String,
-}
-
-#[derive(Deserialize, Clone)]
-#[allow(dead_code)]
-struct PeerInfo {
-    pub_key: String,
-    ip: String,
-    name: String,
-    role: String,
-    public_endpoint: Option<String>,
-}
-
-#[derive(Serialize)]
-struct MetricsReport {
-    agent_vpn_ip: String,
-    cpu_percent: f32,
-    ram_used_mb: u64,
-    ram_total_mb: u64,
-    vram_used_mb: Option<u64>,
-    vram_total_mb: Option<u64>,
-}
-
 fn query_vram() -> (Option<u64>, Option<u64>) {
     let out = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"])
@@ -118,14 +87,6 @@ fn query_vram() -> (Option<u64>, Option<u64>) {
     let used: Option<u64> = parts.next().and_then(|s| s.trim().parse().ok());
     let total: Option<u64> = parts.next().and_then(|s| s.trim().parse().ok());
     (used, total)
-}
-
-#[derive(Deserialize)]
-struct JoinResponse {
-    master_pub_key: String,
-    agent_vpn_ip: String,
-    master_endpoint: String,
-    peers: HashMap<String, PeerInfo>,
 }
 
 #[tokio::main]
@@ -166,8 +127,9 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
         .post(format!("{master_api}/api/join"))
         .json(&JoinRequest { 
             pub_key: identity.public_key.clone(), 
-            name: name.clone(),
-            role: "agent".to_string(),
+            name: Some(name.clone()),
+            role: Some("agent".to_string()),
+            public_endpoint: None,
         })
         .send()
         .await?
@@ -238,6 +200,32 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             if let Err(e) = check_and_apply_update(&update_client, &master_base, &update_vpn_ip).await {
                 warn!("Update check failed: {e}");
+            }
+        }
+    });
+
+    let reconcile_client = client.clone();
+    let reconciler_node_name = name.clone();
+    tokio::spawn(async move {
+        let reconciler = match Reconciler::new(reconciler_node_name.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to initialize Reconciler: {}", e);
+                return;
+            }
+        };
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            let url = format!("http://master.local:8080/api/manifests?node={}", reconciler_node_name);
+            match reconcile_client.get(&url).send().await {
+                Ok(resp) => {
+                    if let Ok(manifests) = resp.json::<HashMap<String, Manifest>>().await {
+                        if let Err(e) = reconciler.reconcile(manifests).await {
+                            error!("Reconcile error: {}", e);
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to fetch manifests: {}", e),
             }
         }
     });

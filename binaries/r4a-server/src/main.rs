@@ -1,13 +1,17 @@
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{header, StatusCode},
     response::Response,
     routing::{any, get, post},
     Json, Router,
 };
 use clap::{Parser, Subcommand};
+use r4a_core::{
+    AgentUpdateStatus, AgentUpdateState, Identity, JoinRequest, JoinResponse,
+    Manifest, MetricsReport, NodeInfo, PeerInfo,
+};
 use r4a_store::Store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,12 +29,6 @@ const API_PORT: u16 = 8080;
 fn state_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home).join(".r4a-server")
-}
-
-#[derive(Serialize, Deserialize)]
-struct Identity {
-    private_key: String,
-    public_key: String,
 }
 
 fn load_identity() -> Result<Identity> {
@@ -88,86 +86,7 @@ enum ServiceAction {
     Disable,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct PeerInfo {
-    pub_key: String,
-    ip: String,
-    name: String,
-    role: String, // "master" or "agent"
-    public_endpoint: Option<String>, // Для master-нод
-    cpu_percent: Option<f32>,
-    ram_used_mb: Option<u64>,
-    ram_total_mb: Option<u64>,
-    vram_used_mb: Option<u64>,
-    vram_total_mb: Option<u64>,
-}
-
 const AGENT_BINARY_PATH: &str = "/usr/local/bin/r4a-agent";
-
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum AgentUpdateStatus {
-    Unknown,
-    Pending,
-    Updating,
-    Updated,
-    Failed(String),
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct AgentUpdateState {
-    status: AgentUpdateStatus,
-    checksum: Option<String>,
-}
-
-#[derive(Clone)]
-struct AppState {
-    master_pub_key: String,
-    my_vpn_ip: String,
-    peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
-    next_ip: Arc<Mutex<u8>>,
-    update_pending: Arc<Mutex<bool>>,
-    agent_update_states: Arc<Mutex<HashMap<String, AgentUpdateState>>>,
-    store: Store,
-}
-
-#[derive(Serialize)]
-struct NodeInfo {
-    ip: String,
-    name: String,
-    role: String,
-    cpu_percent: Option<f32>,
-    ram_used_mb: Option<u64>,
-    ram_total_mb: Option<u64>,
-    vram_used_mb: Option<u64>,
-    vram_total_mb: Option<u64>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct JoinRequest {
-    pub_key: String,
-    name: Option<String>,
-    role: Option<String>,
-    public_endpoint: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct JoinResponse {
-    master_pub_key: String,
-    agent_vpn_ip: String,
-    master_endpoint: String,
-    peers: HashMap<String, PeerInfo>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct MetricsReport {
-    agent_vpn_ip: String,
-    cpu_percent: f32,
-    ram_used_mb: u64,
-    ram_total_mb: u64,
-    vram_used_mb: Option<u64>,
-    vram_total_mb: Option<u64>,
-}
 
 fn load_peers(store: &Store) -> HashMap<String, PeerInfo> {
     if let Ok(Some(data)) = store.get("core", b"peers") {
@@ -195,7 +114,19 @@ async fn save_peers(store: &Store, peers: &HashMap<String, PeerInfo>) {
     }
 }
 
+#[derive(Clone)]
+struct AppState {
+    master_pub_key: String,
+    my_vpn_ip: String,
+    peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
+    next_ip: Arc<Mutex<u8>>,
+    update_pending: Arc<Mutex<bool>>,
+    agent_update_states: Arc<Mutex<HashMap<String, AgentUpdateState>>>,
+    store: Store,
+}
+
 #[tokio::main]
+
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
@@ -442,11 +373,35 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         }
     });
 
+    let manifest_state = state.clone();
+    tokio::spawn(async move {
+        let repo_path = r4a_git_registry::default_git_root().join("manifests.git");
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            if let Ok(files) = r4a_git_registry::list_files(&repo_path, "main", ".toml") {
+                let mut current_manifests = HashMap::new();
+                for file in files {
+                    if let Ok(content) = r4a_git_registry::read_file(&repo_path, "main", &file) {
+                        if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
+                            current_manifests.insert(manifest.app.name.clone(), manifest);
+                        }
+                    }
+                }
+                
+                if !current_manifests.is_empty() {
+                    let json = serde_json::to_vec(&current_manifests).unwrap_or_default();
+                    let _ = manifest_state.store.put("core", b"manifests", &json).await;
+                }
+            }
+        }
+    });
+
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/join", post(join_handler))
         .route("/api/nodes", get(nodes_handler))
         .route("/api/metrics", post(metrics_handler))
+        .route("/api/manifests", get(manifests_handler))
         .route("/api/git/repos", get(git_repos_handler).post(git_create_repo_handler))
         .route("/api/agent-binary", get(agent_binary_handler))
         .route("/api/agent-checksum", get(agent_checksum_handler))
@@ -480,6 +435,22 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     info!("Public key: {}", identity.public_key);
     info!("My VPN IP: {}", my_vpn_ip);
     info!("Waiting for agents and other masters...");
+
+    let pingora_store = store.clone();
+    let pingora_ip = my_vpn_ip.clone();
+    tokio::spawn(async move {
+        let mut my_server = pingora::server::Server::new(None).unwrap();
+        my_server.bootstrap();
+        
+        let mut proxy = pingora::proxy::http_proxy_service(
+            &my_server.configuration,
+            r4a_ingress::IngressProxy { store: pingora_store }
+        );
+        proxy.add_tcp(&format!("{}:80", pingora_ip));
+        
+        my_server.add_service(proxy);
+        my_server.run_forever();
+    });
 
     axum::serve(listener, app.clone()).await?;
     Ok(())
@@ -593,6 +564,30 @@ async fn nodes_handler(State(state): State<AppState>) -> Json<Vec<NodeInfo>> {
     }
 
     Json(nodes)
+}
+
+#[derive(Deserialize)]
+struct ManifestsQuery {
+    node: Option<String>,
+}
+
+async fn manifests_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ManifestsQuery>,
+) -> Json<HashMap<String, Manifest>> {
+    if let Ok(Some(data)) = state.store.get("core", b"manifests") {
+        if let Ok(manifests) = serde_json::from_slice::<HashMap<String, Manifest>>(&data) {
+            if let Some(node_name) = query.node {
+                let filtered = manifests
+                    .into_iter()
+                    .filter(|(_, m)| m.app.node_selector == node_name || m.app.node_selector == "all")
+                    .collect();
+                return Json(filtered);
+            }
+            return Json(manifests);
+        }
+    }
+    Json(HashMap::new())
 }
 
 fn query_vram() -> (Option<u64>, Option<u64>) {
@@ -820,4 +815,26 @@ fn get_external_ip() -> String {
         return best_ip;
     }
     "127.0.0.1".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use r4a_core::Manifest;
+
+    #[test]
+    fn test_manifest_parsing() {
+        let content = r#"
+[app]
+name = "test-app"
+node_selector = "home"
+
+[container]
+image = "alpine"
+restart = "always"
+command = ["sleep", "1000"]
+"#;
+        let manifest: Manifest = toml::from_str(content).unwrap();
+        assert_eq!(manifest.app.name, "test-app");
+        assert_eq!(manifest.container.unwrap().image, "alpine");
+    }
 }

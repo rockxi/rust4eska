@@ -35,3 +35,37 @@ pub fn default_git_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home).join(".r4a-server").join("git")
 }
+
+pub fn list_files(repo_path: &Path, branch: &str, pattern: &str) -> Result<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo_path)
+        .args(["ls-tree", "-r", "--name-only", branch])
+        .output()
+        .context("git ls-tree")?;
+
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let files: Vec<String> = text
+        .lines()
+        .filter(|line| line.ends_with(pattern))
+        .map(|s| s.to_string())
+        .collect();
+    
+    Ok(files)
+}
+
+pub fn read_file(repo_path: &Path, branch: &str, file_path: &str) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repo_path)
+        .args(["show", &format!("{}:{}", branch, file_path)])
+        .output()
+        .context("git show")?;
+
+    anyhow::ensure!(out.status.success(), "git show failed for {}", file_path);
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}

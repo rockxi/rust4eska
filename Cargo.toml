@@ -4,11 +4,14 @@ members = [
     "crates/r4a-git-registry",
     "binaries/r4a-server",
     "binaries/r4a-agent",
-    "binaries/r4a-tui", "crates/r4a-store", "crates/r4a-service",
+    "binaries/r4a-tui", "crates/r4a-store", "crates/r4a-service", "crates/r4a-core", "crates/r4a-worker", "crates/r4a-ingress",
 ]
 resolver = "2"
 
 [workspace.dependencies]
+r4a-core = { path = "crates/r4a-core" }
+r4a-worker = { path = "crates/r4a-worker" }
+r4a-ingress = { path = "crates/r4a-ingress" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
 axum = "0.7"
@@ -22,3 +25,5 @@ sysinfo = "0.32"
 ratatui = "0.29"
 crossterm = "0.28"
 sha2 = "0.10"
+bollard = "0.18"
+pingora = { version = "0.4", features = ["lb"] }
