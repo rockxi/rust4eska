@@ -1,0 +1,13 @@
+[package]
+name = "r4a-git-registry"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
