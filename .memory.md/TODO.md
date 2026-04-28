@@ -3,8 +3,10 @@
 - [x] Очистить старый проект (r4e бинарники, wg0)
 - [x] Rust workspace r4a создан (r4a-server, r4a-agent, r4a-vpn)
 - [x] **WireGuard VPN**: asus=master(10.42.0.1), home=agent — поднимается автоматически бинарниками
-- [x] **Ingress**: r4a-server слушает 10.42.0.1:80 (встроенный axum, без nginx)
+- [x] **Ingress**: r4a-server пытается слушать 10.42.0.1:80 (для master.local)
+- [x] **DNS на master**: master.local → 10.42.0.1 теперь прописывается и на мастере в /etc/hosts
 - [x] **DNS на home**: master.local → 10.42.0.1 прописывается r4a-agent в /etc/hosts
+- [x] **Makefile**: Автоматизация сборки (musl), деплоя (scp) и перезапуска на asus/home
 - [x] Проверка: curl http://master.local с home → HTTP 200 ✓
 - [x] **TUI**: r4a-tui бинарник, Dashboard (CPU, RAM, VRAM, имя ноды), остальные экраны — заглушки
 - [x] **Метрики агента**: агент шлёт CPU/RAM/VRAM на мастер каждые 5 сек через POST /api/metrics
@@ -45,5 +47,7 @@
 
 ## Следующие шаги (backend)
 
-- [ ] r4a-store: Raft консенсус + Sled БД
+- [x] r4a-store: Консенсус (Raft-lite) + Sled БД
+- [x] Multi-Master VPN: `r4a-server join-master`, репликация состояния по HTTP
+- [x] DNS Load Balancing: Агент прописывает все IP-адреса мастеров для `master.local`
 - [ ] r4a-ingress: Pingora вместо Axum

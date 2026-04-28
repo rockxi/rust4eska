@@ -1,13 +1,14 @@
 use anyhow::Result;
 use axum::{
-    Json, Router,
     body::Body,
     extract::State,
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::Response,
     routing::{any, get, post},
+    Json, Router,
 };
 use clap::{Parser, Subcommand};
+use r4a_store::Store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,9 +17,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use sysinfo::System;
-use tracing::info;
+use tracing::{info, warn};
 
-const MASTER_VPN_IP: &str = "10.42.0.1";
 const WG_PORT: u16 = 51820;
 const API_PORT: u16 = 8080;
 
@@ -33,13 +33,6 @@ struct Identity {
     public_key: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct PersistedPeer {
-    pub_key: String,
-    ip: String,
-    name: String,
-}
-
 fn load_identity() -> Result<Identity> {
     let path = state_dir().join("identity.json");
     if path.exists() {
@@ -50,32 +43,14 @@ fn load_identity() -> Result<Identity> {
     }
     info!("Generating new WireGuard keypair...");
     let kp = r4a_vpn::wireguard::generate_keypair()?;
-    let id = Identity { private_key: kp.private, public_key: kp.public };
+    let id = Identity {
+        private_key: kp.private,
+        public_key: kp.public,
+    };
     std::fs::create_dir_all(state_dir())?;
     std::fs::write(&path, serde_json::to_string_pretty(&id)?)?;
     info!("Saved identity to {}", path.display());
     Ok(id)
-}
-
-fn load_peers() -> Vec<PersistedPeer> {
-    let path = state_dir().join("peers.json");
-    if !path.exists() {
-        return vec![];
-    }
-    match std::fs::read_to_string(&path).ok().and_then(|d| serde_json::from_str(&d).ok()) {
-        Some(peers) => peers,
-        None => vec![],
-    }
-}
-
-fn save_peers(peers: &HashMap<String, PeerInfo>) {
-    let path = state_dir().join("peers.json");
-    let list: Vec<PersistedPeer> = peers.values().map(|p| PersistedPeer {
-        pub_key: p.pub_key.clone(),
-        ip: p.ip.clone(),
-        name: p.name.clone(),
-    }).collect();
-    let _ = std::fs::write(&path, serde_json::to_string_pretty(&list).unwrap_or_default());
 }
 
 #[derive(Parser)]
@@ -87,15 +62,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Инициализировать master-ноду: поднять WireGuard и встроенный HTTP ingress
+    /// Инициализировать первую master-ноду
     Init,
+    /// Присоединить эту ноду как дополнительный master
+    JoinMaster {
+        #[arg(long)]
+        master: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Очистить список всех нод
+    PruneNodes,
+    /// Управление системным сервисом (systemd/launchd)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
 }
 
-#[derive(Clone)]
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Установить и запустить сервис
+    Enable,
+    /// Остановить и удалить сервис
+    Disable,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct PeerInfo {
     pub_key: String,
     ip: String,
     name: String,
+    role: String, // "master" or "agent"
+    public_endpoint: Option<String>, // Для master-нод
     cpu_percent: Option<f32>,
     ram_used_mb: Option<u64>,
     ram_total_mb: Option<u64>,
@@ -124,10 +123,12 @@ struct AgentUpdateState {
 #[derive(Clone)]
 struct AppState {
     master_pub_key: String,
+    my_vpn_ip: String,
     peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
     next_ip: Arc<Mutex<u8>>,
     update_pending: Arc<Mutex<bool>>,
     agent_update_states: Arc<Mutex<HashMap<String, AgentUpdateState>>>,
+    store: Store,
 }
 
 #[derive(Serialize)]
@@ -142,20 +143,23 @@ struct NodeInfo {
     vram_total_mb: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct JoinRequest {
     pub_key: String,
     name: Option<String>,
+    role: Option<String>,
+    public_endpoint: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct JoinResponse {
     master_pub_key: String,
     agent_vpn_ip: String,
     master_endpoint: String,
+    peers: HashMap<String, PeerInfo>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct MetricsReport {
     agent_vpn_ip: String,
     cpu_percent: f32,
@@ -165,58 +169,195 @@ struct MetricsReport {
     vram_total_mb: Option<u64>,
 }
 
+fn load_peers(store: &Store) -> HashMap<String, PeerInfo> {
+    if let Ok(Some(data)) = store.get("core", b"peers") {
+        if let Ok(peers) = serde_json::from_slice(&data) {
+            return peers;
+        }
+    }
+    HashMap::new()
+}
+
+async fn save_peers(store: &Store, peers: &HashMap<String, PeerInfo>) {
+    let json = serde_json::to_vec(peers).unwrap_or_default();
+    let _ = store.put("core", b"peers", &json).await;
+
+    let master_ips: Vec<String> = peers
+        .values()
+        .filter(|p| p.role == "master")
+        .map(|p| p.ip.clone())
+        .collect();
+    store.set_masters(master_ips.clone());
+    
+    let ips_ref: Vec<&str> = master_ips.iter().map(|s| s.as_str()).collect();
+    if !ips_ref.is_empty() {
+        let _ = r4a_vpn::dns::set_hosts_entries(&ips_ref, "master.local");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Init => init().await,
+        Cmd::Init => init("10.42.0.1", None).await,
+        Cmd::JoinMaster { master, name } => join_master(&master, name).await,
+        Cmd::PruneNodes => prune_nodes().await,
+        Cmd::Service { action } => handle_service(action),
     }
 }
 
-async fn init() -> Result<()> {
-    // Загружаем или создаём keypair (персистентный)
-    let identity = load_identity()?;
+async fn prune_nodes() -> Result<()> {
+    let store = Store::open(state_dir().join("db"))?;
+    let _ = store.delete("core", b"peers").await;
+    info!("Pruned all nodes from database. Master will need to be re-initialized.");
+    Ok(())
+}
 
-    // Загружаем сохранённых пиров
-    let saved_peers = load_peers();
-    if !saved_peers.is_empty() {
-        info!("Restoring {} peer(s) from disk", saved_peers.len());
+fn handle_service(action: ServiceAction) -> Result<()> {
+    let manager = r4a_service::ServiceManager::detect()?;
+    match action {
+        ServiceAction::Enable => {
+            let exec = format!("/usr/local/bin/r4a-server init");
+            manager.enable("r4a-server", "r4a Master Node", &exec)?;
+        }
+        ServiceAction::Disable => {
+            manager.disable("r4a-server")?;
+        }
     }
+    Ok(())
+}
 
-    // Поднимаем WireGuard с уже известными пирами
-    info!("Setting up WireGuard ({}:{})...", MASTER_VPN_IP, WG_PORT);
+async fn join_master(first_master_url: &str, name: Option<String>) -> Result<()> {
+    let identity = load_identity()?;
+    let my_endpoint = format!("{}:{}", get_external_ip(), WG_PORT);
+    let my_name = name.unwrap_or_else(|| {
+        System::host_name().unwrap_or_else(|| "master-node".to_string())
+    });
+
+    info!("Joining existing master at {}...", first_master_url);
+    let client = reqwest::Client::new();
+    let req = JoinRequest {
+        pub_key: identity.public_key.clone(),
+        name: Some(my_name.clone()),
+        role: Some("master".to_string()),
+        public_endpoint: Some(my_endpoint.clone()),
+    };
+
+    let resp: JoinResponse = client
+        .post(format!("{}/api/join", first_master_url))
+        .json(&req)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let my_vpn_ip = resp.agent_vpn_ip;
+    info!("Assigned VPN IP as master: {}", my_vpn_ip);
+
+    let store = Store::open(state_dir().join("db"))?;
+    save_peers(&store, &resp.peers).await;
+
+    let mut wg_peers = Vec::new();
+    for peer in resp.peers.values() {
+        if peer.pub_key != identity.public_key {
+            wg_peers.push((peer.pub_key.as_str(), peer.ip.as_str()));
+        }
+    }
+    
+    info!("Setting up WireGuard on {} with {} peers...", my_vpn_ip, wg_peers.len());
     r4a_vpn::wireguard::setup_master_with_peers(
         &identity.private_key,
-        MASTER_VPN_IP,
+        &my_vpn_ip,
         WG_PORT,
-        &saved_peers.iter().map(|p| (p.pub_key.as_str(), p.ip.as_str())).collect::<Vec<_>>(),
+        &wg_peers,
+    )?;
+    
+    // Parse the host from first_master_url
+    let master_host = first_master_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .unwrap_or("");
+        
+    let initial_endpoint = format!("{}:{}", master_host, WG_PORT);
+    
+    let _ = std::process::Command::new("wg")
+        .args(["set", "wg0", "peer", &resp.master_pub_key, "endpoint", &initial_endpoint])
+        .status();
+
+    start_server(identity, my_vpn_ip, store).await
+}
+
+async fn init(my_vpn_ip: &str, _store: Option<Store>) -> Result<()> {
+    let identity = load_identity()?;
+    let store = Store::open(state_dir().join("db"))?;
+
+    let mut peers = load_peers(&store);
+    let my_endpoint = format!("{}:{}", get_external_ip(), WG_PORT);
+    let my_name = System::host_name().unwrap_or_else(|| "master".to_string());
+
+    if !peers.contains_key(&identity.public_key) {
+        peers.insert(
+            identity.public_key.clone(),
+            PeerInfo {
+                pub_key: identity.public_key.clone(),
+                ip: my_vpn_ip.to_string(),
+                name: my_name.clone(),
+                role: "master".to_string(),
+                public_endpoint: Some(my_endpoint.clone()),
+                cpu_percent: None,
+                ram_used_mb: None,
+                ram_total_mb: None,
+                vram_used_mb: None,
+                vram_total_mb: None,
+            },
+        );
+        save_peers(&store, &peers).await;
+    }
+
+    let saved_peers = load_peers(&store);
+    info!("Loaded {} peers from store", saved_peers.len());
+    save_peers(&store, &saved_peers).await;
+
+    let mut wg_peers = Vec::new();
+    for peer in saved_peers.values() {
+        if peer.pub_key != identity.public_key {
+            wg_peers.push((peer.pub_key.as_str(), peer.ip.as_str()));
+        }
+    }
+
+    info!("Setting up WireGuard on {} with {} peers...", my_vpn_ip, wg_peers.len());
+    r4a_vpn::wireguard::setup_master_with_peers(
+        &identity.private_key,
+        my_vpn_ip,
+        WG_PORT,
+        &wg_peers,
     )?;
 
-    // Инициализация git-хранилища манифестов
+    for peer in saved_peers.values() {
+        if peer.role == "master" && peer.pub_key != identity.public_key {
+            if let Some(endpoint) = &peer.public_endpoint {
+                let _ = std::process::Command::new("wg")
+                    .args(["set", "wg0", "peer", &peer.pub_key, "endpoint", endpoint])
+                    .status();
+            }
+        }
+    }
+
+    start_server(identity, my_vpn_ip.to_string(), store).await
+}
+
+async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Result<()> {
     let git_root = r4a_git_registry::default_git_root();
     let manifests_repo = git_root.join("manifests.git");
     r4a_git_registry::init_repo(&manifests_repo)?;
 
-    let master_endpoint = get_external_ip();
-    info!("Master external IP: {}", master_endpoint);
-
-    // Восстанавливаем состояние из сохранённых пиров
-    let peers_map: HashMap<String, PeerInfo> = saved_peers.iter().map(|p| {
-        (p.pub_key.clone(), PeerInfo {
-            pub_key: p.pub_key.clone(),
-            ip: p.ip.clone(),
-            name: p.name.clone(),
-            cpu_percent: None,
-            ram_used_mb: None,
-            ram_total_mb: None,
-            vram_used_mb: None,
-            vram_total_mb: None,
-        })
-    }).collect();
-
-    // next_ip = max(существующие IP) + 1
-    let next_ip = saved_peers.iter()
+    let saved_peers = load_peers(&store);
+    let next_ip = saved_peers
+        .values()
         .filter_map(|p| p.ip.split('.').last()?.parse::<u8>().ok())
         .max()
         .map(|m| m + 1)
@@ -224,11 +365,82 @@ async fn init() -> Result<()> {
 
     let state = AppState {
         master_pub_key: identity.public_key.clone(),
-        peers: Arc::new(Mutex::new(peers_map)),
+        my_vpn_ip: my_vpn_ip.clone(),
+        peers: Arc::new(Mutex::new(saved_peers)),
         next_ip: Arc::new(Mutex::new(next_ip)),
         update_pending: Arc::new(Mutex::new(false)),
         agent_update_states: Arc::new(Mutex::new(HashMap::new())),
+        store: store.clone(),
     };
+
+    let broadcast_state = state.clone();
+    tokio::spawn(async move {
+        use std::io::Write;
+        let mut log_file = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/metrics_debug.log").ok();
+        
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        let mut sys = System::new_all();
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            sys.refresh_all();
+            let (vram_used_mb, vram_total_mb) = query_vram();
+            
+            let report = MetricsReport {
+                agent_vpn_ip: broadcast_state.my_vpn_ip.clone(),
+                cpu_percent: sys.global_cpu_usage(),
+                ram_used_mb: sys.used_memory() / 1024 / 1024,
+                ram_total_mb: sys.total_memory() / 1024 / 1024,
+                vram_used_mb,
+                vram_total_mb,
+            };
+            
+            let masters: Vec<String> = {
+                let peers = broadcast_state.peers.lock().unwrap();
+                peers.values()
+                    .filter(|p| p.role == "master" && p.ip != broadcast_state.my_vpn_ip)
+                    .map(|p| p.ip.clone())
+                    .collect()
+            };
+
+            if let Some(f) = &mut log_file {
+                let _ = writeln!(f, "Broadcasting metrics to masters: {:?}", masters);
+            }
+
+            for master_ip in masters {
+                let res = client
+                    .post(format!("http://{master_ip}:8080/api/metrics"))
+                    .json(&report)
+                    .send()
+                    .await;
+                if let Some(f) = &mut log_file {
+                    let _ = writeln!(f, "Sent to {}: {:?}", master_ip, res.is_ok());
+                }
+            }
+        }
+    });
+
+    let hosts_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            let peers = hosts_state.peers.lock().unwrap().clone();
+            let master_ips: Vec<String> = peers
+                .values()
+                .filter(|p| p.role == "master")
+                .map(|p| p.ip.clone())
+                .collect();
+            
+            let ips_ref: Vec<&str> = master_ips.iter().map(|s| s.as_str()).collect();
+            if !ips_ref.is_empty() {
+                let _ = r4a_vpn::dns::set_hosts_entries(&ips_ref, "master.local");
+            }
+
+            hosts_state.store.set_masters(master_ips);
+        }
+    });
 
     let app = Router::new()
         .route("/", get(index_handler))
@@ -249,17 +461,27 @@ async fn init() -> Result<()> {
                 .route("/*path", any(r4a_git_registry::handler::git_handler))
                 .with_state(git_root),
         )
-        .with_state(state);
+        .with_state(state)
+        .merge(r4a_store::store_router(store.clone()));
 
-    let listener = tokio::net::TcpListener::bind(
-        format!("0.0.0.0:{}", API_PORT)
-    ).await?;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", API_PORT)).await?;
     info!("API listening on 0.0.0.0:{}", API_PORT);
+
+    if let Ok(ingress_listener) = tokio::net::TcpListener::bind(format!("{}:80", my_vpn_ip)).await {
+        info!("Ingress listening on {}:80", my_vpn_ip);
+        let app_for_ingress = app.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(ingress_listener, app_for_ingress).await;
+        });
+    } else {
+        warn!("Could not bind Ingress to {}:80 (port likely occupied). Use :8080", my_vpn_ip);
+    }
+
     info!("Public key: {}", identity.public_key);
-    info!("Waiting for agents...");
+    info!("My VPN IP: {}", my_vpn_ip);
+    info!("Waiting for agents and other masters...");
 
-    axum::serve(listener, app).await?;
-
+    axum::serve(listener, app.clone()).await?;
     Ok(())
 }
 
@@ -273,48 +495,54 @@ async fn join_handler(
 ) -> Json<JoinResponse> {
     let mut peers = state.peers.lock().unwrap();
 
-    // Если агент уже зарегистрирован (повторный join после рестарта агента)
-    if let Some(existing) = peers.get(&req.pub_key) {
-        let agent_ip = existing.ip.clone();
-        info!("Agent re-joined: name={} ip={}", existing.name, agent_ip);
-        return Json(JoinResponse {
-            master_pub_key: state.master_pub_key.clone(),
-            agent_vpn_ip: agent_ip,
-            master_endpoint: format!("{}:{}", get_external_ip(), WG_PORT),
-        });
-    }
-
-    let agent_ip = {
+    let agent_ip = if let Some(existing) = peers.get(&req.pub_key) {
+        info!("Node re-joined: name={} ip={}", existing.name, existing.ip);
+        existing.ip.clone()
+    } else {
         let mut next = state.next_ip.lock().unwrap();
         let ip = format!("10.42.0.{}", *next);
         *next += 1;
         ip
     };
 
-    let _ = std::process::Command::new("wg")
-        .args(["set", "wg0", "peer", &req.pub_key, "allowed-ips", &format!("{agent_ip}/32")])
-        .status();
+    let role = req.role.unwrap_or_else(|| "agent".to_string());
+    let name = req.name.unwrap_or_else(|| format!("{}-{}", role, &agent_ip[agent_ip.rfind('.').unwrap_or(0)+1..]));
 
-    let name = req.name.unwrap_or_else(|| format!("agent-{}", &agent_ip[agent_ip.rfind('.').unwrap_or(0)+1..]));
-    info!("Agent joined: name={} pub_key={}... ip={}", name, &req.pub_key[..8], agent_ip);
+    let mut wg_cmd = std::process::Command::new("wg");
+    wg_cmd.args(["set", "wg0", "peer", &req.pub_key, "allowed-ips", &format!("{agent_ip}/32"), "persistent-keepalive", "25"]);
+    // DO NOT force endpoint here. WireGuard will dynamically learn the correct NAT endpoint 
+    // when the peer sends its first handshake. Forcing it to `req.public_endpoint` breaks NAT.
+    let _ = wg_cmd.status();
 
-    peers.insert(req.pub_key.clone(), PeerInfo {
-        pub_key: req.pub_key.clone(),
-        ip: agent_ip.clone(),
-        name,
-        cpu_percent: None,
-        ram_used_mb: None,
-        ram_total_mb: None,
-        vram_used_mb: None,
-        vram_total_mb: None,
+    info!("Node joined: role={} name={} pub_key={}... ip={}", role, name, &req.pub_key[..8], agent_ip);
+
+    peers.insert(
+        req.pub_key.clone(),
+        PeerInfo {
+            pub_key: req.pub_key.clone(),
+            ip: agent_ip.clone(),
+            name,
+            role,
+            public_endpoint: req.public_endpoint.clone(),
+            cpu_percent: None,
+            ram_used_mb: None,
+            ram_total_mb: None,
+            vram_used_mb: None,
+            vram_total_mb: None,
+        },
+    );
+
+    let cloned_peers = peers.clone();
+    let cloned_store = state.store.clone();
+    tokio::spawn(async move {
+        save_peers(&cloned_store, &cloned_peers).await;
     });
-
-    save_peers(&peers);
 
     Json(JoinResponse {
         master_pub_key: state.master_pub_key.clone(),
         agent_vpn_ip: agent_ip,
         master_endpoint: format!("{}:{}", get_external_ip(), WG_PORT),
+        peers: peers.clone(),
     })
 }
 
@@ -336,12 +564,11 @@ async fn metrics_handler(
 async fn nodes_handler(State(state): State<AppState>) -> Json<Vec<NodeInfo>> {
     let mut sys = System::new_all();
     sys.refresh_all();
-
     let master_name = System::host_name().unwrap_or_else(|| "master".to_string());
     let (master_vram_used, master_vram_total) = query_vram();
 
     let mut nodes = vec![NodeInfo {
-        ip: MASTER_VPN_IP.to_string(),
+        ip: state.my_vpn_ip.clone(),
         name: master_name,
         role: "master".to_string(),
         cpu_percent: Some(sys.global_cpu_usage()),
@@ -352,10 +579,11 @@ async fn nodes_handler(State(state): State<AppState>) -> Json<Vec<NodeInfo>> {
     }];
 
     for peer in state.peers.lock().unwrap().values() {
+        if peer.ip == state.my_vpn_ip { continue; } 
         nodes.push(NodeInfo {
             ip: peer.ip.clone(),
             name: peer.name.clone(),
-            role: "agent".to_string(),
+            role: peer.role.clone(),
             cpu_percent: peer.cpu_percent,
             ram_used_mb: peer.ram_used_mb,
             ram_total_mb: peer.ram_total_mb,
@@ -392,7 +620,7 @@ struct RepoInfo {
     clone_url: String,
 }
 
-async fn git_repos_handler() -> Json<Vec<RepoInfo>> {
+async fn git_repos_handler(State(state): State<AppState>) -> Json<Vec<RepoInfo>> {
     let git_root = r4a_git_registry::default_git_root();
     let mut repos = vec![];
     if let Ok(entries) = std::fs::read_dir(&git_root) {
@@ -400,7 +628,7 @@ async fn git_repos_handler() -> Json<Vec<RepoInfo>> {
             let path = entry.path();
             if path.is_dir() && path.join("HEAD").exists() {
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                let clone_url = format!("http://{}:{}/git/{}", MASTER_VPN_IP, API_PORT, name);
+                let clone_url = format!("http://{}:{}/git/{}", state.my_vpn_ip, API_PORT, name);
                 repos.push(RepoInfo { name, clone_url });
             }
         }
@@ -415,6 +643,7 @@ struct CreateRepoRequest {
 }
 
 async fn git_create_repo_handler(
+    State(state): State<AppState>,
     Json(req): Json<CreateRepoRequest>,
 ) -> Result<Json<RepoInfo>, (StatusCode, String)> {
     let name = req.name.trim().to_string();
@@ -428,8 +657,9 @@ async fn git_create_repo_handler(
     }
     r4a_git_registry::init_repo(&path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let clone_url = format!("http://{}:{}/git/{}", MASTER_VPN_IP, API_PORT, repo_name);
+    let clone_url = format!("http://{}:{}/git/{}", state.my_vpn_ip, API_PORT, repo_name);
     info!("Created git repository: {}", repo_name);
+    
     Ok(Json(RepoInfo { name: repo_name, clone_url }))
 }
 
@@ -444,10 +674,7 @@ async fn agent_binary_handler() -> Response {
     match tokio::fs::read(AGENT_BINARY_PATH).await {
         Ok(data) => Response::builder()
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"r4a-agent\"",
-            )
+            .header(header::CONTENT_DISPOSITION, "attachment; filename=\"r4a-agent\"")
             .body(Body::from(data))
             .unwrap(),
         Err(e) => Response::builder()
@@ -478,14 +705,11 @@ struct TestResponse {
 
 async fn update_test_handler() -> Json<TestResponse> {
     match sha256_file(AGENT_BINARY_PATH) {
-        Some(checksum) => {
-            info!("Update test: agent binary ok, sha256={}", &checksum[..16]);
-            Json(TestResponse {
-                ok: true,
-                checksum: Some(checksum),
-                message: "binary OK".to_string(),
-            })
-        }
+        Some(checksum) => Json(TestResponse {
+            ok: true,
+            checksum: Some(checksum),
+            message: "binary OK".to_string(),
+        }),
         None => Json(TestResponse {
             ok: false,
             checksum: None,
@@ -573,17 +797,27 @@ fn get_external_ip() -> String {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
+    
+    let mut best_ip = String::new();
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with("inet ") && !line.contains("127.") && !line.contains("10.42.") {
             if let Some(ip) = line.split_whitespace().nth(1) {
                 if let Some(ip) = ip.split('/').next() {
-                    if ip.starts_with("192.168.") {
-                        return ip.to_string();
+                    let ip_str = ip.to_string();
+                    if ip_str.starts_with("100.") {
+                        return ip_str; // Максимальный приоритет - Tailscale
+                    } else if ip_str.starts_with("192.168.") {
+                        best_ip = ip_str;
+                    } else if best_ip.is_empty() && !ip_str.starts_with("10.") {
+                        best_ip = ip_str;
                     }
                 }
             }
         }
+    }
+    if !best_ip.is_empty() {
+        return best_ip;
     }
     "127.0.0.1".to_string()
 }

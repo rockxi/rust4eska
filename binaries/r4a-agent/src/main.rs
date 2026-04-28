@@ -1,9 +1,42 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use sysinfo::System;
 use tracing::{info, warn};
+
+fn state_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".r4a-agent")
+}
+
+#[derive(Serialize, Deserialize)]
+struct Identity {
+    private_key: String,
+    public_key: String,
+}
+
+fn load_identity() -> Result<Identity> {
+    let path = state_dir().join("identity.json");
+    if path.exists() {
+        let data = std::fs::read_to_string(&path)?;
+        let id: Identity = serde_json::from_str(&data)?;
+        info!("Loaded existing identity, public key: {}", id.public_key);
+        return Ok(id);
+    }
+    info!("Generating new WireGuard keypair...");
+    let kp = r4a_vpn::wireguard::generate_keypair()?;
+    let id = Identity {
+        private_key: kp.private,
+        public_key: kp.public,
+    };
+    std::fs::create_dir_all(state_dir())?;
+    std::fs::write(&path, serde_json::to_string_pretty(&id)?)?;
+    info!("Saved identity to {}", path.display());
+    Ok(id)
+}
 
 #[derive(Parser)]
 #[command(name = "r4a-agent", about = "r4a Agent Node")]
@@ -22,12 +55,39 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Управление системным сервисом (systemd/launchd)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Установить и запустить сервис
+    Enable {
+        #[arg(long)]
+        master: String,
+    },
+    /// Остановить и удалить сервис
+    Disable,
 }
 
 #[derive(Serialize)]
 struct JoinRequest {
     pub_key: String,
     name: String,
+    role: String,
+}
+
+#[derive(Deserialize, Clone)]
+#[allow(dead_code)]
+struct PeerInfo {
+    pub_key: String,
+    ip: String,
+    name: String,
+    role: String,
+    public_endpoint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -65,6 +125,7 @@ struct JoinResponse {
     master_pub_key: String,
     agent_vpn_ip: String,
     master_endpoint: String,
+    peers: HashMap<String, PeerInfo>,
 }
 
 #[tokio::main]
@@ -74,7 +135,22 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Cmd::Connect { master, name } => connect(&master, name).await,
+        Cmd::Service { action } => handle_service(action),
     }
+}
+
+fn handle_service(action: ServiceAction) -> Result<()> {
+    let manager = r4a_service::ServiceManager::detect()?;
+    match action {
+        ServiceAction::Enable { master } => {
+            let exec = format!("/usr/local/bin/r4a-agent connect --master {}", master);
+            manager.enable("r4a-agent", "r4a Agent Node", &exec)?;
+        }
+        ServiceAction::Disable => {
+            manager.disable("r4a-agent")?;
+        }
+    }
+    Ok(())
 }
 
 async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
@@ -82,14 +158,17 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
         System::host_name().unwrap_or_else(|| "agent".to_string())
     });
 
-    info!("Generating WireGuard keypair...");
-    let kp = r4a_vpn::wireguard::generate_keypair()?;
+    let identity = load_identity().context("Failed to load or generate identity")?;
 
     info!("Joining master at {} as '{}'...", master_api, name);
     let client = reqwest::Client::new();
     let resp: JoinResponse = client
         .post(format!("{master_api}/api/join"))
-        .json(&JoinRequest { pub_key: kp.public.clone(), name: name.clone() })
+        .json(&JoinRequest { 
+            pub_key: identity.public_key.clone(), 
+            name: name.clone(),
+            role: "agent".to_string(),
+        })
         .send()
         .await?
         .error_for_status()?
@@ -101,20 +180,32 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
 
     info!("Setting up WireGuard interface...");
     r4a_vpn::wireguard::setup_agent(
-        &kp.private,
+        &identity.private_key,
         &resp.agent_vpn_ip,
         &resp.master_pub_key,
         &resp.master_endpoint,
     )?;
 
-    info!("Adding master.local to /etc/hosts...");
-    r4a_vpn::dns::set_hosts_entry("10.42.0.1", "master.local")?;
+    // Выбираем всех мастеров из списка пиров
+    let master_ips: Vec<String> = resp.peers
+        .values()
+        .filter(|p| p.role == "master")
+        .map(|p| p.ip.clone())
+        .collect();
+
+    let mut hosts_ips: Vec<&str> = master_ips.iter().map(|s| s.as_str()).collect();
+    if hosts_ips.is_empty() {
+        hosts_ips.push("10.42.0.1"); // Фолбэк на случай если что-то не так
+    }
+
+    info!("Adding master.local ({}) to /etc/hosts...", hosts_ips.join(", "));
+    r4a_vpn::dns::set_hosts_entries(&hosts_ips, "master.local")?;
 
     info!("Agent '{}' connected. VPN IP: {}", name, resp.agent_vpn_ip);
 
     let vpn_ip = resp.agent_vpn_ip.clone();
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
         let mut sys = System::new_all();
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -128,15 +219,18 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
                 vram_used_mb,
                 vram_total_mb,
             };
+            
+            // Если есть несколько мастеров, мы могли бы делать fallback.
+            // Но пока что master.local отрезолвится в первый живой (в зависимости от поведения reqwest).
             let _ = client
-                .post("http://10.42.0.1:8080/api/metrics")
+                .post("http://master.local:8080/api/metrics")
                 .json(&report)
                 .send()
                 .await;
         }
     });
 
-    let master_base = "http://10.42.0.1:8080".to_string();
+    let master_base = "http://master.local:8080".to_string();
     let update_client = client.clone();
     let update_vpn_ip = resp.agent_vpn_ip.clone();
     tokio::spawn(async move {
@@ -201,7 +295,6 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
         .bytes()
         .await?;
 
-    // Verify downloaded checksum
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let downloaded_checksum = format!("{:x}", hasher.finalize());

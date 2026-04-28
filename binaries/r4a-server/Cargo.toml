@@ -20,3 +20,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
 sha2 = { workspace = true }
+r4a-store = { version = "0.1.0", path = "../../crates/r4a-store" }
+r4a-service = { version = "0.1.0", path = "../../crates/r4a-service" }
+reqwest.workspace = true

@@ -4,13 +4,13 @@ members = [
     "crates/r4a-git-registry",
     "binaries/r4a-server",
     "binaries/r4a-agent",
-    "binaries/r4a-tui",
+    "binaries/r4a-tui", "crates/r4a-store", "crates/r4a-service",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 axum = "0.7"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }

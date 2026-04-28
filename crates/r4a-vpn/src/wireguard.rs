@@ -27,7 +27,7 @@ pub fn setup_master_with_peers(
     );
     for (pub_key, peer_ip) in peers {
         conf.push_str(&format!(
-            "\n[Peer]\nPublicKey = {pub_key}\nAllowedIPs = {peer_ip}/32\n"
+            "\n[Peer]\nPublicKey = {pub_key}\nAllowedIPs = {peer_ip}/32\nPersistentKeepalive = 25\n"
         ));
     }
     write_conf(&conf)?;
