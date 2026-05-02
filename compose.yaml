@@ -1,0 +1,88 @@
+services:
+  master:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: node-master
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - R4A_SECRET=test_secret_for_cluster_123
+      - RUST_LOG=info
+    command: r4a-server init
+    volumes:
+      - master_data:/root/.r4a-server
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    networks:
+      r4a-net:
+        ipv4_address: 172.20.0.10
+
+  agent1:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: node-agent1
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - R4A_SECRET=test_secret_for_cluster_123
+      - RUST_LOG=info
+    command: r4a-agent connect --master http://master:8080 --name agent1
+    depends_on:
+      - master
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent1_data:/root/.r4a-agent
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    networks:
+      - r4a-net
+
+  agent2:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: node-agent2
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - R4A_SECRET=test_secret_for_cluster_123
+      - RUST_LOG=info
+    command: r4a-agent connect --master http://master:8080 --name agent2
+    depends_on:
+      - master
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent2_data:/root/.r4a-agent
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    networks:
+      - r4a-net
+
+volumes:
+  master_data:
+  agent1_data:
+  agent2_data:
+
+networks:
+  r4a-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

@@ -37,7 +37,7 @@ build-all:
 	cargo build --release --target $(TARGET)
 
 build-dev:
-	cargo build --release --target $(DEV_TARGET)
+	cargo build --release --target $(DEV_TARGET) --bin r4a-server --bin r4a-agent --bin r4a-tui
 
 # --- Production Deploy (musl) ---
 
@@ -83,16 +83,21 @@ dev-down:
 
 dev-deploy: build-dev
 	@echo "--- Deploying to Local Docker Cluster ($(DEV_TARGET)) ---"
-	docker cp $(LOCAL_BIN_SERVER_DEV) r4a-master:$(REMOTE_BIN_DIR)/$(BIN_SERVER)
-	docker cp $(LOCAL_BIN_AGENT_DEV) r4a-master:$(REMOTE_BIN_DIR)/$(BIN_AGENT)
-	docker exec r4a-master chmod +x $(REMOTE_BIN_DIR)/$(BIN_SERVER) $(REMOTE_BIN_DIR)/$(BIN_AGENT)
-	docker exec r4a-master pkill -9 r4a-server || true
-	docker cp $(LOCAL_BIN_AGENT_DEV) r4a-agent1:$(REMOTE_BIN_DIR)/$(BIN_AGENT)
-	docker cp $(LOCAL_BIN_AGENT_DEV) r4a-agent2:$(REMOTE_BIN_DIR)/$(BIN_AGENT)
-	docker exec r4a-agent1 chmod +x $(REMOTE_BIN_DIR)/$(BIN_AGENT)
-	docker exec r4a-agent2 chmod +x $(REMOTE_BIN_DIR)/$(BIN_AGENT)
-	docker exec r4a-agent1 pkill -9 r4a-agent || true
-	docker exec r4a-agent2 pkill -9 r4a-agent || true
+	docker cp $(LOCAL_BIN_SERVER_DEV) node-master:$(REMOTE_BIN_DIR)/$(BIN_SERVER)
+	docker cp $(LOCAL_BIN_AGENT_DEV) node-master:$(REMOTE_BIN_DIR)/$(BIN_AGENT)
+	docker cp $(LOCAL_BIN_TUI_DEV) node-master:$(REMOTE_BIN_DIR)/$(BIN_TUI)
+	docker exec node-master chmod +x $(REMOTE_BIN_DIR)/$(BIN_SERVER) $(REMOTE_BIN_DIR)/$(BIN_AGENT) $(REMOTE_BIN_DIR)/$(BIN_TUI)
+	docker exec node-master pkill -9 r4a-server || true
+	
+	docker cp $(LOCAL_BIN_AGENT_DEV) node-agent1:$(REMOTE_BIN_DIR)/$(BIN_AGENT)
+	docker cp $(LOCAL_BIN_TUI_DEV) node-agent1:$(REMOTE_BIN_DIR)/$(BIN_TUI)
+	docker exec node-agent1 chmod +x $(REMOTE_BIN_DIR)/$(BIN_AGENT) $(REMOTE_BIN_DIR)/$(BIN_TUI)
+	docker exec node-agent1 pkill -9 r4a-agent || true
+	
+	docker cp $(LOCAL_BIN_AGENT_DEV) node-agent2:$(REMOTE_BIN_DIR)/$(BIN_AGENT)
+	docker cp $(LOCAL_BIN_TUI_DEV) node-agent2:$(REMOTE_BIN_DIR)/$(BIN_TUI)
+	docker exec node-agent2 chmod +x $(REMOTE_BIN_DIR)/$(BIN_AGENT) $(REMOTE_BIN_DIR)/$(BIN_TUI)
+	docker exec node-agent2 pkill -9 r4a-agent || true
 	@echo "--- Binaries updated and services restarted in Docker ---"
 
 # --- Common ---

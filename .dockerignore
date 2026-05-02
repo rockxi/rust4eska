@@ -1,0 +1,11 @@
+target/
+binaries/**/target/
+crates/**/target/
+.git/
+.cargo/
+*.tmp
+*.log
+docker-data/
+remote_sync/
+remote_sync_2/
+sync_back/

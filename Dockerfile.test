@@ -1,0 +1,48 @@
+# Build stage
+FROM rust:bookworm as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    git \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the entire workspace
+COPY . .
+
+# Build the binaries
+RUN cargo build --release --bin r4a-server --bin r4a-agent --bin r4a-tui
+
+# Final stage
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    wireguard-tools \
+    iproute2 \
+    iptables \
+    ca-certificates \
+    curl \
+    docker.io \
+    procps \
+    iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binaries from builder
+COPY --from=builder /app/target/release/r4a-server /usr/local/bin/
+COPY --from=builder /app/target/release/r4a-agent /usr/local/bin/
+COPY --from=builder /app/target/release/r4a-tui /usr/local/bin/
+
+# Create required directories for state
+RUN mkdir -p /root/.r4a-server /root/.r4a-agent
+
+# Set working directory
+WORKDIR /root
+
+# Default command (overridden by docker-compose)
+CMD ["r4a-server", "init"]
