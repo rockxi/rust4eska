@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 const HOSTS_FILE: &str = "/etc/hosts";
 const MARKER: &str = "# r4a-managed";
 
-/// Добавляет/обновляет записи в /etc/hosts. Идемпотентно.
+/// Добавляет/обновляет записи в /etc/hosts. Идемпотентно. Атомарно.
 pub fn set_hosts_entries(ips: &[&str], hostname: &str) -> Result<()> {
     let content = std::fs::read_to_string(HOSTS_FILE).context("read /etc/hosts")?;
 
@@ -23,3 +23,4 @@ pub fn set_hosts_entries(ips: &[&str], hostname: &str) -> Result<()> {
     tracing::info!("Set {} IPs for {} in /etc/hosts", ips.len(), hostname);
     Ok(())
 }
+

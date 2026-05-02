@@ -28,6 +28,8 @@ struct Cli {
     /// Master node API URL
     #[arg(long, env = "R4A_MASTER", default_value = "http://master.local:8080")]
     master: String,
+    #[arg(long, env = "R4A_SECRET")]
+    secret: Option<String>,
 }
 
 struct App {
@@ -44,7 +46,7 @@ struct App {
 }
 
 impl App {
-    fn new(master_url: &str) -> Self {
+    fn new(master_url: &str, secret: Option<String>) -> Self {
         Self {
             screen: Screen::Dashboard,
             nodes: vec![],
@@ -55,7 +57,7 @@ impl App {
             git_message: None,
             update_status: None,
             update_message: None,
-            client: ApiClient::new(master_url),
+            client: ApiClient::new(master_url, secret),
         }
     }
 
@@ -96,7 +98,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &cli.master).await;
+    let result = run(&mut terminal, &cli.master, cli.secret).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -105,8 +107,8 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: &str) -> Result<()> {
-    let mut app = App::new(master_url);
+async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: &str, secret: Option<String>) -> Result<()> {
+    let mut app = App::new(master_url, secret);
     app.refresh().await;
 
     let mut last_refresh = std::time::Instant::now();

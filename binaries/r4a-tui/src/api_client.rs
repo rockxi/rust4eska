@@ -25,21 +25,38 @@ pub struct TestResponse {
 
 pub struct ApiClient {
     base_url: String,
+    secret: Option<String>,
     client: reqwest::Client,
 }
 
 impl ApiClient {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, secret: Option<String>) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
+            secret,
             client: reqwest::Client::new(),
         }
     }
 
+    fn authenticated_get(&self, url: String) -> reqwest::RequestBuilder {
+        let mut req = self.client.get(url);
+        if let Some(ref s) = self.secret {
+            req = req.header("X-R4A-Secret", s);
+        }
+        req
+    }
+
+    fn authenticated_post(&self, url: String) -> reqwest::RequestBuilder {
+        let mut req = self.client.post(url);
+        if let Some(ref s) = self.secret {
+            req = req.header("X-R4A-Secret", s);
+        }
+        req
+    }
+
     pub async fn nodes(&self) -> Result<Vec<NodeInfo>> {
         let nodes = self
-            .client
-            .get(format!("{}/api/nodes", self.base_url))
+            .authenticated_get(format!("{}/api/nodes", self.base_url))
             .send()
             .await?
             .error_for_status()?
@@ -50,8 +67,7 @@ impl ApiClient {
 
     pub async fn git_repos(&self) -> Result<Vec<RepoInfo>> {
         let repos = self
-            .client
-            .get(format!("{}/api/git/repos", self.base_url))
+            .authenticated_get(format!("{}/api/git/repos", self.base_url))
             .send()
             .await?
             .error_for_status()?
@@ -63,8 +79,7 @@ impl ApiClient {
     pub async fn create_repo(&self, name: &str) -> Result<RepoInfo> {
         let body = serde_json::json!({"name": name});
         let repo = self
-            .client
-            .post(format!("{}/api/git/repos", self.base_url))
+            .authenticated_post(format!("{}/api/git/repos", self.base_url))
             .json(&body)
             .send()
             .await?
@@ -76,8 +91,7 @@ impl ApiClient {
 
     pub async fn update_status(&self) -> Result<UpdateStatus> {
         let status = self
-            .client
-            .get(format!("{}/api/update/status", self.base_url))
+            .authenticated_get(format!("{}/api/update/status", self.base_url))
             .send()
             .await?
             .error_for_status()?
@@ -88,8 +102,7 @@ impl ApiClient {
 
     pub async fn update_test(&self) -> Result<TestResponse> {
         let resp = self
-            .client
-            .post(format!("{}/api/update/test", self.base_url))
+            .authenticated_post(format!("{}/api/update/test", self.base_url))
             .send()
             .await?
             .error_for_status()?
@@ -99,8 +112,7 @@ impl ApiClient {
     }
 
     pub async fn update_trigger(&self) -> Result<()> {
-        self.client
-            .post(format!("{}/api/update/trigger", self.base_url))
+        self.authenticated_post(format!("{}/api/update/trigger", self.base_url))
             .send()
             .await?
             .error_for_status()?;

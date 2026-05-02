@@ -1,4 +1,4 @@
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{extract::State, http::{StatusCode, HeaderMap}, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use sled::Db;
 use std::{path::Path, sync::Arc};
@@ -7,6 +7,7 @@ use tracing::{debug, error};
 #[derive(Clone)]
 pub struct Store {
     pub db: Db,
+    pub cluster_secret: Arc<std::sync::RwLock<String>>,
     // VPN IP других мастеров (например, "10.42.0.1", "10.42.0.2")
     pub masters: Arc<std::sync::RwLock<Vec<String>>>,
 }
@@ -23,6 +24,7 @@ impl Store {
         let db = sled::open(path)?;
         Ok(Self {
             db,
+            cluster_secret: Arc::new(std::sync::RwLock::new(String::new())),
             masters: Arc::new(std::sync::RwLock::new(Vec::new())),
         })
     }
@@ -30,6 +32,11 @@ impl Store {
     pub fn set_masters(&self, master_ips: Vec<String>) {
         let mut w = self.masters.write().unwrap();
         *w = master_ips;
+    }
+
+    pub fn set_secret(&self, secret: String) {
+        let mut w = self.cluster_secret.write().unwrap();
+        *w = secret;
     }
 
     pub async fn put(&self, tree_name: &str, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
@@ -44,8 +51,10 @@ impl Store {
         };
 
         let masters = self.masters.read().unwrap().clone();
+        let secret = self.cluster_secret.read().unwrap().clone();
         for master_ip in masters {
             let req = req.clone();
+            let secret = secret.clone();
             tokio::spawn(async move {
                 let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(2))
@@ -53,7 +62,11 @@ impl Store {
                     .unwrap_or_default();
                 
                 let target = format!("http://{master_ip}:8080/api/store/sync");
-                if let Err(e) = client.post(&target).json(&req).send().await {
+                if let Err(e) = client.post(&target)
+                    .header("X-R4A-Secret", &secret)
+                    .json(&req)
+                    .send()
+                    .await {
                     debug!("Store sync to {} failed: {}", master_ip, e);
                 }
             });
@@ -80,13 +93,29 @@ pub fn store_router(store: Store) -> Router {
         .with_state(store)
 }
 
-async fn sync_handler(State(store): State<Store>, Json(req): Json<SyncRequest>) -> StatusCode {
-    if let Ok(tree) = store.db.open_tree(&req.tree) {
-        if let Err(e) = tree.insert(req.key, req.value) {
-            error!("Sync write failed: {}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR;
+async fn sync_handler(
+    headers: HeaderMap,
+    State(store): State<Store>, 
+    Json(req): Json<SyncRequest>
+) -> StatusCode {
+    if let Some(auth_header) = headers.get("X-R4A-Secret") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            let is_auth = {
+                let secret = store.cluster_secret.read().unwrap();
+                !secret.is_empty() && auth_str == *secret
+            };
+
+            if is_auth {
+                if let Ok(tree) = store.db.open_tree(&req.tree) {
+                    if let Err(e) = tree.insert(req.key, req.value) {
+                        error!("Sync write failed: {}", e);
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                    let _ = store.db.flush_async().await;
+                }
+                return StatusCode::OK;
+            }
         }
-        let _ = store.db.flush();
     }
-    StatusCode::OK
+    StatusCode::UNAUTHORIZED
 }

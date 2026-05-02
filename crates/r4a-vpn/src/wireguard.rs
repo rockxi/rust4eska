@@ -54,9 +54,17 @@ pub fn setup_agent(
 }
 
 fn write_conf(conf: &str) -> Result<()> {
-    std::fs::write("/etc/wireguard/wg0.conf", conf)
-        .context("write /etc/wireguard/wg0.conf (run as root?)")?;
-    run("chmod", &["600", "/etc/wireguard/wg0.conf"])?;
+    let path = "/etc/wireguard/wg0.conf";
+    let tmp_path = format!("{}.tmp", path);
+    
+    std::fs::write(&tmp_path, conf)
+        .context("write /etc/wireguard/wg0.conf.tmp (run as root?)")?;
+    
+    run("chmod", &["600", &tmp_path])?;
+    
+    std::fs::rename(&tmp_path, path)
+        .context("rename /etc/wireguard/wg0.conf.tmp to wg0.conf")?;
+    
     Ok(())
 }
 

@@ -14,11 +14,34 @@ fn state_dir() -> PathBuf {
     PathBuf::from(home).join(".r4a-agent")
 }
 
-fn load_identity() -> Result<Identity> {
+fn save_identity(id: &Identity) -> Result<()> {
+    let path = state_dir().join("identity.json");
+    let tmp_path = path.with_extension("json.tmp");
+    
+    std::fs::create_dir_all(state_dir())?;
+    
+    let data = serde_json::to_string_pretty(id)?;
+    std::fs::write(&tmp_path, data)?;
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    }
+    
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
+}
+
+fn load_identity(secret: Option<String>) -> Result<Identity> {
     let path = state_dir().join("identity.json");
     if path.exists() {
         let data = std::fs::read_to_string(&path)?;
-        let id: Identity = serde_json::from_str(&data)?;
+        let mut id: Identity = serde_json::from_str(&data)?;
+        if secret.is_some() && id.cluster_secret != secret {
+            id.cluster_secret = secret;
+            save_identity(&id)?;
+        }
         info!("Loaded existing identity, public key: {}", id.public_key);
         return Ok(id);
     }
@@ -27,9 +50,9 @@ fn load_identity() -> Result<Identity> {
     let id = Identity {
         private_key: kp.private,
         public_key: kp.public,
+        cluster_secret: secret,
     };
-    std::fs::create_dir_all(state_dir())?;
-    std::fs::write(&path, serde_json::to_string_pretty(&id)?)?;
+    save_identity(&id)?;
     info!("Saved identity to {}", path.display());
     Ok(id)
 }
@@ -43,15 +66,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Подключиться к master-ноде
     Connect {
         #[arg(long)]
         master: String,
-        /// Имя ноды (по умолчанию — hostname)
+        #[arg(long, env = "R4A_SECRET")]
+        secret: Option<String>,
         #[arg(long)]
         name: Option<String>,
     },
-    /// Управление системным сервисом (systemd/launchd)
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -60,14 +82,14 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    /// Установить и запустить сервис
     Enable {
         #[arg(long)]
         master: String,
+        #[arg(long, env = "R4A_SECRET")]
+        secret: Option<String>,
         #[arg(long)]
         name: Option<String>,
     },
-    /// Остановить и удалить сервис
     Disable,
 }
 
@@ -97,7 +119,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Connect { master, name } => connect(&master, name).await,
+        Cmd::Connect { master, secret, name } => connect(&master, secret, name).await,
         Cmd::Service { action } => handle_service(action),
     }
 }
@@ -105,8 +127,11 @@ async fn main() -> Result<()> {
 fn handle_service(action: ServiceAction) -> Result<()> {
     let manager = r4a_service::ServiceManager::detect()?;
     match action {
-        ServiceAction::Enable { master, name } => {
+        ServiceAction::Enable { master, secret, name } => {
             let mut exec = format!("/usr/local/bin/r4a-agent connect --master {}", master);
+            if let Some(s) = secret {
+                exec.push_str(&format!(" --secret {}", s));
+            }
             if let Some(n) = name {
                 exec.push_str(&format!(" --name {}", n));
             }
@@ -119,17 +144,19 @@ fn handle_service(action: ServiceAction) -> Result<()> {
     Ok(())
 }
 
-async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
+async fn connect(master_api: &str, secret: Option<String>, name: Option<String>) -> Result<()> {
     let name = name.unwrap_or_else(|| {
         System::host_name().unwrap_or_else(|| "agent".to_string())
     });
 
-    let identity = load_identity().context("Failed to load or generate identity")?;
+    let identity = load_identity(secret).context("Failed to load or generate identity")?;
+    let cluster_secret = identity.cluster_secret.clone().unwrap_or_default();
 
     info!("Joining master at {} as '{}'...", master_api, name);
     let client = reqwest::Client::new();
     let resp: JoinResponse = client
         .post(format!("{master_api}/api/join"))
+        .header("X-R4A-Secret", &cluster_secret)
         .json(&JoinRequest { 
             pub_key: identity.public_key.clone(), 
             name: Some(name.clone()),
@@ -153,7 +180,6 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
         &resp.master_endpoint,
     )?;
 
-    // Выбираем всех мастеров из списка пиров
     let master_ips: Vec<String> = resp.peers
         .values()
         .filter(|p| p.role == "master")
@@ -162,7 +188,7 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
 
     let mut hosts_ips: Vec<&str> = master_ips.iter().map(|s| s.as_str()).collect();
     if hosts_ips.is_empty() {
-        hosts_ips.push("10.42.0.1"); // Фолбэк на случай если что-то не так
+        hosts_ips.push("10.42.0.1");
     }
 
     info!("Adding master.local ({}) to /etc/hosts...", hosts_ips.join(", "));
@@ -171,6 +197,7 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
     info!("Agent '{}' connected. VPN IP: {}", name, resp.agent_vpn_ip);
 
     let vpn_ip = resp.agent_vpn_ip.clone();
+    let metrics_secret = cluster_secret.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
         let mut sys = System::new_all();
@@ -187,10 +214,9 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
                 vram_total_mb,
             };
             
-            // Если есть несколько мастеров, мы могли бы делать fallback.
-            // Но пока что master.local отрезолвится в первый живой (в зависимости от поведения reqwest).
             let _ = client
                 .post("http://master.local:8080/api/metrics")
+                .header("X-R4A-Secret", &metrics_secret)
                 .json(&report)
                 .send()
                 .await;
@@ -200,10 +226,11 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
     let master_base = "http://master.local:8080".to_string();
     let update_client = client.clone();
     let update_vpn_ip = resp.agent_vpn_ip.clone();
+    let update_secret = cluster_secret.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            if let Err(e) = check_and_apply_update(&update_client, &master_base, &update_vpn_ip).await {
+            if let Err(e) = check_and_apply_update(&update_client, &master_base, &update_vpn_ip, &update_secret).await {
                 warn!("Update check failed: {e}");
             }
         }
@@ -211,6 +238,7 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
 
     let reconcile_client = client.clone();
     let reconciler_node_name = name.clone();
+    let reconcile_secret = cluster_secret.clone();
     tokio::spawn(async move {
         let reconciler = match Reconciler::new(reconciler_node_name.clone()) {
             Ok(r) => r,
@@ -222,7 +250,9 @@ async fn connect(master_api: &str, name: Option<String>) -> Result<()> {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             let url = format!("http://master.local:8080/api/manifests?node={}", reconciler_node_name);
-            match reconcile_client.get(&url).send().await {
+            match reconcile_client.get(&url)
+                .header("X-R4A-Secret", &reconcile_secret)
+                .send().await {
                 Ok(resp) => {
                     if let Ok(manifests) = resp.json::<HashMap<String, Manifest>>().await {
                         if let Err(e) = reconciler.reconcile(manifests).await {
@@ -253,9 +283,10 @@ fn sha256_self() -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
-async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: &str) -> Result<()> {
+async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: &str, secret: &str) -> Result<()> {
     let poll: UpdatePollResponse = client
         .get(format!("{master}/api/update/poll"))
+        .header("X-R4A-Secret", secret)
         .send()
         .await?
         .error_for_status()?
@@ -278,10 +309,11 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
 
     info!("Update available (master={} self={}), downloading...", &master_checksum[..8], &self_checksum[..8]);
 
-    let _ = report_update_status(client, master, vpn_ip, "updating", &self_checksum).await;
+    let _ = report_update_status(client, master, vpn_ip, "updating", &self_checksum, secret).await;
 
     let bytes = client
         .get(format!("{master}/api/agent-binary"))
+        .header("X-R4A-Secret", secret)
         .send()
         .await?
         .error_for_status()?
@@ -292,7 +324,7 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
     hasher.update(&bytes);
     let downloaded_checksum = format!("{:x}", hasher.finalize());
     if downloaded_checksum != master_checksum {
-        let _ = report_update_status(client, master, vpn_ip, "failed", &downloaded_checksum).await;
+        let _ = report_update_status(client, master, vpn_ip, "failed", &downloaded_checksum, secret).await;
         anyhow::bail!("checksum mismatch: expected {master_checksum} got {downloaded_checksum}");
     }
 
@@ -309,7 +341,7 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
     std::fs::rename(tmp_path, target_path)?;
     info!("Updated to checksum {}, restarting...", &master_checksum[..8]);
 
-    let _ = report_update_status(client, master, vpn_ip, "updated", &master_checksum).await;
+    let _ = report_update_status(client, master, vpn_ip, "updated", &master_checksum, secret).await;
 
     std::process::exit(0);
 }
@@ -320,11 +352,13 @@ async fn report_update_status(
     vpn_ip: &str,
     status: &str,
     checksum: &str,
+    secret: &str,
 ) -> Result<()> {
     #[derive(Serialize)]
     struct Report<'a> { agent_vpn_ip: &'a str, checksum: &'a str, status: &'a str }
     client
         .post(format!("{master}/api/update/report"))
+        .header("X-R4A-Secret", secret)
         .json(&Report { agent_vpn_ip: vpn_ip, checksum, status })
         .send()
         .await?

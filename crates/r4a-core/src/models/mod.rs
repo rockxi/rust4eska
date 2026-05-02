@@ -5,6 +5,7 @@ use std::collections::HashMap;
 pub struct Identity {
     pub private_key: String,
     pub public_key: String,
+    pub cluster_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
