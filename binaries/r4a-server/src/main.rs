@@ -636,6 +636,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
                     let s = origin.to_str().unwrap_or("");
                     s.starts_with("http://10.42.")
                         || s.starts_with("http://master.local")
+                        || s.starts_with("http://master.r4a.local")
                         || s.starts_with("http://localhost")
                         || s.starts_with("http://127.0.0.1")
                 }))

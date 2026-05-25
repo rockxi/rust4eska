@@ -88,6 +88,9 @@ struct ConnectionState {
     vpn_ip: String,
     master_pubkey: String,
     master_endpoint: String,
+    label: Option<String>,
+    #[serde(default)]
+    added_hosts: Vec<String>,
 }
 
 fn connection_state_path() -> PathBuf {
@@ -345,8 +348,11 @@ async fn main() -> Result<()> {
             ConnectCommands::Up { label, wg_endpoint } => {
                 // Bring down old WG interface if any, but do NOT delete the server-side
                 // connection — let server evict by label and reuse the same VPN IP.
-                if load_connection_state().is_ok() {
+                if let Ok(old) = load_connection_state() {
                     let _ = std::process::Command::new("wg-quick").args(["down", "wg0"]).status();
+                    for host in &old.added_hosts {
+                        let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
+                    }
                     remove_connection_state();
                 }
 
@@ -359,13 +365,11 @@ async fn main() -> Result<()> {
                 // the host in master_endpoint with the host from --master URL so the
                 // tunnel goes through the same address the user used for the API.
                 let derived_endpoint = wg_endpoint.unwrap_or_else(|| {
-                    // Extract host from --master URL (e.g. "http://localhost:8080" → "localhost")
                     let master_host = cli.master
                         .trim_start_matches("http://")
                         .trim_start_matches("https://")
                         .split(':').next()
                         .unwrap_or("10.42.0.1");
-                    // Keep port from server response (always 51820)
                     let wg_port = resp.master_endpoint.rsplit(':').next().unwrap_or("51820");
                     format!("{}:{}", master_host, wg_port)
                 });
@@ -377,9 +381,35 @@ async fn main() -> Result<()> {
                     endpoint,
                 ).context("Failed to configure WireGuard interface")?;
 
-                // VPN IP мастера всегда 10.42.0.1 (первый адрес в пуле)
-                if let Err(e) = r4a_vpn::dns::set_hosts_entries(&["10.42.0.1"], "master.local") {
-                    eprintln!("Warning: could not update /etc/hosts: {}", e);
+                let mut added_hosts: Vec<String> = Vec::new();
+
+                // master.r4a.local → 10.42.0.1
+                match r4a_vpn::dns::set_hosts_entries(&["10.42.0.1"], "master.r4a.local") {
+                    Ok(_) => added_hosts.push("master.r4a.local".to_string()),
+                    Err(e) => eprintln!("Warning: could not update /etc/hosts: {}", e),
+                }
+
+                // <label>.r4a.local → own VPN IP
+                if let Some(ref lbl) = label {
+                    let label_host = format!("{}.r4a.local", lbl);
+                    match r4a_vpn::dns::set_hosts_entries(&[resp.vpn_ip.as_str()], &label_host) {
+                        Ok(_) => added_hosts.push(label_host),
+                        Err(e) => eprintln!("Warning: could not update /etc/hosts for label: {}", e),
+                    }
+                }
+
+                // <node_name>.r4a.local → node VPN IP
+                match client.nodes().await {
+                    Ok(nodes) => {
+                        for node in &nodes {
+                            let node_host = format!("{}.r4a.local", node.name);
+                            match r4a_vpn::dns::set_hosts_entries(&[node.ip.as_str()], &node_host) {
+                                Ok(_) => added_hosts.push(node_host),
+                                Err(e) => eprintln!("Warning: /etc/hosts for {}: {}", node.name, e),
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Warning: could not fetch nodes for DNS setup: {}", e),
                 }
 
                 save_connection_state(&ConnectionState {
@@ -388,14 +418,19 @@ async fn main() -> Result<()> {
                     vpn_ip: resp.vpn_ip.clone(),
                     master_pubkey: resp.master_pubkey.clone(),
                     master_endpoint: resp.master_endpoint.clone(),
+                    label: label.clone(),
+                    added_hosts: added_hosts.clone(),
                 })?;
 
                 println!("Connected!");
                 println!("  VPN IP:        {}", resp.vpn_ip);
                 println!("  Connection ID: {}", resp.id);
                 println!("  WG endpoint:   {}", endpoint);
-                println!("  master.local → 10.42.0.1 added to /etc/hosts");
-                println!("  Ingress:       http://master.local:8000");
+                println!("  DNS entries added:");
+                for h in &added_hosts {
+                    println!("    {}", h);
+                }
+                println!("  Ingress:       http://master.r4a.local:8000");
                 println!("  Heartbeat:     every {}s", resp.heartbeat_interval_secs);
                 println!();
 
@@ -422,7 +457,9 @@ async fn main() -> Result<()> {
                             println!("\nDisconnecting...");
                             let _ = client.connection_delete(&resp.id).await;
                             let _ = std::process::Command::new("wg-quick").args(["down", "wg0"]).status();
-                            let _ = r4a_vpn::dns::set_hosts_entries(&[], "master.local");
+                            for host in &added_hosts {
+                                let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
+                            }
                             remove_connection_state();
                             println!("Disconnected.");
                             break;
@@ -434,7 +471,9 @@ async fn main() -> Result<()> {
                 let state = load_connection_state()?;
                 let _ = client.connection_delete(&state.id).await;
                 let _ = std::process::Command::new("wg-quick").args(["down", "wg0"]).status();
-                let _ = r4a_vpn::dns::set_hosts_entries(&[], "master.local");
+                for host in &state.added_hosts {
+                    let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
+                }
                 remove_connection_state();
                 println!("Disconnected.");
             }

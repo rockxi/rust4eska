@@ -38,7 +38,7 @@
 - Верификация только по SHA256.
 
 **CORS (H-6)**
-- `AllowOrigin::predicate`: разрешены `http://10.42.*`, `http://master.local`, `http://localhost`, `http://127.0.0.1`.
+- `AllowOrigin::predicate`: разрешены `http://10.42.*`, `http://master.local`, `http://master.r4a.local`, `http://localhost`, `http://127.0.0.1`.
 
 ---
 
@@ -150,6 +150,61 @@
 - Обязательное поле — пустая строка не матчит ни одну ноду и ни `"all"`.
 - Web UI: пустое поле блокирует Save + красная рамка.
 - `"all"` в dev (shared Docker socket) — каждый агент получает манифест, имена контейнеров различаются суффиксом ноды.
+
+---
+
+## Connection (реализовано 2026-05-25)
+
+### Архитектура
+- Позволяет подключить машину к кластеру через WireGuard без регистрации как нода.
+- Клиент получает VPN IP, настраивает WG туннель, но НЕ запускает воркеры/reconciler.
+- Ingress (Pingora, порт 8000) доступен через туннель по IP `10.42.0.1`.
+
+### Хранение
+- Sled дерево `connections`: активные подключения (evict'ятся при disconnect или по таймауту 90s).
+- Sled дерево `connection_labels`: `label → vpn_ip` — постоянный маппинг, IP не меняется при переподключении.
+
+### API (Auth: Bearer token, Resource::Connections)
+- `POST /api/connections` — создать подключение
+- `DELETE /api/connections/:id` — отключиться
+- `GET /api/connections` — список активных
+- `POST /api/connections/:id/heartbeat` — продлить жизнь (каждые 30s)
+- Фоновая задача: удалять connections где `last_seen > 90s`
+
+### CLI (`r4a-cli`)
+- `r4a-cli --master <url> --token <bearer> connect up [--label <name>]`
+- `r4a-cli connect down`
+- `r4a-cli connect status`
+- `r4a-cli connect list`
+- WG endpoint авто-деривируется из `--master` URL (host берётся из него).
+- Heartbeat работает через `tokio::select!` в основном потоке.
+- При Ctrl-C — DELETE на сервере + `wg-quick down wg0` + очистка `/etc/hosts`.
+- Стейт сохраняется в `~/.r4a-connection.json`.
+
+### r4a-client
+- Добавлены методы: `connection_create`, `connection_delete`, `connection_heartbeat`, `connections_list`.
+- `ApiClient::with_token(url, token)` — создать клиент с прямым Bearer токеном.
+
+### DNS на macOS (схема r4a.local)
+- При `connect up` добавляются записи в `/etc/hosts`:
+  - `10.42.0.1 master.r4a.local # r4a-managed`
+  - `<vpn_ip> <label>.r4a.local # r4a-managed` (если задан `--label`)
+  - `<node_ip> <node_name>.r4a.local # r4a-managed` для каждой ноды кластера
+- Все добавленные хосты сохраняются в `~/.r4a-connection.json` (поле `added_hosts`).
+- При `connect down` / Ctrl-C — все записи удаляются атомарно.
+- Ingress доступен по `http://master.r4a.local:8000`.
+- Браузер: явно `http://` (не https). Firefox кэширует HSTS — очистить данные сайта.
+
+### compose.yaml
+- Добавлен проброс порта `51820:51820/udp` для WireGuard.
+
+### Нюансы
+- IP всегда один и тот же для одного label — хранится в `connection_labels`.
+- Без label — IP динамический (из пула `next_ip`).
+- WG endpoint: при `--master http://localhost:8080` → `localhost:51820` (авто).
+- `r4a-cli --token` / `R4A_TOKEN` — аутентификация по Bearer токену (альтернатива `--secret`).
+- Web UI через VPN: `http://master.r4a.local:8081` (React app), API на `:8080`, Ingress на `:8000`.
+- CORS настроен на `master.r4a.local` — Web UI работает при подключении через `connect up`.
 
 ---
 
