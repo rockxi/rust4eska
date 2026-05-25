@@ -70,3 +70,11 @@
     - [x] r4a-cli: `connect up` добавляет `<node_name>.r4a.local` для каждой ноды кластера
     - [x] r4a-cli: `ConnectionState` хранит `added_hosts: Vec<String>` — чистит все при disconnect
     - [x] r4a-server: CORS добавлен `http://master.r4a.local` в AllowOrigin
+
+- [x] **Feature: встроенный DNS-сервер (2026-05-25)**
+    - [x] r4a-server: `run_dns_server(vpn_ip, store)` — UDP на `<vpn_ip>:53`
+    - [x] r4a-server: `*.r4a.local` — peers по name, connection labels по label, master → 10.42.0.1
+    - [x] r4a-server: AAAA → NOERROR/empty, A/ANY → ответ или NXDOMAIN, остальное → forward 8.8.8.8
+    - [x] r4a-vpn: `set_resolver_domain` / `remove_resolver_domain` — `/etc/resolver/<domain>` на macOS
+    - [x] r4a-cli: `connect up` создаёт `/etc/resolver/r4a.local` → `10.42.0.1`; убраны node /etc/hosts
+    - [x] r4a-cli: `connect down` / Ctrl-C удаляют `/etc/resolver/r4a.local`

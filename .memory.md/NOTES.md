@@ -185,14 +185,25 @@
 - Добавлены методы: `connection_create`, `connection_delete`, `connection_heartbeat`, `connections_list`.
 - `ApiClient::with_token(url, token)` — создать клиент с прямым Bearer токеном.
 
+### DNS-сервер на мастере
+- `run_dns_server(vpn_ip, store)` запускается в `start_server` — UDP на `10.42.0.1:53`.
+- Разрешает `*.r4a.local`:
+  - `master.r4a.local` → `10.42.0.1` (hardcoded)
+  - `<node_name>.r4a.local` → VPN IP ноды (из `store.get("core", "peers")`)
+  - `<label>.r4a.local` → VPN IP connection-клиента (из `store.get_label_ip(label)`)
+  - Неизвестные `*.r4a.local` → NXDOMAIN
+  - AAAA запросы для `*.r4a.local` → NOERROR пустой ответ (нет IPv6)
+- Остальные домены → форвард на `8.8.8.8:53` (timeout 3s).
+- Реализовано без внешних DNS-крейтов (raw UDP + ручной парсинг/сборка DNS пакетов).
+
 ### DNS на macOS (схема r4a.local)
-- При `connect up` добавляются записи в `/etc/hosts`:
-  - `10.42.0.1 master.r4a.local # r4a-managed`
-  - `<vpn_ip> <label>.r4a.local # r4a-managed` (если задан `--label`)
-  - `<node_ip> <node_name>.r4a.local # r4a-managed` для каждой ноды кластера
-- Все добавленные хосты сохраняются в `~/.r4a-connection.json` (поле `added_hosts`).
-- При `connect down` / Ctrl-C — все записи удаляются атомарно.
-- Ingress доступен по `http://master.r4a.local:8000`.
+- При `connect up`:
+  - `/etc/hosts`: `10.42.0.1 master.r4a.local` и `<vpn_ip> <label>.r4a.local` (fallback)
+  - `/etc/resolver/r4a.local`: `nameserver 10.42.0.1` — macOS направляет все `*.r4a.local` на наш DNS
+- Динамические имена нод (`agent1.r4a.local` и т.д.) теперь разрешаются через DNS (не через /etc/hosts).
+- При `connect down` / Ctrl-C — удаляются `/etc/hosts` записи и `/etc/resolver/r4a.local`.
+- Стейт хранит `added_hosts: Vec<String>` и `resolver_domain: Option<String>` в `~/.r4a-connection.json`.
+- Web UI: `http://master.r4a.local:8081`, Ingress: `http://master.r4a.local:8000`.
 - Браузер: явно `http://` (не https). Firefox кэширует HSTS — очистить данные сайта.
 
 ### compose.yaml

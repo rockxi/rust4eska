@@ -525,6 +525,13 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         }
     });
 
+    // DNS server for *.r4a.local
+    let dns_store = store.clone();
+    let dns_vpn_ip = my_vpn_ip.clone();
+    tokio::spawn(async move {
+        run_dns_server(dns_vpn_ip, dns_store).await;
+    });
+
     let broadcast_state = state.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
@@ -2033,5 +2040,153 @@ async fn connection_heartbeat_handler(
     } else {
         Err((StatusCode::NOT_FOUND, "Connection not found".to_string()))
     }
+}
+
+// ── DNS server for *.r4a.local ────────────────────────────────────────────────
+
+async fn run_dns_server(vpn_ip: String, store: Store) {
+    let bind_addr = format!("{}:53", vpn_ip);
+    let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
+        Ok(s) => {
+            info!("DNS server listening on {}", bind_addr);
+            Arc::new(s)
+        }
+        Err(e) => {
+            warn!("DNS server: failed to bind {}: {}", bind_addr, e);
+            return;
+        }
+    };
+
+    let mut buf = [0u8; 512];
+    loop {
+        let (len, src) = match socket.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(e) => { warn!("DNS recv error: {}", e); continue; }
+        };
+        let query = buf[..len].to_vec();
+        let sock = socket.clone();
+        let st = store.clone();
+        tokio::spawn(async move {
+            if let Some(response) = handle_dns_query(&query, &st).await {
+                let _ = sock.send_to(&response, src).await;
+            }
+        });
+    }
+}
+
+async fn handle_dns_query(query: &[u8], store: &Store) -> Option<Vec<u8>> {
+    if query.len() < 13 { return None; }
+
+    let (qname, after_qname) = dns_parse_qname(query, 12)?;
+    if after_qname + 4 > query.len() { return None; }
+    let qtype = u16::from_be_bytes([query[after_qname], query[after_qname + 1]]);
+    let qname_lower = qname.to_lowercase();
+
+    if qname_lower == "r4a.local" || qname_lower.ends_with(".r4a.local") {
+        // AAAA query — we have no IPv6, respond NOERROR with empty answers
+        if qtype == 28 {
+            return Some(dns_noerror_empty(query));
+        }
+        // A query (1) or ANY (255) — try to resolve
+        if qtype == 1 || qtype == 255 {
+            let ip = dns_resolve(&qname_lower, store).await;
+            return Some(match ip {
+                Some(ip) => dns_a_response(query, ip),
+                None => dns_nxdomain(query),
+            });
+        }
+        // Other types for our domain — NOERROR, no answers
+        return Some(dns_noerror_empty(query));
+    }
+
+    // Not our domain — forward to upstream
+    dns_forward(query).await
+}
+
+async fn dns_resolve(qname: &str, store: &Store) -> Option<std::net::Ipv4Addr> {
+    if qname == "master.r4a.local" {
+        return "10.42.0.1".parse().ok();
+    }
+    let label = qname.strip_suffix(".r4a.local")?;
+
+    // Check peers by name
+    let peers: HashMap<String, PeerInfo> = store
+        .get("core", b"peers")
+        .ok()
+        .flatten()
+        .and_then(|d| serde_json::from_slice(&d).ok())
+        .unwrap_or_default();
+
+    if let Some(peer) = peers.values().find(|p| p.name.to_lowercase() == label) {
+        return peer.ip.parse().ok();
+    }
+
+    // Check connection labels
+    store.get_label_ip(label).ok().flatten()?.parse().ok()
+}
+
+async fn dns_forward(query: &[u8]) -> Option<Vec<u8>> {
+    let upstream = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    upstream.send_to(query, "8.8.8.8:53").await.ok()?;
+    let mut buf = vec![0u8; 512];
+    let len = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        upstream.recv(&mut buf),
+    ).await.ok()?.ok()?;
+    buf.truncate(len);
+    Some(buf)
+}
+
+fn dns_parse_qname(buf: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut labels: Vec<String> = Vec::new();
+    let mut pos = start;
+    loop {
+        if pos >= buf.len() { return None; }
+        let len = buf[pos] as usize;
+        if len == 0 { pos += 1; break; }
+        if len & 0xC0 == 0xC0 { return None; } // no pointers in queries
+        pos += 1;
+        if pos + len > buf.len() { return None; }
+        labels.push(std::str::from_utf8(&buf[pos..pos + len]).ok()?.to_string());
+        pos += len;
+    }
+    Some((labels.join("."), pos))
+}
+
+fn dns_a_response(query: &[u8], ip: std::net::Ipv4Addr) -> Vec<u8> {
+    let mut r = Vec::new();
+    r.extend_from_slice(&query[0..2]);           // transaction ID
+    r.extend_from_slice(&[0x81, 0x80]);          // QR=1 AA=0 RD=1 RA=1 RCODE=0
+    r.extend_from_slice(&[0x00, 0x01]);          // QDCOUNT=1
+    r.extend_from_slice(&[0x00, 0x01]);          // ANCOUNT=1
+    r.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // NSCOUNT=0 ARCOUNT=0
+    r.extend_from_slice(&query[12..]);           // question section
+    r.extend_from_slice(&[0xC0, 0x0C]);          // NAME: pointer to offset 12
+    r.extend_from_slice(&[0x00, 0x01]);          // TYPE=A
+    r.extend_from_slice(&[0x00, 0x01]);          // CLASS=IN
+    r.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL=60
+    r.extend_from_slice(&[0x00, 0x04]);          // RDLENGTH=4
+    r.extend_from_slice(&ip.octets());           // RDATA
+    r
+}
+
+fn dns_nxdomain(query: &[u8]) -> Vec<u8> {
+    let mut r = Vec::new();
+    r.extend_from_slice(&query[0..2]);
+    r.extend_from_slice(&[0x81, 0x83]);          // QR=1 RD=1 RA=1 RCODE=3 (NXDOMAIN)
+    r.extend_from_slice(&[0x00, 0x01]);
+    r.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    r.extend_from_slice(&query[12..]);
+    r
+}
+
+fn dns_noerror_empty(query: &[u8]) -> Vec<u8> {
+    let mut r = Vec::new();
+    r.extend_from_slice(&query[0..2]);
+    r.extend_from_slice(&[0x81, 0x80]);          // QR=1 RD=1 RA=1 RCODE=0 (NOERROR)
+    r.extend_from_slice(&[0x00, 0x01]);
+    r.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    r.extend_from_slice(&query[12..]);
+    r
 }
 
