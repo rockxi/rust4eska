@@ -1,4 +1,8 @@
 target/
+!target/*/release/r4a-server
+!target/*/release/r4a-agent
+!target/*/release/r4a-tui
+!target/*/release/r4a-web
 binaries/**/target/
 crates/**/target/
 .git/

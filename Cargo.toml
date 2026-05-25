@@ -3,13 +3,19 @@ members = [
     "crates/r4a-vpn",
     "crates/r4a-git-registry",
     "binaries/r4a-server",
-    "binaries/r4a-agent",
-    "binaries/r4a-tui", "crates/r4a-store", "crates/r4a-service", "crates/r4a-core", "crates/r4a-worker", "crates/r4a-ingress",
+        "binaries/r4a-agent",
+    "binaries/r4a-tui",
+    "binaries/r4a-cli",
+    "binaries/r4a-web",
+    "crates/r4a-store",
+ "crates/r4a-service", "crates/r4a-core", "crates/r4a-worker", "crates/r4a-ingress",
+    "crates/r4a-client",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 r4a-core = { path = "crates/r4a-core" }
+r4a-client = { path = "crates/r4a-client" }
 r4a-worker = { path = "crates/r4a-worker" }
 r4a-ingress = { path = "crates/r4a-ingress" }
 tokio = { version = "1", features = ["full"] }
@@ -27,5 +33,10 @@ crossterm = "0.28"
 sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
+constant_time_eq = "0.3"
 bollard = "0.18"
 pingora = { version = "0.4", features = ["lb"] }
+aes-gcm = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1.8", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }

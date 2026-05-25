@@ -1,4 +1,4 @@
-use crate::api_client::NodeInfo;
+use r4a_client::NodeInfo;
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},

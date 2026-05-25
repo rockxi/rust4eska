@@ -1,25 +1,37 @@
 use anyhow::Result;
+use constant_time_eq::constant_time_eq;
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{any, get, post},
     Json, Router,
 };
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use clap::{Parser, Subcommand};
 use r4a_core::{
-    AgentUpdateStatus, AgentUpdateState, Identity, JoinRequest, JoinResponse,
-    Manifest, MetricsReport, NodeInfo, PeerInfo,
+    Manifest,
+    models::{
+        Token, Policy, Binding, Verb, Resource, Rule, VaultSecret, VaultConfig, User,
+        Identity, PeerInfo, JoinRequest, JoinResponse, MetricsReport, AgentUpdateState, AgentUpdateStatus, NodeInfo,
+        Connection, ConnectRequest, ConnectResponse,
+    },
 };
+
 use r4a_store::Store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use rand::{RngCore, thread_rng};
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+
 use sysinfo::System;
 use tracing::{info, warn, error};
 
@@ -91,6 +103,7 @@ fn load_identity() -> Result<Identity> {
         private_key: kp.private,
         public_key: kp.public,
         cluster_secret: Some(secret),
+        agent_token: None,
     };
     save_identity(&id)?;
     Ok(id)
@@ -102,7 +115,7 @@ struct AppState {
     cluster_secret: String,
     my_vpn_ip: String,
     peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
-    next_ip: Arc<Mutex<u8>>,
+    next_ip: Arc<Mutex<u16>>,
     update_pending: Arc<Mutex<bool>>,
     agent_update_states: Arc<Mutex<HashMap<String, AgentUpdateState>>>,
     store: Store,
@@ -120,12 +133,68 @@ impl FromRequestParts<AppState> for RequireSecret {
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         if let Some(auth_header) = parts.headers.get("X-R4A-Secret") {
             if let Ok(auth_str) = auth_header.to_str() {
-                if auth_str == state.cluster_secret {
+                // H-1: constant-time comparison to prevent timing attacks
+                if constant_time_eq(auth_str.as_bytes(), state.cluster_secret.as_bytes()) {
                     return Ok(RequireSecret);
                 }
             }
         }
         Err((StatusCode::UNAUTHORIZED, "Invalid or missing X-R4A-Secret header"))
+    }
+}
+
+struct RequireToken {
+    pub token: Token,
+}
+
+#[async_trait::async_trait]
+impl FromRequestParts<AppState> for RequireToken {
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        if let Some(auth_header) = parts.headers.get("Authorization") {
+            if let Ok(auth_str) = auth_header.to_str() {
+                if let Some(token_str) = auth_str.strip_prefix("Bearer ") {
+                    if let Ok(Some(token)) = state.store.get_token(token_str) {
+                        return Ok(RequireToken { token });
+                    }
+                }
+            }
+        }
+
+        Err((StatusCode::UNAUTHORIZED, "Invalid or missing Authorization header"))
+    }
+}
+
+enum Auth {
+    Token(Token),
+    Secret,
+}
+
+#[async_trait::async_trait]
+impl FromRequestParts<AppState> for Auth {
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        if let Some(auth_header) = parts.headers.get("Authorization") {
+            if let Ok(auth_str) = auth_header.to_str() {
+                if let Some(token_str) = auth_str.strip_prefix("Bearer ") {
+                    if let Ok(Some(token)) = state.store.get_token(token_str) {
+                        return Ok(Auth::Token(token));
+                    }
+                }
+            }
+        }
+
+        if let Some(auth_header) = parts.headers.get("X-R4A-Secret") {
+            if let Ok(auth_str) = auth_header.to_str() {
+                if constant_time_eq(auth_str.as_bytes(), state.cluster_secret.as_bytes()) {
+                    return Ok(Auth::Secret);
+                }
+            }
+        }
+
+        Err((StatusCode::UNAUTHORIZED, "Invalid or missing authentication (Token or Secret)"))
     }
 }
 
@@ -159,6 +228,43 @@ enum ServiceAction {
 }
 
 const AGENT_BINARY_PATH: &str = "/usr/local/bin/r4a-agent";
+const SERVER_BINARY_PATH: &str = "/usr/local/bin/r4a-server";
+const TUI_BINARY_PATH: &str = "/usr/local/bin/r4a-tui";
+
+const AGENT_SIG_PATH: &str = "/usr/local/bin/r4a-agent.sig";
+const SERVER_SIG_PATH: &str = "/usr/local/bin/r4a-server.sig";
+const TUI_SIG_PATH: &str = "/usr/local/bin/r4a-tui.sig";
+
+// Ed25519 public key for verifying official release binaries (C-2).
+// IMPORTANT: replace this with the real signing key before production deployment.
+// Generate keypair: `openssl genpkey -algorithm ed25519 -out signing.pem`
+// Export pubkey bytes: `openssl pkey -in signing.pem -pubout -outform DER | tail -c 32 | xxd -i`
+// Sign a binary: `openssl pkeyutl -sign -inkey signing.pem -rawin -in r4a-agent -out r4a-agent.sig`
+//
+// This is a DEV/TEST key — NOT FOR PRODUCTION.
+const RELEASE_SIGNING_PUBKEY: [u8; 32] = [
+    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
+    0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+    0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+    0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+];
+
+/// Verifies an Ed25519 signature over binary data using the hardcoded release key.
+/// Set env var R4A_SKIP_SIGNATURE_VERIFY=1 to bypass in development (logs a warning).
+fn verify_release_signature(data: &[u8], sig_bytes: &[u8]) -> anyhow::Result<()> {
+    if std::env::var("R4A_SKIP_SIGNATURE_VERIFY").as_deref() == Ok("1") {
+        warn!("SECURITY: signature verification skipped (R4A_SKIP_SIGNATURE_VERIFY=1) — DO NOT USE IN PRODUCTION");
+        return Ok(());
+    }
+    let key = VerifyingKey::from_bytes(&RELEASE_SIGNING_PUBKEY)
+        .map_err(|e| anyhow::anyhow!("invalid signing public key: {e}"))?;
+    let sig_arr: [u8; 64] = sig_bytes.try_into()
+        .map_err(|_| anyhow::anyhow!("invalid signature length: expected 64 bytes, got {}", sig_bytes.len()))?;
+    let sig = Signature::from_bytes(&sig_arr);
+    key.verify(data, &sig)
+        .map_err(|e| anyhow::anyhow!("signature verification failed: {e}"))?;
+    Ok(())
+}
 
 fn load_peers(store: &Store) -> HashMap<String, PeerInfo> {
     if let Ok(Some(data)) = store.get("core", b"peers") {
@@ -221,7 +327,7 @@ fn handle_service(action: ServiceAction) -> Result<()> {
     match action {
         ServiceAction::Enable => {
             let exec = "/usr/local/bin/r4a-server init";
-            manager.enable("r4a-server", "r4a Master Node", exec)?;
+            manager.enable("r4a-server", "r4a Master Node", exec, &[])?;
         }
         ServiceAction::Disable => {
             manager.disable("r4a-server")?;
@@ -359,13 +465,11 @@ async fn init(my_vpn_ip: &str, _store: Option<Store>) -> Result<()> {
 async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Result<()> {
     let cluster_secret = identity.cluster_secret.clone().unwrap_or_default();
     let git_root = r4a_git_registry::default_git_root();
-    let manifests_repo = git_root.join("manifests.git");
-    r4a_git_registry::init_repo(&manifests_repo)?;
 
     let saved_peers = load_peers(&store);
     let next_ip = saved_peers
         .values()
-        .filter_map(|p| p.ip.split('.').last()?.parse::<u8>().ok())
+        .filter_map(|p| p.ip.split('.').last()?.parse::<u16>().ok())
         .max()
         .map(|m| m + 1)
         .unwrap_or(2);
@@ -382,6 +486,44 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     };
     
     store.set_secret(cluster_secret);
+
+    // Migrate manifests from old single-blob format to per-entry format
+    if let Ok(Some(data)) = store.get("core", b"manifests") {
+        if let Ok(old) = serde_json::from_slice::<HashMap<String, Manifest>>(&data) {
+            let count = old.len();
+            for (_, manifest) in old {
+                let _ = store.put_manifest(&manifest).await;
+            }
+            let _ = store.delete("core", b"manifests").await;
+            info!("Migrated {} manifest(s) from old blob format to store", count);
+        }
+    }
+
+    let _ = store.migrate_rbac_v1_to_v2();
+
+    // Background task: expire connections that haven't sent a heartbeat in 90s
+    let cleanup_store = store.clone();
+    tokio::spawn(async move {
+        const TIMEOUT_SECS: u64 = 90;
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if let Ok(conns) = cleanup_store.list_connections() {
+                for conn in conns {
+                    if now.saturating_sub(conn.last_seen) > TIMEOUT_SECS {
+                        info!("Expiring stale connection {} ({})", conn.id, conn.vpn_ip);
+                        if let Err(e) = r4a_vpn::wireguard::remove_peer(&conn.pubkey) {
+                            warn!("WireGuard remove_peer (cleanup) failed: {}", e);
+                        }
+                        let _ = cleanup_store.delete_connection(&conn.id).await;
+                    }
+                }
+            }
+        }
+    });
 
     let broadcast_state = state.clone();
     tokio::spawn(async move {
@@ -443,57 +585,76 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         }
     });
 
-    let manifest_state = state.clone();
-    tokio::spawn(async move {
-        let repo_path = r4a_git_registry::default_git_root().join("manifests.git");
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            match r4a_git_registry::list_files(&repo_path, "main", ".toml") {
-                Ok(files) => {
-                    let mut current_manifests = HashMap::new();
-                    for file in files {
-                        if let Ok(content) = r4a_git_registry::read_file(&repo_path, "main", &file) {
-                            if let Ok(manifest) = toml::from_str::<Manifest>(&content) {
-                                current_manifests.insert(manifest.app.name.clone(), manifest);
-                            }
-                        }
-                    }
-                    
-                    if !current_manifests.is_empty() {
-                        let json = serde_json::to_vec(&current_manifests).unwrap_or_default();
-                        let _ = manifest_state.store.put("core", b"manifests", &json).await;
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-    });
 
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/join", post(join_handler))
         .route("/api/nodes", get(nodes_handler))
         .route("/api/metrics", post(metrics_handler))
-        .route("/api/manifests", get(manifests_handler))
+        .route("/api/manifests", get(manifests_handler).post(manifest_upsert_handler).delete(manifest_delete_handler))
+        .route("/api/vault", get(vault_get_handler).post(vault_set_handler).delete(vault_delete_handler))
+        .route("/api/vault/list", get(vault_list_handler))
+        .route("/api/vault/configs", get(vault_configs_list_handler).post(vault_config_create_handler))
+        .route("/api/tokens", get(tokens_list_handler).post(token_create_handler).delete(token_delete_handler))
+        .route("/api/tokens/exchange", post(token_exchange_handler))
+        .route("/api/users", get(users_list_handler))
         .route("/api/git/repos", get(git_repos_handler).post(git_create_repo_handler))
         .route("/api/agent-binary", get(agent_binary_handler))
+        .route("/api/server-binary", get(server_binary_handler))
+        .route("/api/tui-binary", get(tui_binary_handler))
         .route("/api/agent-checksum", get(agent_checksum_handler))
+        .route("/api/server-checksum", get(server_checksum_handler))
+        .route("/api/tui-checksum", get(tui_checksum_handler))
+        .route("/api/agent-binary-sig", get(agent_binary_sig_handler))
+        .route("/api/server-binary-sig", get(server_binary_sig_handler))
+        .route("/api/tui-binary-sig", get(tui_binary_sig_handler))
         .route("/api/update/test", post(update_test_handler))
         .route("/api/update/trigger", post(update_trigger_handler))
+        .route("/api/update/server-trigger", post(server_update_server_trigger_handler))
+        .route("/api/update/fetch-github", post(update_fetch_github_handler))
         .route("/api/update/poll", get(update_poll_handler))
         .route("/api/update/report", post(update_report_handler))
         .route("/api/update/status", get(update_status_handler))
+        .route("/api/nodes/:node/containers", get(node_containers_handler))
+        .route("/api/nodes/:node/containers/:container/logs", get(node_container_logs_handler))
+        .route("/api/nodes/:node/containers/:container/restart", post(node_container_restart_handler))
+        .route("/api/nodes/:node/containers/:container/stop", post(node_container_stop_handler))
+        .route("/api/nodes/:node/containers/:container/start", post(node_container_start_handler))
+        .route("/api/connections", get(connections_list_handler).post(connect_handler))
+        .route("/api/connections/:id", axum::routing::delete(disconnect_handler))
+        .route("/api/connections/:id/heartbeat", post(connection_heartbeat_handler))
         .nest_service(
             "/git",
             Router::new()
                 .route("/*path", any(r4a_git_registry::handler::git_handler))
                 .with_state(git_root),
         )
+        // H-6: restrict CORS to VPN and localhost origins only
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(|origin, _| {
+                    let s = origin.to_str().unwrap_or("");
+                    s.starts_with("http://10.42.")
+                        || s.starts_with("http://master.local")
+                        || s.starts_with("http://localhost")
+                        || s.starts_with("http://127.0.0.1")
+                }))
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(vec![
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::ACCEPT,
+                    axum::http::header::ORIGIN,
+                    axum::http::HeaderName::from_static("x-r4a-secret"),
+                ])
+        )
+        // C-2b: VPN-only middleware — all routes except / and /api/join require VPN src IP
+        .layer(axum::middleware::from_fn(require_vpn_for_api))
         .with_state(state)
         .merge(r4a_store::store_router(store.clone()));
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", API_PORT)).await?;
-    info!("API listening on 0.0.0.0:{}", API_PORT);
+    info!("API listening on 0.0.0.0:{} (non-VPN IPs restricted to /api/join)", API_PORT);
 
     let pingora_store = store.clone();
     std::thread::spawn(move || {
@@ -514,66 +675,471 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         my_server.run_forever();
     });
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
+}
+
+/// C-2b: Reject requests to sensitive endpoints from public internet IPs.
+/// Only "/" and "/api/join" are reachable from anywhere.
+/// All RFC-1918 private ranges are allowed (VPN, docker bridge, LAN).
+async fn require_vpn_for_api(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = req.uri().path();
+    let is_public = path == "/" || path == "/api/join";
+    if !is_public {
+        let allowed = match addr.ip() {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                v4.is_loopback()                                        // 127.x.x.x
+                    || o[0] == 10                                       // 10.x.x.x  (VPN, private)
+                    || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)       // 172.16-31 (docker bridge)
+                    || (o[0] == 192 && o[1] == 168)                     // 192.168.x (LAN)
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        };
+        if !allowed {
+            return (StatusCode::FORBIDDEN, "Access restricted to private network").into_response();
+        }
+    }
+    next.run(req).await
 }
 
 async fn index_handler() -> (StatusCode, &'static str) {
     (StatusCode::OK, "r4a master node OK\n")
 }
 
+fn generate_token() -> String {
+    let mut b = [0u8; 32];
+    thread_rng().fill_bytes(&mut b);
+    hex::encode(b)
+}
+
 async fn join_handler(
     State(state): State<AppState>,
     _auth: RequireSecret,
     Json(req): Json<JoinRequest>,
-) -> Json<JoinResponse> {
+) -> Result<Json<JoinResponse>, (StatusCode, String)> {
+    // C-1: validate all fields that end up in the WireGuard config file before
+    // any processing — prevents newline injection into wg0.conf directives.
+    r4a_vpn::wireguard::validate_wg_pubkey(&req.pub_key)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if let Some(ref ep) = req.public_endpoint {
+        r4a_vpn::wireguard::validate_endpoint(ep)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+    if let Some(ref name) = req.name {
+        r4a_vpn::wireguard::validate_node_name(name)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+
     let mut peers = state.peers.lock().unwrap();
+
+    // H-2: master role is only granted when explicitly enabled via env var
+    let allow_master_join = std::env::var("R4A_ALLOW_MASTER_JOIN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let requested_role = req.role.as_deref().unwrap_or("agent");
+    let role_str = if requested_role == "master" && allow_master_join {
+        "master".to_string()
+    } else {
+        "agent".to_string()
+    };
 
     let agent_ip = if let Some(existing) = peers.get(&req.pub_key) {
         existing.ip.clone()
     } else {
+        // H-3: bounds check to prevent IP allocation overflow
         let mut next = state.next_ip.lock().unwrap();
+        if *next > 254 {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "VPN IP pool exhausted (max 254 peers)".to_string()));
+        }
         let ip = format!("10.42.0.{}", *next);
         *next += 1;
         ip
     };
 
-    let role = req.role.unwrap_or_else(|| "agent".to_string());
-    let name = req.name.unwrap_or_else(|| format!("{}-{}", role, &agent_ip[agent_ip.rfind('.').unwrap_or(0)+1..]));
+    let name = req.name.clone().unwrap_or_else(|| format!("{}-{}", role_str, &agent_ip[agent_ip.rfind('.').unwrap_or(0)+1..]));
+
+    let mut to_remove = vec![];
+    for (pk, p) in peers.iter() {
+        if p.name == name && pk != &req.pub_key {
+            to_remove.push(pk.clone());
+        }
+    }
+    for pk in to_remove {
+        info!("Removing old peer entry for name '{}' with old pub_key", name);
+        peers.remove(&pk);
+    }
+
+    if let Ok(tree) = state.store.db.open_tree("tokens") {
+        let mut to_delete = vec![];
+        for item in tree.iter() {
+            if let Ok((k, v)) = item {
+                if let Ok(token) = serde_json::from_slice::<Token>(&v) {
+                    if token.username == name {
+                        to_delete.push(k);
+                    }
+                }
+            }
+        }
+        for k in to_delete {
+            info!("Removing old token for agent '{}'", name);
+            let _ = tree.remove(k);
+        }
+    }
 
     let mut wg_cmd = std::process::Command::new("wg");
     wg_cmd.args(["set", "wg0", "peer", &req.pub_key, "allowed-ips", &format!("{agent_ip}/32"), "persistent-keepalive", "25"]);
     let _ = wg_cmd.status();
+
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    
+    let mut existing_token_id = None;
+    if let Ok(tree) = state.store.db.open_tree("tokens") {
+        for item in tree.iter() {
+            if let Ok((_, v)) = item {
+                if let Ok(token) = serde_json::from_slice::<Token>(&v) {
+                    if token.username == name {
+                        existing_token_id = Some(token.id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    peers.retain(|k, v| v.name != name || k == &req.pub_key);
 
     peers.insert(
         req.pub_key.clone(),
         PeerInfo {
             pub_key: req.pub_key.clone(),
             ip: agent_ip.clone(),
-            name,
-            role,
+            name: name.clone(),
+            role: role_str.clone(),
             public_endpoint: req.public_endpoint.clone(),
             cpu_percent: None,
             ram_used_mb: None,
             ram_total_mb: None,
             vram_used_mb: None,
             vram_total_mb: None,
-            last_seen: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+            last_seen: Some(now),
         },
     );
 
     let cloned_peers = peers.clone();
     let cloned_store = state.store.clone();
+    
+    let token_str = existing_token_id.unwrap_or_else(generate_token);
+    let policy_id = format!("policy-{}", token_str);
+    let binding_id = format!("binding-{}", token_str);
+
+    let policy = if role_str == "master" {
+        Policy {
+            id: policy_id.clone(),
+            rules: vec![Rule {
+                verbs: vec![Verb::All],
+                resources: vec![Resource::All],
+                resource_names: None,
+            }],
+        }
+    } else {
+        Policy {
+            id: policy_id.clone(),
+            rules: vec![Rule {
+                verbs: vec![Verb::Get],
+                resources: vec![Resource::Vault, Resource::Manifests],
+                resource_names: None,
+            }],
+        }
+    };
+
+    let binding = Binding {
+        id: binding_id,
+        subject: name.clone(),
+        policy_id: policy_id.clone(),
+    };
+
+    let token = Token {
+        id: token_str.clone(),
+        username: name.clone(),
+        created_at: now,
+    };
+    
+    let cloned_token = token.clone();
+    let cloned_policy = policy;
+    let cloned_binding = binding;
     tokio::spawn(async move {
+        let _ = cloned_store.put_policy(cloned_policy).await;
+        let _ = cloned_store.put_binding(cloned_binding).await;
+        let _ = cloned_store.put_token(cloned_token).await;
         save_peers(&cloned_store, &cloned_peers).await;
     });
 
-    Json(JoinResponse {
+    Ok(Json(JoinResponse {
         master_pub_key: state.master_pub_key.clone(),
         agent_vpn_ip: agent_ip,
         master_endpoint: format!("{}:{}", get_external_ip(), WG_PORT),
         peers: peers.clone(),
-    })
+        agent_token: Some(token_str),
+    }))
+}
+
+#[derive(Deserialize)]
+struct VaultSetRequest {
+    config_id: String,
+    key: String,
+    value: String,
+}
+
+async fn vault_set_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Json(req): Json<VaultSetRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Create, Resource::Vault, None) {
+        return Err((StatusCode::FORBIDDEN, "Only admins can set secrets".to_string()));
+    }
+    
+    let dek = {
+        let keys = state.store.vault_keys.read().unwrap();
+        *keys.get(&req.config_id).ok_or_else(|| (StatusCode::NOT_FOUND, format!("Vault config {} not found", req.config_id)))?
+    };
+    
+    let (encrypted_value, nonce) = r4a_core::crypto::encrypt(&dek, req.value.as_bytes())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    let secret = VaultSecret {
+        config_id: req.config_id.clone(),
+        key: req.key.clone(),
+        encrypted_value,
+        nonce,
+        updated_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+    };
+    
+    state.store.put_vault_secret(secret).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    info!("Vault secret set: {}/{} by {}", req.config_id, req.key, auth.token.username);
+    Ok(StatusCode::OK)
+}
+
+async fn vault_delete_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Delete, Resource::Vault, None) {
+        return Err((StatusCode::FORBIDDEN, "Only admins can delete secrets".to_string()));
+    }
+    
+    let config_id = query.get("config_id").ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing config_id".to_string()))?;
+    let key = query.get("key").ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing key".to_string()))?;
+    
+    state.store.delete_vault_secret(config_id, key).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    info!("Vault secret deleted: {}/{} by {}", config_id, key, auth.token.username);
+    Ok(StatusCode::OK)
+}
+
+async fn vault_get_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let config_id = query.get("config_id").ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing config_id parameter".to_string()))?;
+    let key = query.get("key").ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing key parameter".to_string()))?;
+    let full_key = format!("{}/{}", config_id, key);
+
+    if !state.store.can(&auth.token.username, Verb::Get, Resource::Vault, Some(&full_key)) {
+        error!("Vault access denied: {} for {}", full_key, auth.token.username);
+        return Err((StatusCode::FORBIDDEN, "Access denied by RBAC policy".to_string()));
+    }
+    
+    let secret = state.store.get_vault_secret(config_id, key)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Secret not found".to_string()))?;
+    
+    let decrypted = state.store.decrypt_secret(&secret)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    info!("Vault secret accessed: {}/{} by {}", config_id, key, auth.token.username);
+    Ok(Json(decrypted))
+}
+
+async fn vault_list_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::List, Resource::Vault, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+    
+    let config_id = query.get("config_id").map(|s| s.as_str()).unwrap_or("default");
+    
+    let keys = state.store.list_vault_secrets(config_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    Ok(Json(keys))
+}
+
+#[derive(Deserialize)]
+struct VaultConfigCreateRequest {
+    name: String,
+}
+
+async fn vault_configs_list_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+) -> Response {
+    if !state.store.can(&auth.token.username, Verb::List, Resource::Vault, None) {
+        return (StatusCode::FORBIDDEN, "Access denied".to_string()).into_response();
+    }
+    
+    match state.store.get_vault_configs() {
+        Ok(configs) => Json(configs).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[axum::debug_handler]
+async fn vault_config_create_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Json(req): Json<VaultConfigCreateRequest>,
+) -> Result<Json<VaultConfig>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Create, Resource::Vault, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+    
+    match state.store.create_vault_config(req.name).await {
+        Ok(config) => Ok(Json(config)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+
+
+async fn tokens_list_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+) -> Result<Json<Vec<Token>>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::List, Resource::Tokens, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+    
+    let mut tokens = vec![];
+    let tree = state.store.db.open_tree("tokens")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    for item in tree.iter() {
+        if let Ok((_, v)) = item {
+            if let Ok(token) = serde_json::from_slice::<Token>(&v) {
+                tokens.push(token);
+            }
+        }
+    }
+    Ok(Json(tokens))
+}
+
+#[derive(Deserialize)]
+struct TokenCreateRequest {
+    username: String,
+    verbs: Vec<Verb>,
+    resources: Vec<Resource>,
+    #[serde(default)]
+    resource_names: Option<Vec<String>>,
+}
+
+async fn token_create_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Json(req): Json<TokenCreateRequest>,
+) -> Result<Json<Token>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Create, Resource::Tokens, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+
+    let token_str = generate_token();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    let policy_id = format!("policy-{}", token_str);
+    let binding_id = format!("binding-{}", token_str);
+
+    let policy = Policy {
+        id: policy_id.clone(),
+        rules: vec![Rule {
+            verbs: req.verbs,
+            resources: req.resources,
+            resource_names: req.resource_names,
+        }],
+    };
+
+    state.store.put_policy(policy).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let binding = Binding {
+        id: binding_id,
+        subject: req.username.clone(),
+        policy_id,
+    };
+    state.store.put_binding(binding).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let token = Token {
+        id: token_str,
+        username: req.username,
+        created_at: now,
+    };
+
+    state.store.put_token(token.clone()).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(token))
+}
+
+async fn token_delete_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Delete, Resource::Tokens, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+    let id = query.get("id").ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing id".to_string()))?;
+    
+    state.store.delete("tokens", id.as_bytes()).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    Ok(StatusCode::OK)
+}
+
+async fn users_list_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+) -> Result<Json<Vec<User>>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::List, Resource::Tokens, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+    
+    let mut users = vec![];
+    let tree = state.store.db.open_tree("users")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    
+    for item in tree.iter() {
+        if let Ok((_, v)) = item {
+            if let Ok(user) = serde_json::from_slice::<User>(&v) {
+                users.push(user);
+            }
+        }
+    }
+    Ok(Json(users))
 }
 
 async fn metrics_handler(
@@ -597,7 +1163,10 @@ async fn metrics_handler(
     StatusCode::OK
 }
 
-async fn nodes_handler(State(state): State<AppState>, _auth: RequireSecret) -> Json<Vec<NodeInfo>> {
+async fn nodes_handler(State(state): State<AppState>, auth: RequireToken) -> Result<Json<Vec<NodeInfo>>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, r4a_core::models::Verb::List, r4a_core::models::Resource::Nodes, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
     let mut sys = System::new_all();
     sys.refresh_all();
     let master_name = System::host_name().unwrap_or_else(|| "master".to_string());
@@ -638,7 +1207,7 @@ async fn nodes_handler(State(state): State<AppState>, _auth: RequireSecret) -> J
         });
     }
 
-    Json(nodes)
+    Ok(Json(nodes))
 }
 
 #[derive(Deserialize)]
@@ -648,22 +1217,76 @@ struct ManifestsQuery {
 
 async fn manifests_handler(
     State(state): State<AppState>,
-    _auth: RequireSecret,
+    auth: Auth,
     Query(query): Query<ManifestsQuery>,
-) -> Json<HashMap<String, Manifest>> {
-    if let Ok(Some(data)) = state.store.get("core", b"manifests") {
-        if let Ok(manifests) = serde_json::from_slice::<HashMap<String, Manifest>>(&data) {
-            if let Some(node_name) = query.node {
-                let filtered = manifests
-                    .into_iter()
-                    .filter(|(_, m)| m.app.node_selector == node_name || m.app.node_selector == "all")
-                    .collect();
-                return Json(filtered);
+) -> Result<Json<HashMap<String, Manifest>>, (StatusCode, String)> {
+    match &auth {
+        Auth::Token(token) => {
+            if !state.store.can(&token.username, Verb::Get, Resource::Manifests, None) {
+                return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
             }
-            return Json(manifests);
         }
+        Auth::Secret => {}
     }
-    Json(HashMap::new())
+
+    let manifests = state.store.list_manifests()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let result: HashMap<String, Manifest> = if let Some(node_name) = query.node {
+        manifests
+            .into_iter()
+            .filter(|m| m.app.node_selector == node_name || m.app.node_selector == "all")
+            .map(|m| (m.app.name.clone(), m))
+            .collect()
+    } else {
+        manifests.into_iter().map(|m| (m.app.name.clone(), m)).collect()
+    };
+
+    Ok(Json(result))
+}
+
+async fn manifest_upsert_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Json(manifest): Json<Manifest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Create, Resource::Manifests, None)
+        && !state.store.can(&auth.token.username, Verb::Update, Resource::Manifests, None)
+    {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+
+    let name = manifest.app.name.trim().to_string();
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid manifest name".to_string()));
+    }
+
+    state.store.put_manifest(&manifest).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    info!("Manifest '{}' upserted by {}", name, auth.token.username);
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct ManifestDeleteQuery {
+    name: String,
+}
+
+async fn manifest_delete_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Query(query): Query<ManifestDeleteQuery>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Delete, Resource::Manifests, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+
+    state.store.delete_manifest(&query.name).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    info!("Manifest '{}' deleted by {}", query.name, auth.token.username);
+    Ok(StatusCode::OK)
 }
 
 fn query_vram() -> (Option<u64>, Option<u64>) {
@@ -689,7 +1312,10 @@ struct RepoInfo {
     clone_url: String,
 }
 
-async fn git_repos_handler(State(state): State<AppState>, _auth: RequireSecret) -> Json<Vec<RepoInfo>> {
+async fn git_repos_handler(State(state): State<AppState>, auth: RequireToken) -> Result<Json<Vec<RepoInfo>>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, r4a_core::models::Verb::List, r4a_core::models::Resource::GitRepos, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
     let git_root = r4a_git_registry::default_git_root();
     let mut repos = vec![];
     if let Ok(entries) = std::fs::read_dir(&git_root) {
@@ -703,7 +1329,7 @@ async fn git_repos_handler(State(state): State<AppState>, _auth: RequireSecret) 
         }
     }
     repos.sort_by(|a, b| a.name.cmp(&b.name));
-    Json(repos)
+    Ok(Json(repos))
 }
 
 #[derive(Deserialize)]
@@ -713,9 +1339,12 @@ struct CreateRepoRequest {
 
 async fn git_create_repo_handler(
     State(state): State<AppState>,
-    _auth: RequireSecret,
+    auth: RequireToken,
     Json(req): Json<CreateRepoRequest>,
 ) -> Result<Json<RepoInfo>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, r4a_core::models::Verb::Create, r4a_core::models::Resource::GitRepos, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
     let name = req.name.trim().to_string();
     if name.is_empty() || name.contains('/') || name.contains("..") {
         return Err((StatusCode::BAD_REQUEST, "invalid repo name".to_string()));
@@ -738,7 +1367,9 @@ fn sha256_file(path: &str) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
-async fn agent_binary_handler(_auth: RequireSecret) -> Response {
+// Binary and signature endpoints accept both Bearer token and X-R4A-Secret,
+// because the auto-update agent only has the cluster secret (no token).
+async fn agent_binary_handler(_auth: Auth) -> Response {
     match tokio::fs::read(AGENT_BINARY_PATH).await {
         Ok(data) => Response::builder()
             .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -748,8 +1379,73 @@ async fn agent_binary_handler(_auth: RequireSecret) -> Response {
     }
 }
 
-async fn agent_checksum_handler(_auth: RequireSecret) -> Result<Json<ChecksumResponse>, (StatusCode, String)> {
+async fn server_binary_handler(_auth: Auth) -> Response {
+    match tokio::fs::read(SERVER_BINARY_PATH).await {
+        Ok(data) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(data))
+            .unwrap(),
+        Err(e) => Response::builder().status(StatusCode::NOT_FOUND).body(Body::from(e.to_string())).unwrap(),
+    }
+}
+
+async fn tui_binary_handler(_auth: Auth) -> Response {
+    match tokio::fs::read(TUI_BINARY_PATH).await {
+        Ok(data) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(data))
+            .unwrap(),
+        Err(e) => Response::builder().status(StatusCode::NOT_FOUND).body(Body::from(e.to_string())).unwrap(),
+    }
+}
+
+// C-2: signature endpoints — agents download and re-verify before applying updates.
+async fn agent_binary_sig_handler(_auth: Auth) -> Response {
+    match tokio::fs::read(AGENT_SIG_PATH).await {
+        Ok(data) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(data))
+            .unwrap(),
+        Err(_) => Response::builder().status(StatusCode::NOT_FOUND).body(Body::from("signature not found")).unwrap(),
+    }
+}
+
+async fn server_binary_sig_handler(_auth: Auth) -> Response {
+    match tokio::fs::read(SERVER_SIG_PATH).await {
+        Ok(data) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(data))
+            .unwrap(),
+        Err(_) => Response::builder().status(StatusCode::NOT_FOUND).body(Body::from("signature not found")).unwrap(),
+    }
+}
+
+async fn tui_binary_sig_handler(_auth: Auth) -> Response {
+    match tokio::fs::read(TUI_SIG_PATH).await {
+        Ok(data) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(data))
+            .unwrap(),
+        Err(_) => Response::builder().status(StatusCode::NOT_FOUND).body(Body::from("signature not found")).unwrap(),
+    }
+}
+
+async fn agent_checksum_handler(_auth: RequireToken) -> Result<Json<ChecksumResponse>, (StatusCode, String)> {
     match sha256_file(AGENT_BINARY_PATH) {
+        Some(checksum) => Ok(Json(ChecksumResponse { checksum })),
+        None => Err((StatusCode::NOT_FOUND, "binary not found".to_string())),
+    }
+}
+
+async fn server_checksum_handler(_auth: RequireToken) -> Result<Json<ChecksumResponse>, (StatusCode, String)> {
+    match sha256_file(SERVER_BINARY_PATH) {
+        Some(checksum) => Ok(Json(ChecksumResponse { checksum })),
+        None => Err((StatusCode::NOT_FOUND, "binary not found".to_string())),
+    }
+}
+
+async fn tui_checksum_handler(_auth: RequireToken) -> Result<Json<ChecksumResponse>, (StatusCode, String)> {
+    match sha256_file(TUI_BINARY_PATH) {
         Some(checksum) => Ok(Json(ChecksumResponse { checksum })),
         None => Err((StatusCode::NOT_FOUND, "binary not found".to_string())),
     }
@@ -758,19 +1454,206 @@ async fn agent_checksum_handler(_auth: RequireSecret) -> Result<Json<ChecksumRes
 #[derive(Serialize)]
 struct ChecksumResponse { checksum: String }
 
+async fn token_exchange_handler(
+    State(state): State<AppState>,
+    _auth: RequireSecret,
+) -> Result<Json<Token>, (StatusCode, String)> {
+    {
+        let tree = state.store.db.open_tree("tokens")
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for item in tree.iter() {
+            if let Ok((_, v)) = item {
+                if let Ok(token) = serde_json::from_slice::<Token>(&v) {
+                    if token.username == "admin"
+                        && state.store.can(&token.username, Verb::All, Resource::All, None)
+                    {
+                        return Ok(Json(token));
+                    }
+                }
+            }
+        }
+    }
+
+    let token_str = generate_token();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    let policy_id = format!("policy-{}", token_str);
+    let binding_id = format!("binding-{}", token_str);
+
+    let policy = Policy {
+        id: policy_id.clone(),
+        rules: vec![Rule {
+            verbs: vec![Verb::All],
+            resources: vec![Resource::All],
+            resource_names: None,
+        }],
+    };
+
+    state.store.put_policy(policy).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let binding = Binding {
+        id: binding_id,
+        subject: "admin".to_string(),
+        policy_id,
+    };
+    state.store.put_binding(binding).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let token = Token {
+        id: token_str.clone(),
+        username: "admin".to_string(),
+        created_at: now,
+    };
+
+    state.store.put_token(token.clone()).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(token))
+}
+
 #[derive(Serialize)]
 struct TestResponse { ok: bool, checksum: Option<String>, message: String }
 
-async fn update_test_handler(_auth: RequireSecret) -> Json<TestResponse> {
+async fn update_test_handler(_auth: RequireToken) -> Json<TestResponse> {
     match sha256_file(AGENT_BINARY_PATH) {
         Some(checksum) => Json(TestResponse { ok: true, checksum: Some(checksum), message: "binary OK".to_string() }),
         None => Json(TestResponse { ok: false, checksum: None, message: "not found".to_string() }),
     }
 }
 
-async fn update_trigger_handler(State(state): State<AppState>, _auth: RequireSecret) -> StatusCode {
+async fn update_trigger_handler(State(state): State<AppState>, _auth: RequireToken) -> StatusCode {
     *state.update_pending.lock().unwrap() = true;
     StatusCode::OK
+}
+
+async fn server_update_server_trigger_handler(_auth: RequireToken) -> StatusCode {
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        info!("Server update triggered, exiting for restart...");
+        std::process::exit(0);
+    });
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Serialize)]
+struct FetchGithubResponse {
+    success: bool,
+    message: String,
+    version: Option<String>,
+}
+
+async fn update_fetch_github_handler(_auth: RequireToken) -> Json<FetchGithubResponse> {
+    match do_fetch_github().await {
+        Ok(version) => Json(FetchGithubResponse {
+            success: true,
+            message: format!("Successfully downloaded version {}", version),
+            version: Some(version),
+        }),
+        Err(e) => Json(FetchGithubResponse {
+            success: false,
+            message: format!("Failed to fetch from GitHub: {}", e),
+            version: None,
+        }),
+    }
+}
+
+async fn do_fetch_github() -> Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent("r4a-cluster-manager")
+        .build()?;
+
+    let repo_url = "https://api.github.com/repos/rockxi/rust4eska/releases/latest";
+    let release: GithubRelease = client.get(repo_url).send().await?.error_for_status()?.json().await?;
+
+    let arch = std::env::consts::ARCH;
+    let target = format!("{}-unknown-linux-musl", arch);
+    let skip_verify = std::env::var("R4A_SKIP_SIGNATURE_VERIFY").as_deref() == Ok("1");
+
+    for binary in ["r4a-server", "r4a-agent", "r4a-tui"] {
+        let bin_pattern = format!("{}-{}", binary, target);
+        let sig_pattern = format!("{}-{}.sig", binary, target);
+
+        let binary_asset = release.assets.iter().find(|a| {
+            a.name.contains(&bin_pattern) || a.name == *binary
+        });
+
+        let sig_asset = release.assets.iter().find(|a| {
+            a.name.contains(&sig_pattern) || a.name == format!("{}.sig", binary)
+        });
+
+        let binary_asset = match binary_asset {
+            Some(a) => a,
+            None => {
+                warn!("Could not find asset for {} in release {}", binary, release.tag_name);
+                continue;
+            }
+        };
+
+        // C-2: require signature unless explicitly bypassed for development
+        let sig_bytes = match sig_asset {
+            Some(sa) => {
+                let b = client.get(&sa.browser_download_url).send().await?.error_for_status()?.bytes().await?;
+                Some(b.to_vec())
+            }
+            None if skip_verify => {
+                warn!("SECURITY: no signature for {} in release {} (R4A_SKIP_SIGNATURE_VERIFY=1)", binary, release.tag_name);
+                None
+            }
+            None => {
+                error!("No signature asset for {} in release {} — refusing to deploy unsigned binary", binary, release.tag_name);
+                continue;
+            }
+        };
+
+        let bytes = client.get(&binary_asset.browser_download_url).send().await?.error_for_status()?.bytes().await?;
+
+        // C-2: verify Ed25519 signature before writing to disk
+        if let Some(ref sig) = sig_bytes {
+            verify_release_signature(&bytes, sig)
+                .map_err(|e| anyhow::anyhow!("Refusing to deploy {}: {}", binary, e))?;
+            info!("Signature verified for {}", binary);
+        }
+
+        let (dest, sig_dest) = match binary {
+            "r4a-server" => (std::path::Path::new(SERVER_BINARY_PATH), std::path::Path::new(SERVER_SIG_PATH)),
+            "r4a-agent"  => (std::path::Path::new(AGENT_BINARY_PATH), std::path::Path::new(AGENT_SIG_PATH)),
+            "r4a-tui"    => (std::path::Path::new(TUI_BINARY_PATH), std::path::Path::new(TUI_SIG_PATH)),
+            _ => continue,
+        };
+
+        let tmp_path = dest.with_extension("tmp_download");
+        tokio::fs::write(&tmp_path, &bytes).await?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
+        }
+
+        tokio::fs::rename(&tmp_path, dest).await?;
+
+        // Store signature alongside binary so agents can re-verify it
+        if let Some(sig) = sig_bytes {
+            tokio::fs::write(sig_dest, &sig).await?;
+        }
+
+        info!("Downloaded and replaced {} (release {})", binary, release.tag_name);
+    }
+
+    Ok(release.tag_name)
 }
 
 #[derive(Serialize)]
@@ -792,10 +1675,37 @@ async fn update_report_handler(State(state): State<AppState>, _auth: RequireSecr
         "failed" => AgentUpdateStatus::Failed("failed".to_string()),
         _ => AgentUpdateStatus::Unknown,
     };
-    state.agent_update_states.lock().unwrap().insert(
-        report.agent_vpn_ip,
-        AgentUpdateState { status: update_status, checksum: Some(report.checksum) },
-    );
+    {
+        let mut states = state.agent_update_states.lock().unwrap();
+        states.insert(
+            report.agent_vpn_ip,
+            AgentUpdateState { status: update_status, checksum: Some(report.checksum) },
+        );
+
+        // Auto-reset update_pending once all known agents have the master checksum
+        let master_checksum = sha256_file(AGENT_BINARY_PATH);
+        if let Some(ref mc) = master_checksum {
+            let peers = state.peers.lock().unwrap();
+            let agent_ips: Vec<String> = peers.values()
+                .filter(|p| p.role == "agent")
+                .map(|p| p.ip.clone())
+                .collect();
+            drop(peers);
+
+            let all_updated = !agent_ips.is_empty() && agent_ips.iter().all(|ip| {
+                match states.get(ip) {
+                    Some(s) => matches!(s.status, AgentUpdateStatus::Updated)
+                               && s.checksum.as_deref() == Some(mc.as_str()),
+                    None => false,
+                }
+            });
+
+            if all_updated {
+                *state.update_pending.lock().unwrap() = false;
+                info!("All agents updated to {}, clearing update_pending", &mc[..8]);
+            }
+        }
+    }
     StatusCode::OK
 }
 
@@ -805,26 +1715,153 @@ struct UpdateStatusResponse { master_checksum: Option<String>, update_pending: b
 #[derive(Serialize)]
 struct AgentUpdateStateDto { status: String, checksum: Option<String> }
 
-async fn update_status_handler(State(state): State<AppState>, _auth: RequireSecret) -> Json<UpdateStatusResponse> {
+async fn update_status_handler(State(state): State<AppState>, _auth: RequireToken) -> Json<UpdateStatusResponse> {
     let master_checksum = sha256_file(AGENT_BINARY_PATH);
     let update_pending = *state.update_pending.lock().unwrap();
     let states = state.agent_update_states.lock().unwrap();
-    let agents = states.iter().map(|(ip, s)| {
+    let peers = state.peers.lock().unwrap();
+
+    // Start with all connected agent peers so they appear even before reporting
+    let mut agents: HashMap<String, AgentUpdateStateDto> = peers.values()
+        .filter(|p| p.role == "agent")
+        .map(|p| (p.ip.clone(), AgentUpdateStateDto { status: "idle".to_string(), checksum: None }))
+        .collect();
+
+    // Overlay with any reported update states
+    for (ip, s) in states.iter() {
         let status_str = match &s.status {
             AgentUpdateStatus::Updated => "updated",
             AgentUpdateStatus::Updating => "updating",
             AgentUpdateStatus::Failed(_) => "failed",
-            _ => "unknown",
+            // If checksum matches master, agent is effectively up-to-date
+            _ if s.checksum.as_deref() == master_checksum.as_deref() => "updated",
+            _ => "idle",
         }.to_string();
-        (ip.clone(), AgentUpdateStateDto { status: status_str, checksum: s.checksum.clone() })
-    }).collect();
+        agents.insert(ip.clone(), AgentUpdateStateDto { status: status_str, checksum: s.checksum.clone() });
+    }
+
     Json(UpdateStatusResponse { master_checksum, update_pending, agents })
+}
+
+const AGENT_API_PORT: u16 = 8082;
+
+#[derive(Deserialize)]
+struct NodePath {
+    node: String,
+}
+
+#[derive(Deserialize)]
+struct NodeContainerPath {
+    node: String,
+    container: String,
+}
+
+#[derive(Deserialize)]
+struct ContainerLogsQuery {
+    tail: Option<u64>,
+}
+
+fn find_peer_ip(state: &AppState, node_name: &str) -> Option<String> {
+    let peers = state.peers.lock().unwrap();
+    peers.values()
+        .find(|p| p.name == node_name)
+        .map(|p| p.ip.clone())
+}
+
+async fn proxy_get(url: &str, secret: &str) -> Result<reqwest::Response, (StatusCode, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    client.get(url)
+        .header("X-R4A-Secret", secret)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
+}
+
+async fn proxy_post(url: &str, secret: &str) -> Result<reqwest::Response, (StatusCode, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+    client.post(url)
+        .header("X-R4A-Secret", secret)
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
+}
+
+async fn node_containers_handler(
+    State(state): State<AppState>,
+    _auth: RequireToken,
+    Path(NodePath { node }): Path<NodePath>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let ip = find_peer_ip(&state, &node)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Node '{}' not found", node)))?;
+    let url = format!("http://{}:{}/containers", ip, AGENT_API_PORT);
+    let resp = proxy_get(&url, &state.cluster_secret).await?;
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = resp.bytes().await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok((status, axum::body::Body::from(body)))
+}
+
+async fn node_container_logs_handler(
+    State(state): State<AppState>,
+    _auth: RequireToken,
+    Path(NodeContainerPath { node, container }): Path<NodeContainerPath>,
+    Query(q): Query<ContainerLogsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let ip = find_peer_ip(&state, &node)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Node '{}' not found", node)))?;
+    let tail = q.tail.unwrap_or(200);
+    let url = format!("http://{}:{}/containers/{}/logs?tail={}", ip, AGENT_API_PORT, container, tail);
+    let resp = proxy_get(&url, &state.cluster_secret).await?;
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = resp.bytes().await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok((status, axum::body::Body::from(body)))
+}
+
+async fn node_container_restart_handler(
+    State(state): State<AppState>,
+    _auth: RequireToken,
+    Path(NodeContainerPath { node, container }): Path<NodeContainerPath>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let ip = find_peer_ip(&state, &node)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Node '{}' not found", node)))?;
+    let url = format!("http://{}:{}/containers/{}/restart", ip, AGENT_API_PORT, container);
+    let resp = proxy_post(&url, &state.cluster_secret).await?;
+    Ok(StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+}
+
+async fn node_container_stop_handler(
+    State(state): State<AppState>,
+    _auth: RequireToken,
+    Path(NodeContainerPath { node, container }): Path<NodeContainerPath>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let ip = find_peer_ip(&state, &node)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Node '{}' not found", node)))?;
+    let url = format!("http://{}:{}/containers/{}/stop", ip, AGENT_API_PORT, container);
+    let resp = proxy_post(&url, &state.cluster_secret).await?;
+    Ok(StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+}
+
+async fn node_container_start_handler(
+    State(state): State<AppState>,
+    _auth: RequireToken,
+    Path(NodeContainerPath { node, container }): Path<NodeContainerPath>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let ip = find_peer_ip(&state, &node)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Node '{}' not found", node)))?;
+    let url = format!("http://{}:{}/containers/{}/start", ip, AGENT_API_PORT, container);
+    let resp = proxy_post(&url, &state.cluster_secret).await?;
+    Ok(StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
 }
 
 fn get_external_ip() -> String {
     let out = std::process::Command::new("ip").args(["-4", "addr", "show"]).output();
     let mut fallback = "127.0.0.1".to_string();
-    
+
     if let Ok(o) = out {
         let text = String::from_utf8_lossy(&o.stdout);
         for line in text.lines() {
@@ -843,3 +1880,157 @@ fn get_external_ip() -> String {
     }
     fallback
 }
+
+// --- Connection handlers ---
+
+async fn connections_list_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+) -> Result<Json<Vec<Connection>>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::List, Resource::Connections, None) {
+        return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
+    }
+    let conns = state.store.list_connections()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(conns))
+}
+
+async fn connect_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Json(req): Json<ConnectRequest>,
+) -> Result<Json<ConnectResponse>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Create, Resource::Connections, None) {
+        return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
+    }
+
+    r4a_vpn::wireguard::validate_wg_pubkey(&req.pubkey)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // Evict any existing active connection with the same pubkey or label
+    if let Ok(existing) = state.store.list_connections() {
+        for old in existing {
+            if old.pubkey == req.pubkey || (req.label.is_some() && old.label == req.label) {
+                if let Err(e) = r4a_vpn::wireguard::remove_peer(&old.pubkey) {
+                    warn!("WireGuard remove_peer (evict) failed: {}", e);
+                }
+                let _ = state.store.delete_connection(&old.id).await;
+            }
+        }
+    }
+
+    // Use pinned IP for this label, or allocate a new one and pin it
+    let vpn_ip = if let Some(label) = &req.label {
+        match state.store.get_label_ip(label) {
+            Ok(Some(ip)) => ip,
+            _ => {
+                let ip = {
+                    let mut next = state.next_ip.lock().unwrap();
+                    if *next > 254 {
+                        return Err((StatusCode::SERVICE_UNAVAILABLE, "VPN IP pool exhausted".to_string()));
+                    }
+                    let ip = format!("10.42.0.{}", *next);
+                    *next += 1;
+                    ip
+                };
+                if let Err(e) = state.store.set_label_ip(label, &ip).await {
+                    warn!("Failed to pin label IP: {}", e);
+                }
+                ip
+            }
+        }
+    } else {
+        let mut next = state.next_ip.lock().unwrap();
+        if *next > 254 {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "VPN IP pool exhausted".to_string()));
+        }
+        let ip = format!("10.42.0.{}", *next);
+        *next += 1;
+        ip
+    };
+
+    if let Err(e) = r4a_vpn::wireguard::add_peer(&req.pubkey, &vpn_ip) {
+        warn!("WireGuard add_peer failed: {}", e);
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let id = {
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    };
+
+    let conn = Connection {
+        id: id.clone(),
+        pubkey: req.pubkey.clone(),
+        vpn_ip: vpn_ip.clone(),
+        label: req.label,
+        connected_at: now,
+        last_seen: now,
+    };
+
+    state.store.put_connection(&conn).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let master_endpoint = format!("{}:{}", get_external_ip(), WG_PORT);
+
+    Ok(Json(ConnectResponse {
+        id,
+        vpn_ip,
+        master_pubkey: state.master_pub_key.clone(),
+        master_endpoint,
+        heartbeat_interval_secs: 30,
+    }))
+}
+
+async fn disconnect_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Delete, Resource::Connections, None) {
+        return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
+    }
+
+    let conn = state.store.get_connection(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Connection not found".to_string()))?;
+
+    if let Err(e) = r4a_vpn::wireguard::remove_peer(&conn.pubkey) {
+        warn!("WireGuard remove_peer failed: {}", e);
+    }
+
+    state.store.delete_connection(&id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn connection_heartbeat_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Update, Resource::Connections, None) {
+        return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let found = state.store.update_connection_heartbeat(&id, now).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if found {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, "Connection not found".to_string()))
+    }
+}
+

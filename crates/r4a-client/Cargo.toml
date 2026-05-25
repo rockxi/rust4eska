@@ -1,0 +1,12 @@
+[package]
+name = "r4a-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+r4a-core = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }

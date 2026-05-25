@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     git \
     g++ \
+    curl \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,8 +18,11 @@ WORKDIR /app
 # Copy the entire workspace
 COPY . .
 
+# Build the frontend
+RUN cd binaries/r4a-web/frontend && npm install && npm run build
+
 # Build the binaries
-RUN cargo build --release --bin r4a-server --bin r4a-agent --bin r4a-tui
+RUN cargo build --release --bin r4a-server --bin r4a-agent --bin r4a-tui --bin r4a-web
 
 # Final stage
 FROM debian:bookworm-slim
@@ -37,6 +43,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /app/target/release/r4a-server /usr/local/bin/
 COPY --from=builder /app/target/release/r4a-agent /usr/local/bin/
 COPY --from=builder /app/target/release/r4a-tui /usr/local/bin/
+COPY --from=builder /app/target/release/r4a-web /usr/local/bin/
 
 # Create required directories for state
 RUN mkdir -p /root/.r4a-server /root/.r4a-agent

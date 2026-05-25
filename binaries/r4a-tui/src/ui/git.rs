@@ -1,4 +1,4 @@
-use crate::api_client::RepoInfo;
+use r4a_client::RepoInfo;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},

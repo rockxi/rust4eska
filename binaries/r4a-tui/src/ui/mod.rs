@@ -1,14 +1,18 @@
 pub mod dashboard;
 pub mod git;
+pub mod manifests;
 pub mod not_implemented;
+pub mod rbac;
 pub mod update;
+pub mod vault;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Screen {
     Dashboard,
-    Git,
-    Rbac,
     Manifests,
+    Git,
+    Vault,
+    Rbac,
     Observability,
     Update,
 }
@@ -16,9 +20,10 @@ pub enum Screen {
 impl Screen {
     pub const ALL: &'static [Screen] = &[
         Screen::Dashboard,
-        Screen::Git,
-        Screen::Rbac,
         Screen::Manifests,
+        Screen::Git,
+        Screen::Vault,
+        Screen::Rbac,
         Screen::Observability,
         Screen::Update,
     ];
@@ -26,9 +31,10 @@ impl Screen {
     pub fn title(&self) -> &'static str {
         match self {
             Screen::Dashboard => "Dashboard",
-            Screen::Git => "Git",
-            Screen::Rbac => "RBAC",
             Screen::Manifests => "Manifests",
+            Screen::Git => "Git",
+            Screen::Vault => "Vault",
+            Screen::Rbac => "RBAC",
             Screen::Observability => "Observability",
             Screen::Update => "Update",
         }

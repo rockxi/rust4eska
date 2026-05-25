@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 r4a-core = { workspace = true }
+r4a-client = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 reqwest = { workspace = true }
@@ -17,3 +18,4 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+sha2 = { workspace = true }

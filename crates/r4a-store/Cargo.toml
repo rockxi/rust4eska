@@ -12,3 +12,8 @@ serde_json.workspace = true
 sled = "0.34.7"
 tokio.workspace = true
 tracing.workspace = true
+r4a-core = { workspace = true }
+zeroize = { workspace = true }
+rand = { workspace = true }
+uuid = { version = "1.13.1", features = ["v4", "serde"] }
+constant_time_eq = { workspace = true }

@@ -1,0 +1,32 @@
+# Final stage only - expects binaries to be pre-built in target/aarch64-unknown-linux-musl/release/
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    wireguard-tools \
+    iproute2 \
+    iptables \
+    ca-certificates \
+    curl \
+    docker.io \
+    procps \
+    iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+# Argument for architecture-specific path
+ARG TARGET_DIR=target/aarch64-unknown-linux-musl/release
+
+# Copy binaries from host (relative to context root)
+COPY ${TARGET_DIR}/r4a-server /usr/local/bin/
+COPY ${TARGET_DIR}/r4a-agent /usr/local/bin/
+COPY ${TARGET_DIR}/r4a-tui /usr/local/bin/
+COPY ${TARGET_DIR}/r4a-web /usr/local/bin/
+
+# Create required directories for state
+RUN mkdir -p /root/.r4a-server /root/.r4a-agent
+
+# Set working directory
+WORKDIR /root
+
+# Default command
+CMD ["r4a-server", "init"]

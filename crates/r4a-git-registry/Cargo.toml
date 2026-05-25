@@ -11,3 +11,6 @@ tracing = { workspace = true }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"
+tempfile = "3"
+serde = { workspace = true }
+r4a-core = { workspace = true }

@@ -15,6 +15,7 @@ r4a-git-registry = { path = "../../crates/r4a-git-registry" }
 tokio = { workspace = true }
 clap = { workspace = true }
 axum = { workspace = true }
+tower-http = { version = "0.5", features = ["cors"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -30,4 +31,6 @@ pingora = { workspace = true }
 r4a-store = { version = "0.1.0", path = "../../crates/r4a-store" }
 r4a-service = { version = "0.1.0", path = "../../crates/r4a-service" }
 reqwest = { workspace = true }
+constant_time_eq = { workspace = true }
+ed25519-dalek = { workspace = true }
 

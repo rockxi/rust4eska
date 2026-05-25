@@ -1,4 +1,4 @@
-use crate::api_client::UpdateStatus;
+use r4a_client::UpdateStatus;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},

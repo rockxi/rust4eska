@@ -1,0 +1,18 @@
+[package]
+name = "r4a-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "r4a-cli"
+path = "src/main.rs"
+
+[dependencies]
+r4a-core = { workspace = true }
+r4a-client = { workspace = true }
+r4a-vpn = { path = "../../crates/r4a-vpn" }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }

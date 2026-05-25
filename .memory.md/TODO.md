@@ -1,54 +1,65 @@
 # TODO
 
-- [x] Очистить старый проект (r4e бинарники, wg0)
-- [x] Rust workspace r4a создан (r4a-server, r4a-agent, r4a-vpn)
-- [x] **WireGuard VPN**: asus=master(10.42.0.1), home=agent — поднимается автоматически бинарниками
-- [x] **Ingress**: r4a-server на базе Pingora (порт 8000)
-- [x] **DNS на master**: master.local → 10.42.0.1 теперь прописывается и на мастере в /etc/hosts
-- [x] **DNS на home**: master.local → 10.42.0.1 прописывается r4a-agent в /etc/hosts
-- [x] **Makefile**: Автоматизация сборки (musl), деплоя (scp) и перезапуска на asus/home
-- [x] Проверка: curl http://master.local с home → HTTP 200 ✓
-- [x] **TUI**: r4a-tui бинарник, Dashboard (Status, CPU, RAM, имя ноды), Git, Update
-- [x] **Метрики агента**: агент шлёт CPU/RAM/VRAM на мастер каждые 5 сек через POST /api/metrics
-- [x] **Тестирование**: Создание `compose.yaml` для имитации кластера (1 мастер, 2 агента)
+- [x] **Манифесты через State (Sled DB)**
+    - [x] Убрать git-based manifest polling
+    - [x] Добавить CRUD методы в r4a-store (put_manifest, list_manifests, delete_manifest)
+    - [x] Новые эндпоинты: GET/POST/DELETE /api/manifests
+    - [x] Миграция старого blob-формата манифестов
+    - [x] TUI: экран Manifests (просмотр, создание, удаление)
+    - [x] Web UI: CRUD форма манифестов (без TOML редактора)
+    - [x] CLI: manifest_upsert, manifest_delete в r4a-client
 
-## TUI — оставшиеся экраны
+- [x] **Fix: Worker перезапускает контейнеры в цикле**
+    - [x] Label-изоляция: агенты фильтруют контейнеры по `r4a.node=<name>`
+    - [x] При 409 (контейнер без лейбла) — удалять и пересоздавать с лейблом
+    - [x] Fix ExposedPorts: добавить Config.ExposedPorts при создании контейнера с портами
 
-- [ ] **TUI: RBAC экран** — таблица пользователей, формы создания токенов (требует `/api/users` и `/api/tokens` на сервере)
-- [ ] **TUI: Manifests экран** — просмотр текущих манифестов и их статуса на нодах
-- [ ] **TUI: Observability экран** — WebSocket-поток логов/трейсов, цветной парсинг JSON (требует r4a-telemetry + WebSocket endpoint на сервере)
+- [x] **Security: устранение критических и высоких проблем (2026-05-21)**
+    - [x] C-1: случайная соль Vault (с миграцией старых данных)
+    - [x] C-2: агент API на VPN IP; мастер — VPN-only middleware (RFC-1918 + loopback)
+    - [x] C-3: whitelist деревьев для /api/store/sync
+    - [x] H-1: constant_time_eq для сравнения секретов
+    - [x] H-2: R4A_ALLOW_MASTER_JOIN=1 для master-role join
+    - [x] H-3: next_ip u8 → u16 + проверка переполнения
+    - [x] H-4: секрет сервиса через EnvironmentFile (0o600), не в cmdline
+    - [x] H-5: убран запуск бинарника при обновлении
+    - [x] H-6: CORS ограничен VPN/localhost origin
 
-## Управление нагрузками (Manifests & Worker)
+- [x] **Containers API: stop/start (2026-05-25)**
+    - [x] Агент: POST /containers/:name/stop, POST /containers/:name/start
+    - [x] Сервер: прокси POST /api/nodes/:node/containers/:container/stop и /start
+    - [x] Web UI (Containers.tsx): кнопки Stop (красная) / Start (зелёная) — динамически по state контейнера; все три кнопки блокируются во время pending-операции
 
-- [x] **r4a-core**: общий крейт для моделей данных
-- [x] **Парсинг Git**: мастер читает манифесты из `manifests.git`
-- [x] **r4a-worker**: запуск Docker контейнеров с пробросом портов
-- [x] **Reconciliation**: агент поддерживает желаемое состояние и чистит сирот
-- [x] **Healthchecks**: отслеживание ONLINE/OFFLINE статуса в TUI
+- [x] **Fix: медленный запуск контейнеров (2026-05-25)**
+    - [x] Worker: `inspect_image` перед pull — пропускать pull если образ уже есть локально
 
-## Следующие шаги
+- [x] **Fix: изоляция контейнеров между агентами (2026-05-25)**
+    - [x] Worker: при `node_selector = "all"` имя контейнера = `r4a-{name}-{node_name}` (избегает конфликтов на shared Docker socket в dev)
+    - [x] Worker: 409-обработчик проверяет лейбл `r4a.node` перед удалением — не трогает контейнеры, созданные не через r4a
+    - [x] Web UI (Manifests.tsx): убран дефолт `"all"` для node_selector; поле обязательно (красная рамка + заблокированный Save если пусто)
 
-- [x] **Критическая надежность**:
-    - [x] Атомарная запись конфигов (/etc/hosts, wg0.conf, identity.json)
-    - [x] Устранение блокирующих вызовов (sled flush) в async-обработчиках
-    - [x] Очистка критических `unwrap()` и замена `let _ =` на обработку ошибок
-## Безопасность (Hardening)
+- [x] **Fix: Updates tab не показывает подключённых агентов**
+    - [x] Server: `update_status_handler` теперь объединяет `peers` (role=agent) с `agent_update_states` — агенты отображаются сразу после join со статусом "idle"
+    - [x] Web UI (Updates.tsx): добавлен статус "idle" (серый иконка Server)
 
-- [ ] **Code Signing для обновлений**:
-    - **Как**: Использовать `ed25519-dalek`. Мастер подписывает бинарник агента своим закрытым ключом. Агент хранит публичный ключ и проверяет подпись перед заменой файла.
-    - **Зачем**: Гарантирует целостность кода. Даже если злоумышленник захватит API мастера, он не сможет прошить агентам вредоносный бинарник без вашего закрытого ключа.
-- [ ] **Безопасность Git (manifests.git)**:
-    - **Как**: Внедрить индивидуальные Git-токены для каждой ноды. Настроить `git-http-backend` так, чтобы он проверял `Authorization` заголовок.
-    - **Зачем**: Закрыть "дыру", позволяющую любому анониму менять состояние кластера. Каждая нода должна иметь доступ только к своим ресурсам.
-- [ ] **Vault & Crypto**:
-    - **Как**: Реализовать крейт `r4a-crypto`. Использовать `aes-gcm` для шифрования данных и `argon2` для генерации ключа из мастер-пароля/секрета.
-    - **Зачем**: Секреты (пароли БД, API-ключи) не должны лежать в Sled в открытом виде. Храним только зашифрованные блобы.
-- [ ] **Масштабируемая аутентификация**:
-    - **Как**: Перейти от единого `cluster_secret` к уникальным статичным токенам для каждой ноды, выпускаемым при `join`.
-    - **Зачем**: Если один агент будет взломан, его токен можно отозвать отдельно, не прерывая работу всего кластера.
+- [x] **Fix: Update не работает**
+    - [x] compose.yaml: `R4A_SKIP_SIGNATURE_VERIFY=1` для agent1/agent2 (без .sig → bail)
+    - [x] Agent: при `self_checksum == master_checksum` репортит "updated" (не молчит) → мастер может сбросить флаг
+    - [x] Agent: репортит начальный checksum + "idle" при connect
+    - [x] Server: авто-сброс `update_pending` требует статус "Updated" + matching checksum (не просто checksum)
+    - [x] Server: статус "unknown"/"idle" с matching checksum → показывается как "updated" в UI
+    - [x] Makefile: `pkill -9 r4a-agent` → `docker restart node-agentN` (pkill не перезапускает процесс в docker)
 
-## Производительность
-    - [ ] Оптимизация Ingress (кеширование манифестов в памяти)
-- [ ] **Функционал**:
-    - [ ] CI/CD: запуск скриптов сборки в изолированном окружении
-    - [ ] Telemetry: сбор логов контейнеров и отправка на мастер
+- [x] **Feature: Connection (клиентское VPN-подключение к кластеру)**
+    - [x] r4a-core: модель `Connection` (id, pubkey, vpn_ip, label, connected_at, last_seen)
+    - [x] r4a-core: новый `Resource::Connections` для RBAC
+    - [x] r4a-store: дерево `connections` в Sled, CRUD методы
+    - [x] r4a-vpn: `add_peer` / `remove_peer` для динамического управления WG пирами
+    - [x] r4a-server: POST /api/connections (создать подключение)
+    - [x] r4a-server: DELETE /api/connections/:id (отключиться)
+    - [x] r4a-server: GET /api/connections (список активных)
+    - [x] r4a-server: POST /api/connections/:id/heartbeat (продлить жизнь)
+    - [x] r4a-server: фоновая задача — удалять connections где last_seen > 90s
+    - [x] r4a-cli: команды connect up/down/status/list (вместо отдельного бинарника)
+    - [x] r4a-client: методы connection_create/delete/heartbeat/connections_list
+    - [x] Web UI: вкладка "Connections" (таблица: IP, label, last_seen, кнопка Disconnect)

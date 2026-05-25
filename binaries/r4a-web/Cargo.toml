@@ -1,0 +1,22 @@
+[package]
+name = "r4a-web"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "r4a-web"
+path = "src/main.rs"
+
+[dependencies]
+r4a-core = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+rust-embed = "8"
+mime_guess = "2"
+clap = { workspace = true }

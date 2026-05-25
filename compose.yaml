@@ -2,7 +2,9 @@ services:
   master:
     build:
       context: .
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile.release
+      args:
+        - TARGET_DIR=target/aarch64-unknown-linux-musl/release
     container_name: node-master
     cap_add:
       - NET_ADMIN
@@ -11,7 +13,13 @@ services:
     environment:
       - R4A_SECRET=test_secret_for_cluster_123
       - RUST_LOG=info
-    command: r4a-server init
+    command: sh -c "/usr/local/bin/r4a-web --port 8081 & /usr/local/bin/r4a-server init"
+    restart: always
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+      - "8000:8000"
+      - "51820:51820/udp"
     volumes:
       - master_data:/root/.r4a-server
     deploy:
@@ -26,7 +34,9 @@ services:
   agent1:
     build:
       context: .
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile.release
+      args:
+        - TARGET_DIR=target/aarch64-unknown-linux-musl/release
     container_name: node-agent1
     cap_add:
       - NET_ADMIN
@@ -35,7 +45,9 @@ services:
     environment:
       - R4A_SECRET=test_secret_for_cluster_123
       - RUST_LOG=info
+      - R4A_SKIP_SIGNATURE_VERIFY=1
     command: r4a-agent connect --master http://master:8080 --name agent1
+    restart: always
     depends_on:
       - master
     volumes:
@@ -52,7 +64,9 @@ services:
   agent2:
     build:
       context: .
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile.release
+      args:
+        - TARGET_DIR=target/aarch64-unknown-linux-musl/release
     container_name: node-agent2
     cap_add:
       - NET_ADMIN
@@ -61,7 +75,9 @@ services:
     environment:
       - R4A_SECRET=test_secret_for_cluster_123
       - RUST_LOG=info
+      - R4A_SKIP_SIGNATURE_VERIFY=1
     command: r4a-agent connect --master http://master:8080 --name agent2
+    restart: always
     depends_on:
       - master
     volumes:

@@ -1,9 +1,9 @@
-mod api_client;
 mod ui;
 
-use anyhow::Result;
-use api_client::{ApiClient, NodeInfo, RepoInfo, UpdateStatus};
+use anyhow::{Result, Context};
+use r4a_client::{ApiClient, Manifest, NodeInfo, RepoInfo, UpdateStatus, Token};
 use clap::Parser;
+use sha2::{Digest, Sha256};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -30,6 +30,14 @@ struct Cli {
     master: String,
     #[arg(long, env = "R4A_SECRET")]
     secret: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(clap::Subcommand)]
+enum Commands {
+    Update,
 }
 
 struct App {
@@ -42,6 +50,22 @@ struct App {
     git_message: Option<String>,
     update_status: Option<UpdateStatus>,
     update_message: Option<String>,
+    vault_configs: Option<Vec<r4a_client::VaultConfig>>,
+    vault_config_idx: usize,
+    vault_keys: Option<Vec<String>>,
+    vault_input: Option<String>,
+    vault_message: Option<String>,
+    vault_revealed: Option<String>,
+    vault_selected_idx: usize,
+    vault_editing_key: Option<String>,
+    vault_grant_input: Option<String>,
+    rbac_tokens: Option<Vec<Token>>,
+    rbac_selected_idx: usize,
+    rbac_message: Option<String>,
+    manifests: Option<Vec<Manifest>>,
+    manifests_selected_idx: usize,
+    manifests_input: Option<String>,
+    manifests_message: Option<String>,
     client: ApiClient,
 }
 
@@ -57,6 +81,22 @@ impl App {
             git_message: None,
             update_status: None,
             update_message: None,
+            vault_configs: None,
+            vault_config_idx: 0,
+            vault_keys: None,
+            vault_input: None,
+            vault_message: None,
+            vault_revealed: None,
+            vault_selected_idx: 0,
+            vault_editing_key: None,
+            vault_grant_input: None,
+            rbac_tokens: None,
+            rbac_selected_idx: 0,
+            rbac_message: None,
+            manifests: None,
+            manifests_selected_idx: 0,
+            manifests_input: None,
+            manifests_message: None,
             client: ApiClient::new(master_url, secret),
         }
     }
@@ -79,6 +119,46 @@ impl App {
             }
         }
 
+        if self.screen == Screen::Vault {
+            match self.client.vault_configs_list().await {
+                Ok(c) => { self.vault_configs = Some(c); }
+                Err(e) => self.vault_message = Some(format!("Error: {e}")),
+            }
+            
+            let config_id = self.vault_configs.as_ref()
+                .and_then(|c| c.get(self.vault_config_idx))
+                .map(|c| c.id.as_str())
+                .unwrap_or("default");
+
+            match self.client.vault_list(config_id).await {
+                Ok(k) => { self.vault_keys = Some(k); }
+                Err(e) => self.vault_message = Some(format!("Error: {e}")),
+            }
+            match self.client.tokens_list().await {
+                Ok(t) => { self.rbac_tokens = Some(t); }
+                Err(_) => {}
+            }
+        }
+
+        if self.screen == Screen::Manifests {
+            match self.client.manifests(None).await {
+                Ok(m) => {
+                    let mut list: Vec<Manifest> = m.into_values().collect();
+                    list.sort_by(|a, b| a.app.name.cmp(&b.app.name));
+                    self.manifests = Some(list);
+                    self.manifests_message = None;
+                }
+                Err(e) => self.manifests_message = Some(format!("Error: {e}")),
+            }
+        }
+
+        if self.screen == Screen::Rbac {
+            match self.client.tokens_list().await {
+                Ok(t) => { self.rbac_tokens = Some(t); }
+                Err(e) => self.rbac_message = Some(format!("Error: {e}")),
+            }
+        }
+
         if self.screen == Screen::Update {
             match self.client.update_status().await {
                 Ok(s) => self.update_status = Some(s),
@@ -91,6 +171,10 @@ impl App {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Commands::Update) = cli.command {
+        return handle_update_command(&cli.master, cli.secret).await;
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -105,6 +189,92 @@ async fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+async fn handle_update_command(master_url: &str, secret: Option<String>) -> Result<()> {
+    let client = ApiClient::new(master_url, secret);
+    
+    println!("Checking for updates on {}...", master_url);
+    
+    print!("- Fetching latest release from GitHub... ");
+    match client.fetch_github_release().await {
+        Ok(v) => println!("OK (version {})", v),
+        Err(e) => {
+            println!("FAIL: {e}");
+            return Err(e);
+        }
+    }
+    
+    print!("- Triggering agent updates... ");
+    match client.update_trigger().await {
+        Ok(()) => println!("OK (agents will update within 30s)"),
+        Err(e) => println!("FAIL: {e}"),
+    }
+
+    print!("- Checking for r4a-tui update... ");
+    match tui_self_update(&client).await {
+        Ok(updated) => {
+            if updated {
+                println!("UPDATED (successfully replaced binary)");
+            } else {
+                println!("ALREADY UP TO DATE");
+            }
+        }
+        Err(e) => println!("FAIL: {e}"),
+    }
+    
+    print!("- Triggering r4a-server restart... ");
+    match client.server_update_trigger().await {
+        Ok(()) => println!("OK (server is restarting)"),
+        Err(e) => println!("FAIL: {e}"),
+    }
+
+    println!("\nUpdate process finished.");
+    Ok(())
+}
+
+async fn tui_self_update(client: &ApiClient) -> Result<bool> {
+    let master_checksum = client.get_tui_checksum().await?;
+    
+    let self_path = std::env::current_exe().context("Failed to get current executable path")?;
+    let data = std::fs::read(&self_path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    let self_checksum = format!("{:x}", hasher.finalize());
+
+    if self_checksum == master_checksum {
+        return Ok(false);
+    }
+
+    let bytes = client.download_tui_binary().await?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let downloaded_checksum = format!("{:x}", hasher.finalize());
+
+    if downloaded_checksum != master_checksum {
+        anyhow::bail!("Checksum mismatch for tui binary");
+    }
+
+    let tmp_path = format!("{}.new", self_path.display());
+    std::fs::write(&tmp_path, &bytes)?;
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    
+    let check_status = std::process::Command::new(&tmp_path).arg("--help").status();
+    if match check_status {
+        Ok(status) => !status.success(),
+        Err(_) => true,
+    } {
+        let _ = std::fs::remove_file(&tmp_path);
+        anyhow::bail!("TUI Binary verification failed");
+    }
+
+    std::fs::rename(&tmp_path, &self_path)?;
+    Ok(true)
 }
 
 async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: &str, secret: Option<String>) -> Result<()> {
@@ -149,20 +319,337 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                     continue;
                 }
 
+                // Vault input mode
+                if app.screen == Screen::Vault && app.vault_input.is_some() {
+                    match key.code {
+                        KeyCode::Esc => { 
+                            app.vault_input = None;
+                            app.vault_editing_key = None;
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(ref mut s) = app.vault_input { s.pop(); }
+                        }
+                        KeyCode::Enter => {
+                            let input = app.vault_input.take().unwrap_or_default();
+                            app.vault_editing_key = None;
+                            let parts: Vec<&str> = input.splitn(2, '=').collect();
+                            if parts.len() == 2 {
+                                let key = parts[0].trim();
+                                let val = parts[1].trim();
+                                let config_id = app.vault_configs.as_ref()
+                                    .and_then(|c| c.get(app.vault_config_idx))
+                                    .map(|c| c.id.as_str())
+                                    .unwrap_or("default");
+
+                                match app.client.vault_set(config_id, key, val).await {
+                                    Ok(()) => {
+                                        app.vault_message = Some(format!("Set: {}", key));
+                                        if let Ok(k) = app.client.vault_list(config_id).await {
+                                            app.vault_keys = Some(k);
+                                        }
+                                    }
+                                    Err(e) => app.vault_message = Some(format!("Error: {e}")),
+                                }
+                            } else {
+                                app.vault_message = Some("Format: key=value".to_string());
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            if let Some(ref mut s) = app.vault_input { s.push(c); }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if app.screen == Screen::Vault && app.vault_grant_input.is_some() {
+                    match key.code {
+                        KeyCode::Esc => { app.vault_grant_input = None; }
+                        KeyCode::Backspace => {
+                            if let Some(ref mut s) = app.vault_grant_input { s.pop(); }
+                        }
+                        KeyCode::Enter => {
+                            let input = app.vault_grant_input.take().unwrap_or_default().trim().to_string();
+                            if input.starts_with("CONFIG: ") {
+                                let name = input.trim_start_matches("CONFIG: ").to_string();
+                                if !name.is_empty() {
+                                    match app.client.vault_config_create(&name).await {
+                                        Ok(config) => {
+                                            app.vault_message = Some(format!("Created config: {}", config.name));
+                                            app.refresh().await;
+                                        }
+                                        Err(e) => app.vault_message = Some(format!("Error: {e}")),
+                                    }
+                                }
+                            } else {
+                                let username = input;
+                                if !username.is_empty() {
+                                    if let Some(ref keys) = app.vault_keys {
+                                        if let Some(key) = keys.get(app.vault_selected_idx) {
+                                            let config_id = app.vault_configs.as_ref()
+                                                .and_then(|c| c.get(app.vault_config_idx))
+                                                .map(|c| c.id.as_str())
+                                                .unwrap_or("default");
+                                            let full_key = format!("{}/{}", config_id, key);
+
+                                            match app.client.token_create(&username, vec![r4a_core::models::Verb::Get], vec![r4a_core::models::Resource::Vault], Some(vec![full_key])).await {
+                                                Ok(token) => {
+                                                    app.vault_message = Some(format!("Created token for {}: {}", username, token.id));
+                                                    if let Ok(t) = app.client.tokens_list().await {
+                                                        app.rbac_tokens = Some(t);
+                                                    }
+                                                }
+                                                Err(e) => app.vault_message = Some(format!("Error: {e}")),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            if let Some(ref mut s) = app.vault_grant_input { s.push(c); }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Manifests input mode
+                if app.screen == Screen::Manifests && app.manifests_input.is_some() {
+                    match key.code {
+                        KeyCode::Esc => { app.manifests_input = None; }
+                        KeyCode::Backspace => {
+                            if let Some(ref mut s) = app.manifests_input { s.pop(); }
+                        }
+                        KeyCode::Enter => {
+                            let name = app.manifests_input.take().unwrap_or_default().trim().to_string();
+                            if !name.is_empty() {
+                                let manifest = r4a_client::Manifest {
+                                    app: r4a_client::AppConfig { name: name.clone(), node_selector: "all".to_string() },
+                                    container: Some(r4a_client::ContainerConfig {
+                                        image: "alpine:latest".to_string(),
+                                        restart: "always".to_string(),
+                                        command: None,
+                                        ports: None,
+                                    }),
+                                    systemd: None,
+                                    ingress: None,
+                                    env: Default::default(),
+                                };
+                                match app.client.manifest_upsert(&manifest).await {
+                                    Ok(()) => {
+                                        app.manifests_message = Some(format!("Created: {} (edit via API/web to configure)", name));
+                                        app.refresh().await;
+                                    }
+                                    Err(e) => app.manifests_message = Some(format!("Error: {e}")),
+                                }
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            if let Some(ref mut s) = app.manifests_input { s.push(c); }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // If revealed value is shown, any key hides it
+                if app.vault_revealed.is_some() {
+                    app.vault_revealed = None;
+                    continue;
+                }
+
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('q'), _)
                     | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                    (KeyCode::Tab, _) | (KeyCode::Right, _) => {
+                    (KeyCode::Tab, _) | (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
                         app.screen = app.screen.next();
                         app.update_message = None;
                     }
-                    (KeyCode::BackTab, _) | (KeyCode::Left, _) => {
+                    (KeyCode::BackTab, _) | (KeyCode::Left, _) | (KeyCode::Char('h'), _) => {
                         app.screen = app.screen.prev();
                         app.update_message = None;
+                    }
+                    (KeyCode::Char('n'), _) if app.screen == Screen::Manifests => {
+                        app.manifests_input = Some(String::new());
+                        app.manifests_message = None;
+                    }
+                    (KeyCode::Char('d'), _) if app.screen == Screen::Manifests => {
+                        if let Some(ref list) = app.manifests {
+                            if let Some(m) = list.get(app.manifests_selected_idx) {
+                                let name = m.app.name.clone();
+                                match app.client.manifest_delete(&name).await {
+                                    Ok(()) => {
+                                        app.manifests_message = Some(format!("Deleted: {}", name));
+                                        app.manifests_selected_idx = 0;
+                                        app.refresh().await;
+                                    }
+                                    Err(e) => app.manifests_message = Some(format!("Error: {e}")),
+                                }
+                            }
+                        }
+                    }
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) if app.screen == Screen::Manifests => {
+                        if app.manifests_selected_idx > 0 {
+                            app.manifests_selected_idx -= 1;
+                        }
+                    }
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) if app.screen == Screen::Manifests => {
+                        if let Some(ref list) = app.manifests {
+                            if app.manifests_selected_idx < list.len().saturating_sub(1) {
+                                app.manifests_selected_idx += 1;
+                            }
+                        }
+                    }
+                    (KeyCode::Char('g'), _) if app.screen == Screen::Manifests => {
+                        app.manifests_selected_idx = 0;
+                    }
+                    (KeyCode::Char('G'), _) if app.screen == Screen::Manifests => {
+                        if let Some(ref list) = app.manifests {
+                            app.manifests_selected_idx = list.len().saturating_sub(1);
+                        }
                     }
                     (KeyCode::Char('n'), _) if app.screen == Screen::Git => {
                         app.git_input = Some(String::new());
                         app.git_message = None;
+                    }
+                    (KeyCode::Char('n'), _) if app.screen == Screen::Vault => {
+                        app.vault_input = Some(String::new());
+                        app.vault_editing_key = None;
+                        app.vault_message = None;
+                    }
+                    (KeyCode::Char('e'), _) if app.screen == Screen::Vault => {
+                        if let Some(ref keys) = app.vault_keys {
+                            if let Some(key) = keys.get(app.vault_selected_idx) {
+                                let config_id = app.vault_configs.as_ref()
+                                    .and_then(|c| c.get(app.vault_config_idx))
+                                    .map(|c| c.id.as_str())
+                                    .unwrap_or("default");
+
+                                match app.client.vault_get(config_id, key).await {
+                                    Ok(val) => {
+                                        app.vault_input = Some(format!("{}={}", key, val));
+                                        app.vault_editing_key = Some(key.clone());
+                                        app.vault_message = None;
+                                    }
+                                    Err(e) => app.vault_message = Some(format!("Error: {e}")),
+                                }
+                            }
+                        }
+                    }
+                    (KeyCode::Char('d'), _) if app.screen == Screen::Vault => {
+                        if let Some(ref keys) = app.vault_keys {
+                            if let Some(key) = keys.get(app.vault_selected_idx) {
+                                let config_id = app.vault_configs.as_ref()
+                                    .and_then(|c| c.get(app.vault_config_idx))
+                                    .map(|c| c.id.as_str())
+                                    .unwrap_or("default");
+
+                                match app.client.vault_delete(config_id, key).await {
+                                    Ok(()) => {
+                                        app.vault_message = Some(format!("Deleted: {}", key));
+                                        if let Ok(k) = app.client.vault_list(config_id).await {
+                                            app.vault_keys = Some(k);
+                                        }
+                                    }
+                                    Err(e) => app.vault_message = Some(format!("Error: {e}")),
+                                }
+                            }
+                        }
+                    }
+                    (KeyCode::Char('a'), _) if app.screen == Screen::Vault => {
+                        app.vault_grant_input = Some(String::new());
+                        app.vault_message = None;
+                    }
+                    (KeyCode::Char('v'), _) if app.screen == Screen::Vault => {
+                        if let Some(ref keys) = app.vault_keys {
+                            if let Some(key) = keys.get(app.vault_selected_idx) {
+                                let config_id = app.vault_configs.as_ref()
+                                    .and_then(|c| c.get(app.vault_config_idx))
+                                    .map(|c| c.id.as_str())
+                                    .unwrap_or("default");
+
+                                match app.client.vault_get(config_id, key).await {
+                                    Ok(val) => app.vault_revealed = Some(val),
+                                    Err(e) => app.vault_message = Some(format!("Error: {e}")),
+                                }
+                            }
+                        }
+                    }
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) if app.screen == Screen::Vault => {
+                        if app.vault_selected_idx > 0 {
+                            app.vault_selected_idx -= 1;
+                        }
+                    }
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) if app.screen == Screen::Vault => {
+                        if let Some(ref keys) = app.vault_keys {
+                            if app.vault_selected_idx < keys.len().saturating_sub(1) {
+                                app.vault_selected_idx += 1;
+                            }
+                        }
+                    }
+                    (KeyCode::Char('g'), _) if app.screen == Screen::Vault => {
+                        app.vault_selected_idx = 0;
+                    }
+                    (KeyCode::Char('G'), _) if app.screen == Screen::Vault => {
+                        if let Some(ref keys) = app.vault_keys {
+                            app.vault_selected_idx = keys.len().saturating_sub(1);
+                        }
+                    }
+                    (KeyCode::Char('['), _) if app.screen == Screen::Vault => {
+                        if app.vault_config_idx > 0 {
+                            app.vault_config_idx -= 1;
+                            app.vault_selected_idx = 0;
+                            app.refresh().await;
+                        }
+                    }
+                    (KeyCode::Char(']'), _) if app.screen == Screen::Vault => {
+                        if let Some(ref configs) = app.vault_configs {
+                            if app.vault_config_idx < configs.len().saturating_sub(1) {
+                                app.vault_config_idx += 1;
+                                app.vault_selected_idx = 0;
+                                app.refresh().await;
+                            }
+                        }
+                    }
+                    (KeyCode::Char('C'), _) if app.screen == Screen::Vault => {
+                        app.vault_grant_input = Some("CONFIG: ".to_string());
+                        app.vault_message = Some("Enter new config name".to_string());
+                    }
+                    (KeyCode::Char('d'), _) if app.screen == Screen::Rbac => {
+                        if let Some(ref tokens) = app.rbac_tokens {
+                            if let Some(token) = tokens.get(app.rbac_selected_idx) {
+                                match app.client.token_delete(&token.id).await {
+                                    Ok(()) => {
+                                        app.rbac_message = Some(format!("Deleted: {}", token.id));
+                                        if let Ok(t) = app.client.tokens_list().await {
+                                            app.rbac_tokens = Some(t);
+                                        }
+                                    }
+                                    Err(e) => app.rbac_message = Some(format!("Error: {e}")),
+                                }
+                            }
+                        }
+                    }
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) if app.screen == Screen::Rbac => {
+                        if app.rbac_selected_idx > 0 {
+                            app.rbac_selected_idx -= 1;
+                        }
+                    }
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) if app.screen == Screen::Rbac => {
+                        if let Some(ref tokens) = app.rbac_tokens {
+                            if app.rbac_selected_idx < tokens.len().saturating_sub(1) {
+                                app.rbac_selected_idx += 1;
+                            }
+                        }
+                    }
+                    (KeyCode::Char('g'), _) if app.screen == Screen::Rbac => {
+                        app.rbac_selected_idx = 0;
+                    }
+                    (KeyCode::Char('G'), _) if app.screen == Screen::Rbac => {
+                        if let Some(ref tokens) = app.rbac_tokens {
+                            app.rbac_selected_idx = tokens.len().saturating_sub(1);
+                        }
                     }
                     (KeyCode::Char('t'), _) if app.screen == Screen::Update => {
                         match app.client.update_test().await {
@@ -243,6 +730,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Screen::Dashboard => {
             ui::dashboard::render(f, chunks[1], &app.nodes, app.fetch_error.as_deref());
         }
+        Screen::Manifests => {
+            ui::manifests::render(
+                f,
+                chunks[1],
+                app.manifests.as_deref(),
+                app.manifests_selected_idx,
+                app.manifests_message.as_deref(),
+                app.manifests_input.as_deref(),
+            );
+        }
         Screen::Git => {
             ui::git::render(
                 f,
@@ -253,11 +750,29 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 app.git_message.as_deref(),
             );
         }
-        Screen::Rbac => {
-            ui::not_implemented::render(f, chunks[1], Screen::Rbac.title());
+        Screen::Vault => {
+            ui::vault::render(
+                f,
+                chunks[1],
+                app.vault_configs.as_deref(),
+                app.vault_config_idx,
+                app.vault_keys.as_deref(),
+                app.vault_selected_idx,
+                app.rbac_tokens.as_deref(),
+                app.vault_input.as_deref(),
+                app.vault_grant_input.as_deref(),
+                app.vault_message.as_deref(),
+                app.vault_revealed.as_deref(),
+            );
         }
-        Screen::Manifests => {
-            ui::not_implemented::render(f, chunks[1], Screen::Manifests.title());
+        Screen::Rbac => {
+            ui::rbac::render(
+                f,
+                chunks[1],
+                app.rbac_tokens.as_deref(),
+                None,
+                app.rbac_message.as_deref(),
+            );
         }
         Screen::Observability => {
             ui::not_implemented::render(f, chunks[1], Screen::Observability.title());

@@ -80,7 +80,7 @@ src/db/:
 
 sled_wrapper.rs: Инициализация экземпляра БД sled в ~/.r4a-server/db. Разделение на Tree (таблицы): users, manifests, nodes.
 
-src/vault.rs: Управление секретницей. Запись и чтение зашифрованных данных в ~/.r4a-server/vault. Интеграция с r4a-core/crypto.rs (in-memory расшифровка по запросу).
+src/vault.rs: Управление секретницей. Запись и чтение зашифрованных данных в ~/.r4a-server/vault. Поддерживает множественные конфигурации Vault, каждая со своим ключом (DEK). Интеграция с r4a-core/crypto.rs (in-memory расшифровка по запросу).
 
 2.4. Пакет crates/r4a-ingress (Маршрутизация Pingora)
 
@@ -210,15 +210,15 @@ observability.rs: Обработчик WebSocket-потока. Цветной п
 
 3.1. Как работает Инжект Секретов (Vault)
 
-Пользователь через TUI задает секрет: r4a -> API -> r4a-store::vault шифрует AES-256 и сохраняет в sled.
+Пользователь через TUI или Web UI задает секрет: r4a -> API -> r4a-store шифрует AES-256 (используя DEK конкретной конфигурации) и сохраняет в sled.
 
-В манифесте указывается: DB_PASS = "vault://production/db-pass".
+В манифесте указывается: DB_PASS = "vault://production/db-pass" (или "vault://db-pass" для дефолтного конфига).
 
 Агент (r4a-worker::reconciler) скачивает манифест.
 
-Агент видит vault:// и делает защищенный GET-запрос: http://master.local/value/production/db-pass (передавая свой токен аутентификации).
+Агент видит vault:// и делает защищенный GET-запрос: http://master.local:8080/api/vault?config_id=production&key=db-pass (передавая свой токен аутентификации).
 
-Pingora (r4a-ingress) перехватывает запрос, проверяет RBAC-права агента.
+Pingora (r4a-ingress) или Axum (на порту 8080) перехватывает запрос, проверяет RBAC-права агента.
 
 Мастер расшифровывает секрет в оперативной памяти и отдает агенту.
 

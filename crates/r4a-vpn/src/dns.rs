@@ -13,14 +13,22 @@ pub fn set_hosts_entries(ips: &[&str], hostname: &str) -> Result<()> {
         .map(|l| format!("{l}\n"))
         .collect();
 
+    let mut ips_sorted = ips.to_vec();
+    ips_sorted.sort();
+
     let mut new_entries = String::new();
-    for ip in ips {
+    for ip in ips_sorted {
         new_entries.push_str(&format!("{ip} {hostname} {MARKER}\n"));
     }
 
     let new_content = format!("{filtered}{new_entries}");
-    std::fs::write(HOSTS_FILE, new_content).context("write /etc/hosts")?;
-    tracing::info!("Set {} IPs for {} in /etc/hosts", ips.len(), hostname);
+    
+    if content.lines().eq(new_content.lines()) {
+        return Ok(());
+    }
+
+    std::fs::write(HOSTS_FILE, &new_content).context("write /etc/hosts")?;
+    tracing::info!("Updated /etc/hosts: {} IPs for {}", ips.len(), hostname);
     Ok(())
 }
 

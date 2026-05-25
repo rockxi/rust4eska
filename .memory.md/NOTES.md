@@ -1,187 +1,160 @@
-# NOTES
+## Security (реализовано 2026-05-21)
 
-## Окружение
+### Что изменилось в архитектуре безопасности
 
-- **asus** (rockxi-zenbook) — master-нода, Ubuntu 24.04, kernel 6.17, Tailscale IP 100.97.158.58
-- **home** (DESKTOP-HIL871U) — agent-нода, Ubuntu 24.04 WSL2, kernel 6.6, Tailscale IP 100.116.148.12
-- SSH через Tailscale: `ssh asus` / `ssh home` (конфиг в ~/.ssh/config)
-- **Роли**: asus — единственный Master, home — Agent (multi-master конфигурация для home была отменена).
+**Vault (C-1)**
+- `master_salt` генерируется случайно (OsRng, 32 байта) при первом старте, хранится в `vault_meta["master_salt"]`.
+- При старте: если расшифровка DEK новым ключом не работает — автоматический fallback на legacy-соль `b"r4a-master-salt-v1"`, затем перешифровка DEK и сохранение (одноразовая миграция).
+- После миграции старый hardcoded ключ больше не используется.
+
+**Привязка сокетов (C-2)**
+- Агент API (8082): слушает на `resp.agent_vpn_ip`, а не `0.0.0.0`.
+- Мастер API (8080): middleware `require_vpn_for_api` блокирует публичные IP для всех роутов кроме `/` и `/api/join`. Разрешены: `10.x.x.x`, `172.16-31.x.x`, `192.168.x.x`, loopback.
+- Docker compose bridge (`172.20.0.0/16`) — разрешён, дашборд на `localhost:8081` работает.
+
+**Sync whitelist (C-3)**
+- `/api/store/sync` принимает только деревья: `tokens, bindings, policies, manifests, vault, vault_configs`.
+- `vault_meta` и `core` (peers) — заблокированы.
+
+**Сравнение секретов (H-1)**
+- `constant_time_eq::constant_time_eq` везде где сравниваются `X-R4A-Secret` / токены.
+
+**Роль при join (H-2)**
+- `R4A_ALLOW_MASTER_JOIN=1` — только так можно добавить master-ноду.
+- Без переменной все джойнеры получают роль `"agent"` независимо от запроса.
+- **Сценарий multi-master**: временно выставить переменную на существующем мастере перед `r4a-server join-master`.
+
+**IP пул (H-3)**
+- `next_ip: Arc<Mutex<u16>>`, ограничение > 254 → 503 SERVICE_UNAVAILABLE.
+
+**Секрет в сервисе (H-4)**
+- `ServiceManager::enable` принимает `env_vars: &[(&str, &str)]`.
+- Секреты пишутся в `/etc/r4a/<name>.env` (mode 0o600) через `EnvironmentFile=`.
+- В cmdline (`ps aux`) секрет не виден.
+- Все вызовы обновлены: r4a-server, r4a-agent, r4a-worker.
+
+**Обновление бинарников (H-5)**
+- Убран `Command::new(tmp_path).arg("--help")` — выполнение скачанного бинарника до замены.
+- Верификация только по SHA256.
+
+**CORS (H-6)**
+- `AllowOrigin::predicate`: разрешены `http://10.42.*`, `http://master.local`, `http://localhost`, `http://127.0.0.1`.
+
+---
+
+## Vault (обновлено 2026-05-09)
+- Поддержка множественных конфигураций Vault.
+- Каждый конфиг имеет свой DEK.
+- TUI: `[` / `]` для переключения конфигов, `Shift+C` для создания нового.
+- Web UI: селектор конфигов и кнопка "New Config".
+- Worker: поддержка `vault://config_id/key`.
+
+---
+
+## Инструменты тестирования
+- Для проверки работоспособности кластера и API использовать `r4a-cli`.
+
+## Web UI (реализовано 2026-05-09)
+- **Backend**: Axum + rust-embed, порт `8081`.
+- **Frontend**: React 19, TanStack Query, Tailwind CSS 4, Lucide React.
+- **Динамический API**: фронтенд определяет адрес по `window.location.hostname`.
+
+---
+
+## Исправленные проблемы (2026-05-15)
+- **401 на /api/manifests**: экстрактор `Auth` поддерживает и `X-R4A-Secret`, и `Bearer Token`.
+- В `join_handler`: новые агенты автоматически получают права на `Resource::Manifests`.
+
+---
+
+## Окружение (prod)
+- **asus** (rockxi-zenbook) — master, Ubuntu 24.04, kernel 6.17, Tailscale `100.97.158.58`
+- **home** (DESKTOP-HIL871U) — agent, Ubuntu 24.04 WSL2, kernel 6.6, Tailscale `100.116.148.12`
+- SSH: `ssh asus` / `ssh home`
 
 ## Компиляция и деплой
+- Локально (macOS arm64) → `aarch64-unknown-linux-musl` (dev) или `x86_64-unknown-linux-musl` (prod)
+- Бинарники статически слинкованы.
+- `make dev-deploy` — сборка + `docker cp` + `docker restart`
+- `make prod-deploy-all` — деплой на asus и home
 
-- Собираем локально (macOS arm64) в таргет `x86_64-unknown-linux-musl`
-- Линкер: `x86_64-linux-musl-gcc` (homebrew)
-- Конфиг в `.cargo/config.toml`
-- Бинарники статически слинкованы — нет зависимостей на хостах
-- **Деплой всегда в `/usr/local/bin/`**: Сборка локально -> `scp` на хост -> регистрация через `r4a-server service enable` / `r4a-agent service enable`.
-- **Перезапуск**: При деплое вызывается `sudo systemctl restart <service>`.
+---
 
-## WireGuard
+## Worker: важные нюансы (2026-05-20)
 
-- VPN подсеть: `10.42.0.0/24`
-- master: `10.42.0.1/24`, listen port 51820
-- agents: `10.42.0.2+/32`, assigned динамически при join
-- На home (WSL2) WireGuard kernel module есть, всё работает
-- Для первого join агент использует Tailscale IP мастера: `http://100.97.158.58:8080`
+### Label-изоляция контейнеров
+- Агенты фильтруют по лейблу `r4a.node=<node_name>`.
+- При 409: сначала `inspect_container` → если нет лейбла `r4a.node` — **не трогать** (ошибка), если есть — force remove и пересоздание с лейблом.
+- В dev (shared Docker socket): при `node_selector = "all"` имя контейнера = `r4a-{name}-{node_name}`, при конкретной ноде — `r4a-{name}`. Это предотвращает конфликты между агентами на одном демоне.
 
-## Порты r4a-server
+### Image Pull
+- `inspect_image` перед pull — если образ есть локально, pull пропускается. Критично для быстрого старта при повторных reconcile-циклах.
 
-- `0.0.0.0:8080` — основной порт сервера (API + git).
-- `0.0.0.0:8000` — автоматический Ingress на базе Pingora.
-- На asus основной порт 80 занят nginx, поэтому Ingress перенесен на 8000.
-- TUI и агент ходят на `http://master.local:8080`, но `master.local` резолвится во все VPN IP мастеров.
+### Port Bindings
+- Нужны и `HostConfig.PortBindings`, и `Config.ExposedPorts`.
+- Формат: `ports: ["host_port:container_port"]`, например `"3333:80"`.
 
-## Статус и Здоровье нод (Healthchecks)
-- Мастер отслеживает `last_seen` для каждой ноды на основе прилетающих метрик.
-- В TUI добавлена колонка **Status**:
-    - **ONLINE** (зеленый): метрики получены менее 20 секунд назад.
-    - **OFFLINE** (красный): задержка более 20 секунд.
-- Ноды, не подававшие признаков жизни более 10 минут, скрываются из списка API.
+### Перезапуск агентов в docker compose
+- `pkill` / `kill -9 1` внутри контейнера не работает.
+- Правильно: `docker restart node-agent1`.
 
-## Реализация манифестов (2026-04-29)
-- Создан крейт `r4a-core`: содержит общие модели `Manifest`, `NodeInfo`, `PeerInfo`, `JoinRequest` и др.
-- **Мастер**: Каждые 10 секунд сканирует `manifests.git` (bare repo), парсит `.toml` файлы и сохраняет в Sled БД (дерево `manifests`).
-- **Агент**: Каждые 30 секунд запрашивает манифесты через `GET /api/manifests?node=<имя_ноды>`.
-- **Worker**: Крейт `r4a-worker` (используется агентом) управляет Docker (через `bollard`) и Systemd.
-    - Автоматически останавливает и удаляет "бесхозные" контейнеры (с префиксом `r4a-`), которых нет в текущих манифестах.
-    - Поддерживает проброс портов (`ports = ["host:container"]`) и переменные окружения.
+### make dev-deploy кэш
+- Для принудительной пересборки: `touch crates/r4a-worker/src/lib.rs` перед `cargo build`.
 
-## Ингресс (Pingora)
-- Реализован в `crates/r4a-ingress`.
-- Слушает на `0.0.0.0:8000`.
-- Маршрутизация: запросы `app-name.master.local` или по заголовку `Host` проксируются на VPN IP соответствующего агента.
+### Перезапуск агентов в dev-deploy (исправлено 2026-05-25)
+- `pkill -9 r4a-agent` внутри контейнера не работает — процесс убивается, но docker сразу перезапускает его со старым состоянием.
+- Правильно: `docker restart node-agent1`. Теперь Makefile использует `docker restart`.
 
-## Нюансы сборки и деплоя
-- **Pingora** требует `cmake` и фиксацию версии `sfv = "0.9.3"` в Cargo.lock.
-- **Имя ноды**: При установке агента крайне важно указывать имя, если оно отличается от hostname:
-  `sudo r4a-agent service enable --master http://... --name home`
+### Update flow (исправлено 2026-05-25)
+- Агент при старте репортит `sha256_self()` со статусом "idle" → мастер знает текущую версию.
+- Если при полле `self_checksum == master_checksum` → агент репортит "updated" (не молчит).
+- Авто-сброс `update_pending` требует все агенты в статусе "Updated" + matching checksum.
+- В статус-ответе: если checksum агента совпадает с мастером — показывается "updated" (не "idle"/"unknown").
+- `R4A_SKIP_SIGNATURE_VERIFY=1` в compose.yaml для agent1/agent2 (без .sig файла в dev).
 
-## Проблемы которые встретились
-- **Runtime within Runtime**: Pingora нельзя запускать через `tokio::spawn`, так как у неё свой runtime. Решено через `std::thread::spawn`.
-- **BindError**: При рестарте порт 8000 может быть занят зависшим процессом. Решено через `pkill -9 r4a-server` в Makefile и биндинг на `0.0.0.0`.
-- **Orphan Cleanup**: Агенты удаляли контейнеры друг друга из-за несовпадения имен нод. Решено фиксацией `--name home` в сервисе.
+---
 
+## Containers API (обновлено 2026-05-25)
+- Агент слушает на `<vpn_ip>:8082` (не 0.0.0.0).
+- Эндпоинты агента (Auth: `X-R4A-Secret`):
+  - `GET /containers`
+  - `GET /containers/:name/logs?tail=N`
+  - `POST /containers/:name/restart`
+  - `POST /containers/:name/stop`
+  - `POST /containers/:name/start`
+- Мастер проксирует через VPN IP:
+  - `GET /api/nodes/:node/containers`
+  - `GET /api/nodes/:node/containers/:name/logs?tail=N`
+  - `POST /api/nodes/:node/containers/:name/restart`
+  - `POST /api/nodes/:node/containers/:name/stop`
+  - `POST /api/nodes/:node/containers/:name/start`
+- Web UI: кнопка Stop/Start динамическая по `state` контейнера (`running` → Stop, иначе → Start)
 
-## Git-экран в TUI (реализовано 2026-04-28)
+---
 
-### Суть
-Новая вкладка "Git" в TUI показывает список bare-репозиториев с мастера.
+## Manifests (State, обновлено 2026-05-20)
+- Хранятся в Sled tree `"manifests"` (ключ = `app.name`).
+- Миграция из старого blob-формата при старте.
+- Агент: `GET /api/manifests?node=<name>`.
 
-### API
-- `GET /api/git/repos` — листает `~/.r4a-server/git/`, ищет папки с `HEAD` (bare-репозитории)
-  - Возвращает: `[{name, clone_url}]`
-  - clone_url формат: `http://10.42.0.1:8080/git/<name>`
+---
 
-### TUI
-- `Screen::Git` — вторая вкладка (между Dashboard и RBAC)
-- Отображает: имя репо (зелёным) + `git clone <url>` (серым)
-- Обновляется каждые 2 сек пока вкладка активна
+## RBAC
+- Token / Policy / Binding система.
+- `X-R4A-Secret` — только bootstrap эндпоинты (`/api/join`, `/api/metrics`, `/api/update/poll`...).
+- User-facing эндпоинты — `Authorization: Bearer <token>`.
 
-### Нюансы
-- При первом запуске новой версии сервера старый процесс надо убивать явно через `sudo kill <pid>` — `pkill` без sudo не может завершить root-процесс
-- Текущий список репозиториев: `manifests.git`
+---
 
-## Создание репозиториев через TUI (реализовано 2026-04-28)
+## Manifests: node_selector
+- Обязательное поле — пустая строка не матчит ни одну ноду и ни `"all"`.
+- Web UI: пустое поле блокирует Save + красная рамка.
+- `"all"` в dev (shared Docker socket) — каждый агент получает манифест, имена контейнеров различаются суффиксом ноды.
 
-### API
-- `POST /api/git/repos` — создаёт новый bare-репозиторий
-  - Принимает: `{"name": "repo-name"}` (расширение `.git` добавляется автоматически)
-  - Возвращает: `{name, clone_url}`
-  - Ошибки: 400 (пустое имя / `/` / `..`), 409 (уже существует), 500
-
-### TUI
-- На экране Git: клавиша `n` открывает строку ввода имени репозитория
-- `Enter` — создать, `Esc` — отмена, `Backspace` — удалить символ
-- После создания список автоматически обновляется, показывается сообщение
-
-## Каскадное обновление агентов (реализовано 2026-04-28)
-
-### Суть
-Мастер хранит актуальный бинарник `r4a-agent` в `/usr/local/bin/r4a-agent`.
-Агенты каждые 30 сек поллят мастер и при несовпадении SHA256 скачивают и заменяют себя.
-TUI-экран Update позволяет инициировать процесс.
-
-### Новые API-эндпоинты (r4a-server)
-- `GET  /api/agent-binary`      — отдаёт бинарник агента (application/octet-stream)
-- `GET  /api/agent-checksum`    — `{"checksum": "<sha256>"}`
-- `POST /api/update/test`       — проверяет наличие и SHA256 бинарника, возвращает `{ok, checksum, message}`
-- `POST /api/update/trigger`    — выставляет `update_pending = true` в AppState
-- `GET  /api/update/poll`       — агенты опрашивают: `{update_pending, checksum}`
-- `POST /api/update/report`     — агент сообщает статус `{agent_vpn_ip, checksum, status}`
-- `GET  /api/update/status`     — TUI: checksum мастера + статус всех агентов
-
-### Логика r4a-agent (auto-update loop)
-- Отдельный `tokio::spawn` стартует после join
-- Каждые 30 сек: GET /api/update/poll
-- Если `update_pending = true` И SHA256 отличается от собственного:
-  1. Скачивает бинарник в `/tmp/r4a-agent.new`
-  2. Проверяет SHA256 совпадение
-  3. `chmod 755` + `mv` в `/usr/local/bin/r4a-agent`
-  4. POST /api/update/report со статусом "updated"
-  5. `std::process::exit(0)` — systemd/перезапуск подхватит
-- SHA256 себя считается через `std::env::current_exe()` + чтение файла
-
-### TUI-экран Update
-- Новая вкладка "Update" (пятая, после Observability)
-- Отображает: checksum мастера, per-agent IP + checksum + статус (цвет: green=ok, yellow=updating, red=fail)
-- Клавиши:
-  - `t` — POST /api/update/test (проверить бинарник на мастере, показать результат)
-  - `u` — POST /api/update/trigger (запустить обновление всех агентов)
-- Статус обновляется каждые 2 сек вместе с основным refresh
-
-### Зависимости
-- `sha2 = "0.10"` добавлена в workspace и в r4a-server, r4a-agent
-
-### Нюансы
-- `update_pending` не сбрасывается автоматически после обновления — сервер не имеет стейта о том, все ли агенты обновились. Сброс в будущем можно добавить когда все агенты отрепортят "updated".
-- Агент завершается сам через exit(0) после обновления — нужен внешний supervisor (systemd/перезапуск вручную) для перезапуска с новым бинарником.
-- На asus r4a-server запускается через `sudo nohup` (нужен root для WireGuard).
-
-## Улучшение связности и TUI (реализовано 2026-04-28)
-
-### Тестирование в Docker
-- Создан `compose.yaml` для имитации кластера.
-- **Мастер**: доступен внутри сети Docker как `master:8080`.
-- **Секрет**: задается через `R4A_SECRET=test_secret_for_cluster_123`.
-- **Ресурсы**: ограничены 1 vCPU и 1GB RAM на ноду.
-- **WireGuard**: требует `NET_ADMIN` и `/dev/net/tun` на хосте. В macOS Docker Desktop это работает через виртуализацию.
-- **Docker**: агенты используют сокет хоста `/var/run/docker.sock` для запуска нагрузок.
+---
 
 ## Инструкция по разработке
-1. **Запуск**: `make dev-up` (поднимает master и 2 агента).
-2. **Итерация**: Меняем код -> `make dev-deploy`.
-   - Это работает в 10 раз быстрее, чем `docker compose build`, так как бинарники просто заменяются внутри работающих контейнеров.
-3. **TUI**: 
-   - Локально: Подключаться к `http://localhost:8080` (секрет: `test_secret_for_cluster_123`).
-   - Внутри контейнера: `docker exec -it node-agent1 r4a-tui` (или `node-master`).
-
-## DNS и master.local
-- `master.local` теперь резолвится во **все** доступные master-ноды.
-- `r4a-server` при старте и каждые 10 секунд обновляет свой `/etc/hosts`, добавляя туда IP всех известных мастеров (включая себя).
-- Это позволяет использовать `http://master.local:8080` как универсальный эндпоинт для API.
-
-### r4a-tui
-- Дефолтный URL мастера изменен на `http://master.local:8080`.
-- Добавлена поддержка переменной окружения `R4A_MASTER` (например, `R4A_MASTER=http://100.97.158.58:8080 r4a-tui`).
-- Исправлена ошибка сборки: в `clap` добавлен feature `env`.
-
-### Деплой
-- `Makefile` обновлен: теперь `deploy-all` включает `deploy-master`, `deploy-agent` и `deploy-tui`.
-- Все деплой-цели автоматически перезапускают системные сервисы.
-- `deploy-tui` копирует TUI сразу на все ноды кластера.
-
-## Структура проекта
-
-```
-r4a/
-├── Cargo.toml                  # workspace
-├── .cargo/config.toml          # musl линкер
-├── crates/
-│   ├── r4a-vpn/                # WireGuard + /etc/hosts
-│   ├── r4a-store/              # Raft-lite + Sled (репликация)
-│   └── r4a-git-registry/       # git init + git http-backend handler
-└── binaries/
-    ├── r4a-server/             # master: wg + axum HTTP + metrics + git + store
-    ├── r4a-agent/              # agent: join + wg + dns + metrics reporter
-    └── r4a-tui/                # TUI: dashboard (nodes/CPU/RAM/VRAM), заглушки
-```
+1. `make dev-up`
+2. Меняем код → `make dev-deploy`
+3. TUI: `docker exec -it node-agent1 R4A_SECRET=test_secret_for_cluster_123 r4a-tui`
+4. Логи: `docker compose logs agent1 agent2 -f`

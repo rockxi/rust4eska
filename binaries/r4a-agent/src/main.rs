@@ -1,5 +1,15 @@
 use anyhow::{Context, Result};
+use axum::{
+    extract::{Path, Query, State as AxumState},
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use bollard::container::{ListContainersOptions, LogsOptions, RestartContainerOptions, StopContainerOptions, StartContainerOptions};
+use bollard::Docker;
 use clap::{Parser, Subcommand};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use futures_util::StreamExt;
 use r4a_core::{Identity, JoinRequest, JoinResponse, Manifest, MetricsReport};
 use r4a_worker::Reconciler;
 use serde::{Deserialize, Serialize};
@@ -8,6 +18,32 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use sysinfo::System;
 use tracing::{info, warn, error};
+
+const AGENT_API_PORT: u16 = 8082;
+
+// Must match the public key in r4a-server (C-2).
+// DEV/TEST key — replace before production deployment.
+const RELEASE_SIGNING_PUBKEY: [u8; 32] = [
+    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
+    0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+    0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+    0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+];
+
+fn verify_release_signature(data: &[u8], sig_bytes: &[u8]) -> anyhow::Result<()> {
+    if std::env::var("R4A_SKIP_SIGNATURE_VERIFY").as_deref() == Ok("1") {
+        warn!("SECURITY: signature verification skipped (R4A_SKIP_SIGNATURE_VERIFY=1) — DO NOT USE IN PRODUCTION");
+        return Ok(());
+    }
+    let key = VerifyingKey::from_bytes(&RELEASE_SIGNING_PUBKEY)
+        .map_err(|e| anyhow::anyhow!("invalid signing public key: {e}"))?;
+    let sig_arr: [u8; 64] = sig_bytes.try_into()
+        .map_err(|_| anyhow::anyhow!("invalid signature length: expected 64 bytes, got {}", sig_bytes.len()))?;
+    let sig = Signature::from_bytes(&sig_arr);
+    key.verify(data, &sig)
+        .map_err(|e| anyhow::anyhow!("signature verification failed: {e}"))?;
+    Ok(())
+}
 
 fn state_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -51,6 +87,7 @@ fn load_identity(secret: Option<String>) -> Result<Identity> {
         private_key: kp.private,
         public_key: kp.public,
         cluster_secret: secret,
+        agent_token: None,
     };
     save_identity(&id)?;
     info!("Saved identity to {}", path.display());
@@ -128,20 +165,192 @@ fn handle_service(action: ServiceAction) -> Result<()> {
     let manager = r4a_service::ServiceManager::detect()?;
     match action {
         ServiceAction::Enable { master, secret, name } => {
+            // H-4: secret goes into a 0o600 env file, NOT the command line
             let mut exec = format!("/usr/local/bin/r4a-agent connect --master {}", master);
-            if let Some(s) = secret {
-                exec.push_str(&format!(" --secret {}", s));
-            }
-            if let Some(n) = name {
+            if let Some(n) = &name {
                 exec.push_str(&format!(" --name {}", n));
             }
-            manager.enable("r4a-agent", "r4a Agent Node", &exec)?;
+            let env_pairs: Vec<(&str, &str)> = secret.as_deref()
+                .map(|s| vec![("R4A_SECRET", s)])
+                .unwrap_or_default();
+            manager.enable("r4a-agent", "r4a Agent Node", &exec, &env_pairs)?;
         }
         ServiceAction::Disable => {
             manager.disable("r4a-agent")?;
         }
     }
     Ok(())
+}
+
+#[derive(Clone)]
+struct AgentApiState {
+    cluster_secret: String,
+    node_name: String,
+}
+
+#[derive(Serialize)]
+struct ContainerInfo {
+    id: String,
+    name: String,
+    image: String,
+    status: String,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    tail: Option<u64>,
+}
+
+async fn agent_containers_handler(
+    AxumState(state): AxumState<AgentApiState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<ContainerInfo>>, (StatusCode, String)> {
+    if !check_secret(&headers, &state.cluster_secret) {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut filters = HashMap::new();
+    filters.insert("label".to_string(), vec![format!("r4a.node={}", state.node_name)]);
+    let opts = ListContainersOptions { all: true, filters, ..Default::default() };
+
+    let containers = docker.list_containers(Some(opts)).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let result = containers.into_iter().map(|c| {
+        let name = c.names
+            .and_then(|ns| ns.into_iter().next())
+            .unwrap_or_default()
+            .trim_start_matches('/')
+            .to_string();
+        ContainerInfo {
+            id: c.id.unwrap_or_default(),
+            name,
+            image: c.image.unwrap_or_default(),
+            status: c.status.unwrap_or_default(),
+            state: c.state.unwrap_or_default(),
+        }
+    }).collect();
+
+    Ok(Json(result))
+}
+
+async fn agent_logs_handler(
+    AxumState(state): AxumState<AgentApiState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+    Query(q): Query<LogsQuery>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    if !check_secret(&headers, &state.cluster_secret) {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let tail = q.tail.unwrap_or(200);
+    let opts = LogsOptions::<String> {
+        stdout: true,
+        stderr: true,
+        tail: tail.to_string(),
+        timestamps: false,
+        ..Default::default()
+    };
+
+    let mut stream = docker.logs(&name, Some(opts));
+    let mut lines = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(output) => lines.push(output.to_string()),
+            Err(e) => lines.push(format!("[error] {}", e)),
+        }
+    }
+
+    Ok(Json(lines))
+}
+
+async fn agent_restart_handler(
+    AxumState(state): AxumState<AgentApiState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !check_secret(&headers, &state.cluster_secret) {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    docker.restart_container(&name, Some(RestartContainerOptions { t: 5 })).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn agent_stop_handler(
+    AxumState(state): AxumState<AgentApiState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !check_secret(&headers, &state.cluster_secret) {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    docker.stop_container(&name, Some(StopContainerOptions { t: 5 })).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn agent_start_handler(
+    AxumState(state): AxumState<AgentApiState>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !check_secret(&headers, &state.cluster_secret) {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    docker.start_container(&name, None::<StartContainerOptions<String>>).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::OK)
+}
+
+fn check_secret(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    // H-1: constant-time comparison to prevent timing attacks
+    headers.get("X-R4A-Secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| constant_time_eq::constant_time_eq(v.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false)
+}
+
+fn spawn_agent_api(cluster_secret: String, node_name: String, bind_ip: String) {
+    tokio::spawn(async move {
+        let state = AgentApiState { cluster_secret, node_name };
+        let app = Router::new()
+            .route("/containers", get(agent_containers_handler))
+            .route("/containers/:name/logs", get(agent_logs_handler))
+            .route("/containers/:name/restart", post(agent_restart_handler))
+            .route("/containers/:name/stop", post(agent_stop_handler))
+            .route("/containers/:name/start", post(agent_start_handler))
+            .with_state(state);
+
+        // C-2a: bind only to the VPN interface, not 0.0.0.0
+        let addr = format!("{}:{}", bind_ip, AGENT_API_PORT);
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => { error!("Agent API bind failed on {}: {}", addr, e); return; }
+        };
+        info!("Agent API listening on {}", addr);
+        if let Err(e) = axum::serve(listener, app).await {
+            error!("Agent API error: {}", e);
+        }
+    });
 }
 
 async fn connect(master_api: &str, secret: Option<String>, name: Option<String>) -> Result<()> {
@@ -172,6 +381,13 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
     info!("Assigned VPN IP : {}", resp.agent_vpn_ip);
     info!("Master endpoint : {}", resp.master_endpoint);
 
+    let mut identity = identity;
+    if let Some(token) = resp.agent_token.clone() {
+        identity.agent_token = Some(token);
+        let _ = save_identity(&identity);
+        info!("Saved agent token to identity.json");
+    }
+
     info!("Setting up WireGuard interface...");
     r4a_vpn::wireguard::setup_agent(
         &identity.private_key,
@@ -195,6 +411,8 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
     r4a_vpn::dns::set_hosts_entries(&hosts_ips, "master.local")?;
 
     info!("Agent '{}' connected. VPN IP: {}", name, resp.agent_vpn_ip);
+
+    spawn_agent_api(cluster_secret.clone(), name.clone(), resp.agent_vpn_ip.clone());
 
     let vpn_ip = resp.agent_vpn_ip.clone();
     let metrics_secret = cluster_secret.clone();
@@ -227,6 +445,11 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
     let update_client = client.clone();
     let update_vpn_ip = resp.agent_vpn_ip.clone();
     let update_secret = cluster_secret.clone();
+
+    // Report initial checksum so the master knows our current version immediately
+    if let Some(cs) = sha256_self() {
+        let _ = report_update_status(&update_client, &master_base, &update_vpn_ip, "idle", &cs, &update_secret).await;
+    }
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
@@ -239,8 +462,9 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
     let reconcile_client = client.clone();
     let reconciler_node_name = name.clone();
     let reconcile_secret = cluster_secret.clone();
+    let reconcile_token = identity.agent_token.clone().unwrap_or_default();
     tokio::spawn(async move {
-        let reconciler = match Reconciler::new(reconciler_node_name.clone()) {
+        let reconciler = match Reconciler::new(reconciler_node_name.clone(), reconcile_token.clone()) {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to initialize Reconciler: {}", e);
@@ -250,14 +474,30 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             let url = format!("http://master.local:8080/api/manifests?node={}", reconciler_node_name);
-            match reconcile_client.get(&url)
-                .header("X-R4A-Secret", &reconcile_secret)
-                .send().await {
+            let mut req = reconcile_client.get(&url);
+            if !reconcile_token.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", reconcile_token));
+            } else {
+                req = req.header("X-R4A-Secret", &reconcile_secret);
+            }
+
+            match req.send().await {
                 Ok(resp) => {
-                    if let Ok(manifests) = resp.json::<HashMap<String, Manifest>>().await {
-                        if let Err(e) = reconciler.reconcile(manifests).await {
-                            error!("Reconcile error: {}", e);
+                    let status = resp.status();
+                    if status.is_success() {
+                        let text = resp.text().await.unwrap_or_default();
+                        match serde_json::from_str::<HashMap<String, Manifest>>(&text) {
+                            Ok(manifests) => {
+                                if let Err(e) = reconciler.reconcile(manifests).await {
+                                    error!("Reconcile error: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to parse manifests JSON from master: {}. Body snippet: {}", e, &text[..text.len().min(100)]);
+                            }
                         }
+                    } else {
+                        warn!("Failed to fetch manifests: HTTP {}", status);
                     }
                 }
                 Err(e) => warn!("Failed to fetch manifests: {}", e),
@@ -304,6 +544,8 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
 
     let self_checksum = sha256_self().unwrap_or_default();
     if self_checksum == master_checksum {
+        // Already on latest — report so master can clear update_pending
+        let _ = report_update_status(client, master, vpn_ip, "updated", &self_checksum, secret).await;
         return Ok(());
     }
 
@@ -311,6 +553,7 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
 
     let _ = report_update_status(client, master, vpn_ip, "updating", &self_checksum, secret).await;
 
+    // C-2: download binary and its Ed25519 signature in parallel
     let bytes = client
         .get(format!("{master}/api/agent-binary"))
         .header("X-R4A-Secret", secret)
@@ -320,6 +563,31 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
         .bytes()
         .await?;
 
+    let sig_response = client
+        .get(format!("{master}/api/agent-binary-sig"))
+        .header("X-R4A-Secret", secret)
+        .send()
+        .await?;
+
+    let skip_verify = std::env::var("R4A_SKIP_SIGNATURE_VERIFY").as_deref() == Ok("1");
+
+    if sig_response.status().is_success() {
+        let sig_bytes = sig_response.bytes().await?;
+        verify_release_signature(&bytes, &sig_bytes)
+            .map_err(|e| {
+                let _ = tokio::runtime::Handle::current()
+                    .block_on(report_update_status(client, master, vpn_ip, "failed", &master_checksum, secret));
+                e
+            })?;
+        info!("Binary signature verified successfully");
+    } else if skip_verify {
+        warn!("SECURITY: no signature available from master (R4A_SKIP_SIGNATURE_VERIFY=1) — skipping verification");
+    } else {
+        let _ = report_update_status(client, master, vpn_ip, "failed", &master_checksum, secret).await;
+        anyhow::bail!("master has no signature for agent binary (HTTP {}): refusing to apply unsigned update", sig_response.status());
+    }
+
+    // Verify SHA256 checksum against what the master advertised
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let downloaded_checksum = format!("{:x}", hasher.finalize());
@@ -328,17 +596,18 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
         anyhow::bail!("checksum mismatch: expected {master_checksum} got {downloaded_checksum}");
     }
 
-    let tmp_path = "/tmp/r4a-agent.new";
+    // Write to a unique temp path to avoid symlink attacks (C-2/M-4)
+    let tmp_path = format!("/tmp/r4a-agent-{}.new", std::process::id());
     let target_path = "/usr/local/bin/r4a-agent";
-    std::fs::write(tmp_path, &bytes)?;
+    std::fs::write(&tmp_path, &bytes)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(tmp_path, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    std::fs::rename(tmp_path, target_path)?;
+    std::fs::rename(&tmp_path, target_path)?;
     info!("Updated to checksum {}, restarting...", &master_checksum[..8]);
 
     let _ = report_update_status(client, master, vpn_ip, "updated", &master_checksum, secret).await;

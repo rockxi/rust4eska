@@ -9,3 +9,8 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = "2"
 toml = "0.8"
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+zeroize = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
