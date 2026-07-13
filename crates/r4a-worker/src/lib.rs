@@ -156,7 +156,7 @@ impl Reconciler {
                     continue;
                 }
 
-                match client.get("http://master.local:8080/api/vault")
+                match client.get("http://master.r4a.local:3501/api/vault")
                     .query(&[("config_id", config_id), ("key", key)])
                     .header("Authorization", format!("Bearer {}", token))
                     .send().await {

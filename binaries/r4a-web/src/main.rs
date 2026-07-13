@@ -16,7 +16,7 @@ struct Assets;
 #[derive(Parser)]
 #[command(name = "r4a-web", about = "r4a Web Interface")]
 struct Cli {
-    #[arg(long, default_value = "8081")]
+    #[arg(long, default_value = "3502")]
     port: u16,
 }
 

@@ -6,12 +6,9 @@ pub struct KeyPair {
     pub public: String,
 }
 
-/// Validates a WireGuard public key: must be exactly 44 base64 characters
-/// (32 bytes encoded). Rejects newlines and non-base64 characters that would
-/// allow injecting additional directives into the WireGuard config file.
 pub fn validate_wg_pubkey(key: &str) -> Result<()> {
     if key.len() != 44 {
-        anyhow::bail!("WireGuard public key must be 44 characters (base64-encoded 32 bytes), got {}", key.len());
+        anyhow::bail!("WireGuard public key must be 44 characters, got {}", key.len());
     }
     if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=') {
         anyhow::bail!("WireGuard public key contains invalid characters");
@@ -19,8 +16,6 @@ pub fn validate_wg_pubkey(key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validates a node name: alphanumeric, hyphens, underscores, dots only.
-/// Prevents newline injection into WireGuard config and systemd unit files.
 pub fn validate_node_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
         anyhow::bail!("Node name must be 1–64 characters");
@@ -31,8 +26,6 @@ pub fn validate_node_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validates a host:port endpoint string. Rejects newlines, carriage returns,
-/// and null bytes that could inject config directives.
 pub fn validate_endpoint(endpoint: &str) -> Result<()> {
     if endpoint.contains('\n') || endpoint.contains('\r') || endpoint.contains('\0') {
         anyhow::bail!("Endpoint contains forbidden control characters");
@@ -44,9 +37,16 @@ pub fn validate_endpoint(endpoint: &str) -> Result<()> {
 }
 
 pub fn generate_keypair() -> Result<KeyPair> {
-    let private = run("wg", &["genkey"])?;
-    let public = run_with_stdin("wg", &["pubkey"], &private)?;
-    Ok(KeyPair { private, public })
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use rand::rngs::OsRng;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let secret = StaticSecret::random_from_rng(OsRng);
+    let public = PublicKey::from(&secret);
+    Ok(KeyPair {
+        private: STANDARD.encode(secret.to_bytes()),
+        public: STANDARD.encode(public.to_bytes()),
+    })
 }
 
 pub fn setup_master(private_key: &str, vpn_ip: &str, listen_port: u16) -> Result<()> {
@@ -57,16 +57,14 @@ pub fn setup_master_with_peers(
     private_key: &str,
     vpn_ip: &str,
     listen_port: u16,
-    peers: &[(&str, &str)], // (pub_key, vpn_ip)
+    peers: &[(&str, &str)],
 ) -> Result<()> {
-    // Validate all peer fields before writing the config file (C-1)
     for (pub_key, peer_ip) in peers {
         validate_wg_pubkey(pub_key)?;
         if peer_ip.contains('\n') || peer_ip.contains('\r') || peer_ip.contains('\0') {
             anyhow::bail!("peer VPN IP contains forbidden control characters");
         }
     }
-
     let mut conf = format!(
         "[Interface]\nPrivateKey = {private_key}\nAddress = {vpn_ip}/24\nListenPort = {listen_port}\n"
     );
@@ -87,10 +85,8 @@ pub fn setup_agent(
     master_pub: &str,
     master_endpoint: &str,
 ) -> Result<()> {
-    // Validate before writing the config file (C-1)
     validate_wg_pubkey(master_pub)?;
     validate_endpoint(master_endpoint)?;
-
     let conf = format!(
         "[Interface]\nPrivateKey = {private_key}\nAddress = {vpn_ip}/32\n\n\
          [Peer]\nPublicKey = {master_pub}\nEndpoint = {master_endpoint}\n\
@@ -117,28 +113,200 @@ pub fn remove_peer(pubkey: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_conf(conf: &str) -> Result<()> {
-    let path = "/etc/wireguard/wg0.conf";
-    let tmp_path = format!("{}.tmp", path);
+/// Bring down the WireGuard interface (platform-aware).
+pub fn bring_down() {
+    #[cfg(target_os = "macos")]
+    bring_down_macos();
+    #[cfg(not(target_os = "macos"))]
+    {
+        let conf = wg_conf_path();
+        let _ = Command::new("wg-quick").args(["down", conf]).output();
+    }
+}
 
-    std::fs::create_dir_all("/etc/wireguard")
-        .context("create /etc/wireguard/ (run as root?)")?;
+// ── Config path ───────────────────────────────────────────────────────────────
 
-    std::fs::write(&tmp_path, conf)
-        .context("write /etc/wireguard/wg0.conf.tmp (run as root?)")?;
-    
-    run("chmod", &["600", &tmp_path])?;
-    
-    std::fs::rename(&tmp_path, path)
-        .context("rename /etc/wireguard/wg0.conf.tmp to wg0.conf")?;
-    
+pub fn wg_conf_path() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "/tmp/r4a-wg/wg0.conf"
+    } else {
+        "/etc/wireguard/wg0.conf"
+    }
+}
+
+pub fn wg_quick_bin() -> String {
+    if cfg!(target_os = "macos") {
+        if std::path::Path::new("/opt/homebrew/bin/wg-quick").exists() {
+            "/opt/homebrew/bin/wg-quick".to_string()
+        } else if std::path::Path::new("/usr/local/bin/wg-quick").exists() {
+            "/usr/local/bin/wg-quick".to_string()
+        } else {
+            "wg-quick".to_string()
+        }
+    } else {
+        "wg-quick".to_string()
+    }
+}
+
+// ── Linux bring_up / bring_down ───────────────────────────────────────────────
+
+fn bring_up() -> Result<()> {
+    let conf = wg_conf_path();
+    #[cfg(target_os = "macos")]
+    return bring_up_macos(conf);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = Command::new("wg-quick").args(["down", conf]).output();
+        run("wg-quick", &["up", conf])?;
+        Ok(())
+    }
+}
+
+// ── macOS WireGuard (wireguard-go + wg setconf + ifconfig + route) ────────────
+
+#[cfg(target_os = "macos")]
+const MACOS_WG_STATE: &str = "/tmp/r4a-wg-state.json";
+
+#[cfg(target_os = "macos")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MacosWgState {
+    iface: String,
+    pid: u32,
+}
+
+#[cfg(target_os = "macos")]
+fn find_bin(candidates: &[&str]) -> Result<String> {
+    for p in candidates {
+        if std::path::Path::new(p).exists() {
+            return Ok(p.to_string());
+        }
+    }
+    anyhow::bail!("none of {:?} found", candidates)
+}
+
+#[cfg(target_os = "macos")]
+fn find_free_utun() -> Result<String> {
+    for i in 10..30u32 {
+        let name = format!("utun{}", i);
+        let in_use = Command::new("ifconfig")
+            .arg(&name)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !in_use {
+            return Ok(name);
+        }
+    }
+    anyhow::bail!("no free utun interface (utun10-utun29 all in use)")
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_iface(name: &str) -> Result<()> {
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let up = Command::new("ifconfig")
+            .arg(name)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if up {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("interface {} did not appear within 5s", name)
+}
+
+#[cfg(target_os = "macos")]
+fn bring_down_macos() {
+    if let Ok(data) = std::fs::read_to_string(MACOS_WG_STATE) {
+        if let Ok(state) = serde_json::from_str::<MacosWgState>(&data) {
+            let _ = Command::new("kill").args(["-9", &state.pid.to_string()]).output();
+            let _ = Command::new("route").args(["delete", "-net", "10.42.0.0/24"]).output();
+            // Remove interface if still present
+            let _ = Command::new("ifconfig").args([&state.iface, "down"]).output();
+        }
+    }
+    let _ = std::fs::remove_file(MACOS_WG_STATE);
+}
+
+#[cfg(target_os = "macos")]
+fn bring_up_macos(conf_path: &str) -> Result<()> {
+    // Tear down any existing r4a WireGuard session
+    bring_down_macos();
+
+    let wireguard_go = find_bin(&[
+        "/opt/homebrew/bin/wireguard-go",
+        "/usr/local/bin/wireguard-go",
+    ])
+    .context("wireguard-go not found — install: brew install wireguard-go")?;
+
+    let wg_bin = find_bin(&["/opt/homebrew/bin/wg", "/usr/local/bin/wg"])
+        .context("wg not found — install: brew install wireguard-tools")?;
+
+    let iface = find_free_utun()?;
+
+    // Start wireguard-go — it creates the utun interface and daemonizes
+    let child = Command::new(&wireguard_go)
+        .arg(&iface)
+        .spawn()
+        .with_context(|| format!("spawn wireguard-go {}", iface))?;
+
+    let pid = child.id();
+
+    // Persist state so bring_down can kill the process later
+    let state = MacosWgState { iface: iface.clone(), pid };
+    std::fs::create_dir_all("/tmp/r4a-wg").ok();
+    let _ = std::fs::write(MACOS_WG_STATE, serde_json::to_string(&state).unwrap_or_default());
+
+    // Wait for the utun interface to appear
+    wait_for_iface(&iface).with_context(|| format!("wireguard-go failed to create {}", iface))?;
+
+    // Load the config (private key + peer)
+    run(&wg_bin, &["setconf", &iface, conf_path])
+        .context("wg setconf failed")?;
+
+    // Parse the Address= from the conf file to assign to the interface
+    let conf_text = std::fs::read_to_string(conf_path).context("read wg conf")?;
+    let vpn_ip = conf_text
+        .lines()
+        .find(|l| l.trim_start().starts_with("Address"))
+        .and_then(|l| l.splitn(2, '=').nth(1))
+        .map(|s| s.trim().split('/').next().unwrap_or("").to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Address= not found in wg conf"))?;
+
+    // Assign the VPN IP to the interface (point-to-point)
+    run("ifconfig", &[&iface, "inet", &vpn_ip, &vpn_ip])
+        .context("ifconfig failed")?;
+
+    // Add route for the entire VPN subnet through this interface
+    let _ = Command::new("route").args(["delete", "-net", "10.42.0.0/24"]).output();
+    run("route", &["add", "-net", "10.42.0.0/24", &vpn_ip])
+        .context("route add failed")?;
+
+    tracing::info!("WireGuard up on {} ip={}", iface, vpn_ip);
     Ok(())
 }
 
-fn bring_up() -> Result<()> {
-    // down first to avoid "already exists" errors on re-runs
-    let _ = Command::new("wg-quick").args(["down", "wg0"]).output();
-    run("wg-quick", &["up", "wg0"])?;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn write_conf(conf: &str) -> Result<()> {
+    let path = wg_conf_path();
+    let tmp_path = format!("{}.tmp", path);
+    let dir = std::path::Path::new(path).parent().unwrap();
+
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+
+    std::fs::write(&tmp_path, conf)
+        .with_context(|| format!("write {}", tmp_path))?;
+
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    std::fs::rename(&tmp_path, path).context("rename wg conf")?;
     Ok(())
 }
 
@@ -147,26 +315,6 @@ fn run(cmd: &str, args: &[&str]) -> Result<String> {
         .args(args)
         .output()
         .with_context(|| format!("exec {cmd}"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "{cmd} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn run_with_stdin(cmd: &str, args: &[&str], input: &str) -> Result<String> {
-    use std::io::Write;
-    let mut child = Command::new(cmd)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn {cmd}"))?;
-    child.stdin.as_mut().unwrap().write_all(input.as_bytes())?;
-    let out = child.wait_with_output()?;
     if !out.status.success() {
         anyhow::bail!("{cmd} failed: {}", String::from_utf8_lossy(&out.stderr));
     }

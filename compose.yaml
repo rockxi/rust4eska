@@ -12,13 +12,15 @@ services:
       - /dev/net/tun:/dev/net/tun
     environment:
       - R4A_SECRET=test_secret_for_cluster_123
+      - R4A_ADMIN_SECRET=test_admin_secret_456
       - RUST_LOG=info
-    command: sh -c "/usr/local/bin/r4a-web --port 8081 & /usr/local/bin/r4a-server init"
+    command: sh -c "/usr/local/bin/r4a-web --port 3502 & /usr/local/bin/r4a-server init"
     restart: always
     ports:
-      - "8080:8080"
-      - "8081:8081"
-      - "8000:8000"
+      - "3501:3501"
+      - "3502:3502"
+      - "3500:3500"
+      - "443:443"
       - "51820:51820/udp"
     volumes:
       - master_data:/root/.r4a-server
@@ -46,7 +48,7 @@ services:
       - R4A_SECRET=test_secret_for_cluster_123
       - RUST_LOG=info
       - R4A_SKIP_SIGNATURE_VERIFY=1
-    command: r4a-agent connect --master http://master:8080 --name agent1
+    command: r4a-agent connect --master http://master:3501 --name agent1
     restart: always
     depends_on:
       - master
@@ -76,7 +78,7 @@ services:
       - R4A_SECRET=test_secret_for_cluster_123
       - RUST_LOG=info
       - R4A_SKIP_SIGNATURE_VERIFY=1
-    command: r4a-agent connect --master http://master:8080 --name agent2
+    command: r4a-agent connect --master http://master:3501 --name agent2
     restart: always
     depends_on:
       - master

@@ -343,7 +343,7 @@ impl Store {
                     .build()
                     .unwrap_or_default();
                 
-                let target = format!("http://{master_ip}:8080/api/store/sync");
+                let target = format!("http://{master_ip}:3501/api/store/sync");
                 if let Err(e) = client.post(&target)
                     .header("X-R4A-Secret", &secret)
                     .json(&req)

@@ -377,7 +377,7 @@ const Manifests: React.FC = () => {
                                                 value={editing.ingress.domain}
                                                 onChange={e => updateField(['ingress', 'domain'], e.target.value)}
                                                 className="w-full bg-deep-dark border border-gray-700 rounded px-3 py-2 text-white text-sm font-mono focus:outline-none focus:border-accent-teal/50"
-                                                placeholder="my-app.master.local"
+                                                placeholder="my-app.master.r4a.local"
                                             />
                                         </div>
                                         <div>

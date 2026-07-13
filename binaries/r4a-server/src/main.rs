@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose, SanType};
 
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use clap::{Parser, Subcommand};
@@ -36,8 +37,9 @@ use sysinfo::System;
 use tracing::{info, warn, error};
 
 const WG_PORT: u16 = 51820;
-const API_PORT: u16 = 8080;
-const INGRESS_PORT: u16 = 8000;
+const API_PORT: u16 = 3501;
+const INGRESS_PORT: u16 = 3500;
+const HTTPS_PORT: u16 = 443;
 
 fn state_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
@@ -63,46 +65,61 @@ fn save_identity(id: &Identity) -> Result<()> {
     Ok(())
 }
 
+fn generate_secret() -> String {
+    let mut secret = [0u8; 32];
+    thread_rng().fill_bytes(&mut secret);
+    hex::encode(secret)
+}
+
 fn load_identity() -> Result<Identity> {
     let path = state_dir().join("identity.json");
     let env_secret = std::env::var("R4A_SECRET").ok();
-    
+    let env_admin_secret = std::env::var("R4A_ADMIN_SECRET").ok();
+
     if path.exists() {
         let data = std::fs::read_to_string(&path)?;
         let mut id: Identity = serde_json::from_str(&data)?;
-        
+
         if let Some(secret) = env_secret {
             if id.cluster_secret.as_ref() != Some(&secret) {
                 id.cluster_secret = Some(secret);
                 save_identity(&id)?;
             }
         } else if id.cluster_secret.is_none() {
-            use rand::{RngCore, thread_rng};
-            let mut secret = [0u8; 32];
-            thread_rng().fill_bytes(&mut secret);
-            id.cluster_secret = Some(hex::encode(secret));
+            id.cluster_secret = Some(generate_secret());
             save_identity(&id)?;
         }
-        
+
+        if let Some(secret) = env_admin_secret {
+            if id.admin_secret.as_ref() != Some(&secret) {
+                id.admin_secret = Some(secret);
+                save_identity(&id)?;
+            }
+        } else if id.admin_secret.is_none() {
+            let secret = generate_secret();
+            info!("Generated admin secret (for web/CLI login), stored in {}", path.display());
+            id.admin_secret = Some(secret);
+            save_identity(&id)?;
+        }
+
         info!("Loaded existing identity, public key: {}", id.public_key);
         return Ok(id);
     }
-    
+
     let kp = r4a_vpn::wireguard::generate_keypair()?;
-    
-    let secret = if let Some(s) = env_secret {
+
+    let secret = env_secret.unwrap_or_else(generate_secret);
+    let admin_secret = env_admin_secret.unwrap_or_else(|| {
+        let s = generate_secret();
+        info!("Generated admin secret (for web/CLI login), stored in {}", path.display());
         s
-    } else {
-        use rand::{RngCore, thread_rng};
-        let mut secret = [0u8; 32];
-        thread_rng().fill_bytes(&mut secret);
-        hex::encode(secret)
-    };
-    
+    });
+
     let id = Identity {
         private_key: kp.private,
         public_key: kp.public,
         cluster_secret: Some(secret),
+        admin_secret: Some(admin_secret),
         agent_token: None,
     };
     save_identity(&id)?;
@@ -113,6 +130,7 @@ fn load_identity() -> Result<Identity> {
 struct AppState {
     master_pub_key: String,
     cluster_secret: String,
+    admin_secret: String,
     my_vpn_ip: String,
     peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
     next_ip: Arc<Mutex<u16>>,
@@ -140,6 +158,28 @@ impl FromRequestParts<AppState> for RequireSecret {
             }
         }
         Err((StatusCode::UNAUTHORIZED, "Invalid or missing X-R4A-Secret header"))
+    }
+}
+
+// Admin login secret: unlike the cluster secret, agents never hold this,
+// so only a real administrator can exchange it for an admin token.
+struct RequireAdminSecret;
+
+#[async_trait::async_trait]
+impl FromRequestParts<AppState> for RequireAdminSecret {
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        if let Some(auth_header) = parts.headers.get("X-R4A-Secret") {
+            if let Ok(auth_str) = auth_header.to_str() {
+                if !state.admin_secret.is_empty()
+                    && constant_time_eq(auth_str.as_bytes(), state.admin_secret.as_bytes())
+                {
+                    return Ok(RequireAdminSecret);
+                }
+            }
+        }
+        Err((StatusCode::UNAUTHORIZED, "Invalid or missing X-R4A-Secret header (admin secret required)"))
     }
 }
 
@@ -297,7 +337,7 @@ async fn save_peers(store: &Store, peers: &HashMap<String, PeerInfo>) {
     
     let ips_ref: Vec<&str> = master_ips.iter().map(|s| s.as_str()).collect();
     if !ips_ref.is_empty() {
-        if let Err(e) = r4a_vpn::dns::set_hosts_entries(&ips_ref, "master.local") {
+        if let Err(e) = r4a_vpn::dns::set_hosts_entries(&ips_ref, "master.r4a.local") {
             warn!("Failed to update /etc/hosts: {}", e);
         }
     }
@@ -305,6 +345,8 @@ async fn save_peers(store: &Store, peers: &HashMap<String, PeerInfo>) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 requires an explicit crypto provider when multiple are compiled in
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     match cli.command {
@@ -474,9 +516,15 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         .map(|m| m + 1)
         .unwrap_or(2);
 
+    let admin_secret = identity.admin_secret.clone().unwrap_or_default();
+    if admin_secret.is_empty() {
+        warn!("Admin secret is empty — /api/tokens/exchange will reject all requests");
+    }
+
     let state = AppState {
         master_pub_key: identity.public_key.clone(),
         cluster_secret: cluster_secret.clone(),
+        admin_secret,
         my_vpn_ip: my_vpn_ip.clone(),
         peers: Arc::new(Mutex::new(saved_peers)),
         next_ip: Arc::new(Mutex::new(next_ip)),
@@ -532,6 +580,21 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         run_dns_server(dns_vpn_ip, dns_store).await;
     });
 
+    // TLS certs: generate CA + server cert on first start
+    let (server_cert_pem, server_key_pem) = match ensure_tls_certs(&store).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!("Failed to generate TLS certs: {} — HTTPS proxy disabled", e);
+            (String::new(), String::new())
+        }
+    };
+    if !server_cert_pem.is_empty() {
+        let https_vpn_ip = my_vpn_ip.clone();
+        tokio::spawn(async move {
+            start_https_proxy(https_vpn_ip, server_cert_pem, server_key_pem).await;
+        });
+    }
+
     let broadcast_state = state.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
@@ -563,7 +626,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
 
             for master_ip in masters {
                 let _ = client
-                    .post(format!("http://{master_ip}:8080/api/metrics"))
+                    .post(format!("http://{master_ip}:3501/api/metrics"))
                     .header("X-R4A-Secret", &broadcast_state.cluster_secret)
                     .json(&report)
                     .send()
@@ -585,7 +648,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
             
             let ips_ref: Vec<&str> = master_ips.iter().map(|s| s.as_str()).collect();
             if !ips_ref.is_empty() {
-                let _ = r4a_vpn::dns::set_hosts_entries(&ips_ref, "master.local");
+                let _ = r4a_vpn::dns::set_hosts_entries(&ips_ref, "master.r4a.local");
             }
 
             hosts_state.store.set_masters(master_ips);
@@ -630,6 +693,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         .route("/api/connections", get(connections_list_handler).post(connect_handler))
         .route("/api/connections/:id", axum::routing::delete(disconnect_handler))
         .route("/api/connections/:id/heartbeat", post(connection_heartbeat_handler))
+        .route("/api/ca-cert", get(ca_cert_handler))
         .nest_service(
             "/git",
             Router::new()
@@ -642,8 +706,12 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
                 .allow_origin(AllowOrigin::predicate(|origin, _| {
                     let s = origin.to_str().unwrap_or("");
                     s.starts_with("http://10.42.")
-                        || s.starts_with("http://master.local")
+                        || s.starts_with("https://10.42.")
                         || s.starts_with("http://master.r4a.local")
+                        || s.starts_with("http://master.r4a.local")
+                        || s.starts_with("https://master.r4a.local")
+                        || s.starts_with("https://web.master.r4a.local")
+                        || s.starts_with("https://api.master.r4a.local")
                         || s.starts_with("http://localhost")
                         || s.starts_with("http://127.0.0.1")
                 }))
@@ -697,7 +765,9 @@ async fn require_vpn_for_api(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let path = req.uri().path();
-    let is_public = path == "/" || path == "/api/join";
+    let is_public = path == "/" || path == "/api/join"
+        || (path == "/api/connections" && req.method() == axum::http::Method::POST)
+        || path == "/api/ca-cert";
     if !is_public {
         let allowed = match addr.ip() {
             std::net::IpAddr::V4(v4) => {
@@ -1464,7 +1534,7 @@ struct ChecksumResponse { checksum: String }
 
 async fn token_exchange_handler(
     State(state): State<AppState>,
-    _auth: RequireSecret,
+    _auth: RequireAdminSecret,
 ) -> Result<Json<Token>, (StatusCode, String)> {
     {
         let tree = state.store.db.open_tree("tokens")
@@ -2104,12 +2174,13 @@ async fn handle_dns_query(query: &[u8], store: &Store) -> Option<Vec<u8>> {
 }
 
 async fn dns_resolve(qname: &str, store: &Store) -> Option<std::net::Ipv4Addr> {
-    if qname == "master.r4a.local" {
+    // master and all its subdomains (e.g. web.master.r4a.local, api.master.r4a.local)
+    if qname == "master.r4a.local" || qname.ends_with(".master.r4a.local") {
         return "10.42.0.1".parse().ok();
     }
+
     let label = qname.strip_suffix(".r4a.local")?;
 
-    // Check peers by name
     let peers: HashMap<String, PeerInfo> = store
         .get("core", b"peers")
         .ok()
@@ -2117,11 +2188,20 @@ async fn dns_resolve(qname: &str, store: &Store) -> Option<std::net::Ipv4Addr> {
         .and_then(|d| serde_json::from_slice(&d).ok())
         .unwrap_or_default();
 
+    // Direct node name: <node>.r4a.local
     if let Some(peer) = peers.values().find(|p| p.name.to_lowercase() == label) {
         return peer.ip.parse().ok();
     }
 
-    // Check connection labels
+    // Subdomain of a node: <sub>.<node>.r4a.local → node's VPN IP
+    if let Some(dot_pos) = label.rfind('.') {
+        let node_name = &label[dot_pos + 1..];
+        if let Some(peer) = peers.values().find(|p| p.name.to_lowercase() == node_name) {
+            return peer.ip.parse().ok();
+        }
+    }
+
+    // Connection labels: <label>.r4a.local
     store.get_label_ip(label).ok().flatten()?.parse().ok()
 }
 
@@ -2188,5 +2268,211 @@ fn dns_noerror_empty(query: &[u8]) -> Vec<u8> {
     r.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
     r.extend_from_slice(&query[12..]);
     r
+}
+
+// ── TLS / CA ──────────────────────────────────────────────────────────────────
+
+async fn ca_cert_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.store.get("vault_meta", b"tls_ca_cert") {
+        Ok(Some(bytes)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/x-pem-file")],
+            String::from_utf8_lossy(&bytes).to_string(),
+        ),
+        _ => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "CA cert not found".to_string(),
+        ),
+    }
+}
+
+async fn ensure_tls_certs(store: &Store) -> anyhow::Result<(String, String)> {
+    // Return existing certs if already generated
+    if let (Ok(Some(cert_b)), Ok(Some(key_b))) = (
+        store.get("vault_meta", b"tls_server_cert"),
+        store.get("vault_meta", b"tls_server_key"),
+    ) {
+        info!("Loaded existing TLS server certificate");
+        return Ok((String::from_utf8(cert_b.to_vec())?, String::from_utf8(key_b.to_vec())?));
+    }
+
+    // Generate CA
+    let mut ca_params = CertificateParams::new(vec![]);
+    ca_params.distinguished_name.push(DnType::CommonName, "r4a Local CA");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_cert = Certificate::from_params(ca_params)?;
+    let ca_cert_pem = ca_cert.serialize_pem()?;
+    let ca_key_pem = ca_cert.serialize_private_key_pem();
+
+    // Generate server cert with SANs covering all *.r4a.local and *.master.r4a.local
+    let mut srv_params = CertificateParams::new(vec![
+        "master.r4a.local".to_string(),
+        "*.master.r4a.local".to_string(),
+        "*.r4a.local".to_string(),
+    ]);
+    srv_params.distinguished_name.push(DnType::CommonName, "r4a Server");
+    srv_params.subject_alt_names.push(
+        SanType::IpAddress(std::net::IpAddr::V4("10.42.0.1".parse()?))
+    );
+    srv_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let srv_cert = Certificate::from_params(srv_params)?;
+    let srv_cert_pem = srv_cert.serialize_pem_with_signer(&ca_cert)?;
+    let srv_key_pem = srv_cert.serialize_private_key_pem();
+
+    store.put("vault_meta", b"tls_ca_cert", ca_cert_pem.as_bytes()).await?;
+    store.put("vault_meta", b"tls_ca_key", ca_key_pem.as_bytes()).await?;
+    store.put("vault_meta", b"tls_server_cert", srv_cert_pem.as_bytes()).await?;
+    store.put("vault_meta", b"tls_server_key", srv_key_pem.as_bytes()).await?;
+
+    info!("Generated new TLS CA and server certificate");
+    Ok((srv_cert_pem, srv_key_pem))
+}
+
+// ── HTTPS proxy on port 443 ───────────────────────────────────────────────────
+
+async fn start_https_proxy(vpn_ip: String, cert_pem: String, key_pem: String) {
+    use std::sync::Arc;
+    use rustls::ServerConfig;
+    use rustls_pemfile;
+    use tokio_rustls::TlsAcceptor;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as HyperBuilder;
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .filter_map(|c| c.ok().map(|c| c.into_owned()))
+            .collect();
+
+    let key = match rustls_pemfile::private_key(&mut key_pem.as_bytes()) {
+        Ok(Some(k)) => k.clone_key(),
+        _ => { warn!("HTTPS proxy: no private key found in PEM"); return; }
+    };
+
+    let tls_config = match ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+    {
+        Ok(c) => c,
+        Err(e) => { warn!("HTTPS proxy: TLS config error: {}", e); return; }
+    };
+
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap();
+
+    let proxy_app = Router::new()
+        .route("/", any(proxy_handler))
+        .route("/*path", any(proxy_handler))
+        .with_state(client);
+
+    let addr: std::net::SocketAddr = format!("{}:{}", vpn_ip, HTTPS_PORT).parse().unwrap();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => { warn!("HTTPS proxy: bind {} failed: {}", addr, e); return; }
+    };
+    info!("HTTPS proxy listening on https://{}", addr);
+
+    loop {
+        let (tcp_stream, _) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => { warn!("HTTPS accept error: {}", e); continue; }
+        };
+        let acceptor = acceptor.clone();
+        let svc = proxy_app.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp_stream).await {
+                Ok(s) => s,
+                Err(e) => { warn!("TLS handshake failed: {}", e); return; }
+            };
+            let io = TokioIo::new(tls_stream);
+            let service = hyper::service::service_fn(move |req| {
+                let mut s = svc.clone();
+                async move {
+                    use tower::Service as _;
+                    s.call(req.map(axum::body::Body::new)).await
+                }
+            });
+            if let Err(e) = HyperBuilder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await
+            {
+                warn!("HTTPS connection error: {}", e);
+            }
+        });
+    }
+}
+
+async fn proxy_handler(
+    State(client): State<reqwest::Client>,
+    req: axum::http::Request<Body>,
+) -> Response {
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+
+    let target_base = if host.starts_with("web.") {
+        "http://127.0.0.1:3502"
+    } else if host.starts_with("api.") {
+        "http://127.0.0.1:3501"
+    } else {
+        "http://127.0.0.1:3500"
+    };
+
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let url = format!("{}{}", target_base, path_and_query);
+
+    let method = match reqwest::Method::from_bytes(req.method().as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let mut builder = client.request(method, &url);
+    for (k, v) in req.headers() {
+        if k != axum::http::header::HOST {
+            builder = builder.header(k, v);
+        }
+    }
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    builder = builder.body(body_bytes);
+
+    let upstream = match builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("HTTPS proxy: upstream error for {}: {}", url, e);
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    let status = axum::http::StatusCode::from_u16(upstream.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut resp = Response::builder().status(status);
+    for (k, v) in upstream.headers() {
+        resp = resp.header(k, v);
+    }
+    let body_bytes = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    resp.body(Body::from(body_bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 

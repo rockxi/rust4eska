@@ -87,6 +87,7 @@ fn load_identity(secret: Option<String>) -> Result<Identity> {
         private_key: kp.private,
         public_key: kp.public,
         cluster_secret: secret,
+        admin_secret: None,
         agent_token: None,
     };
     save_identity(&id)?;
@@ -407,8 +408,8 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
         hosts_ips.push("10.42.0.1");
     }
 
-    info!("Adding master.local ({}) to /etc/hosts...", hosts_ips.join(", "));
-    r4a_vpn::dns::set_hosts_entries(&hosts_ips, "master.local")?;
+    info!("Adding master.r4a.local ({}) to /etc/hosts...", hosts_ips.join(", "));
+    r4a_vpn::dns::set_hosts_entries(&hosts_ips, "master.r4a.local")?;
 
     info!("Agent '{}' connected. VPN IP: {}", name, resp.agent_vpn_ip);
 
@@ -433,7 +434,7 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
             };
             
             let _ = client
-                .post("http://master.local:8080/api/metrics")
+                .post("http://master.r4a.local:3501/api/metrics")
                 .header("X-R4A-Secret", &metrics_secret)
                 .json(&report)
                 .send()
@@ -441,7 +442,7 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
         }
     });
 
-    let master_base = "http://master.local:8080".to_string();
+    let master_base = "http://master.r4a.local:3501".to_string();
     let update_client = client.clone();
     let update_vpn_ip = resp.agent_vpn_ip.clone();
     let update_secret = cluster_secret.clone();
@@ -473,7 +474,7 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
         };
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            let url = format!("http://master.local:8080/api/manifests?node={}", reconciler_node_name);
+            let url = format!("http://master.r4a.local:3501/api/manifests?node={}", reconciler_node_name);
             let mut req = reconcile_client.get(&url);
             if !reconcile_token.is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", reconcile_token));

@@ -388,4 +388,11 @@ impl ApiClient {
             .send().await?.error_for_status()?;
         Ok(())
     }
+
+    pub async fn ca_cert(&self) -> Result<String> {
+        let resp = self.client
+            .get(format!("{}/api/ca-cert", self.base_url))
+            .send().await?.error_for_status()?;
+        Ok(resp.text().await?)
+    }
 }

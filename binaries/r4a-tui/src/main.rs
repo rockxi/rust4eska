@@ -26,7 +26,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 #[command(name = "r4a-tui", about = "r4a cluster dashboard")]
 struct Cli {
     /// Master node API URL
-    #[arg(long, env = "R4A_MASTER", default_value = "http://master.local:8080")]
+    #[arg(long, env = "R4A_MASTER", default_value = "http://master.r4a.local:3501")]
     master: String,
     #[arg(long, env = "R4A_SECRET")]
     secret: Option<String>,

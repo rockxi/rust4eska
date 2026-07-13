@@ -40,3 +40,10 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 zeroize = { version = "1.8", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+rcgen = "0.12"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+hyper = { version = "1", features = ["http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+tower = "0.4"

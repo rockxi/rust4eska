@@ -1,3 +1,35 @@
+## HTTPS / TLS (реализовано 2026-05-25)
+
+### Архитектура
+- Root CA + server TLS cert генерируются при первом старте мастера (`rcgen 0.12`)
+- Хранятся в `vault_meta` Sled: `tls_ca_cert`, `tls_ca_key`, `tls_server_cert`, `tls_server_key`
+- SANs: `master.r4a.local`, `*.master.r4a.local`, `*.r4a.local`, IP `10.42.0.1`
+- HTTPS proxy на `<vpn_ip>:443`: `tokio-rustls 0.26` + `hyper-util` + `hyper`
+- Host-based routing: `web.*` → 8081, `api.*` → 8080, всё остальное → 8000 (Pingora)
+- `GET /api/ca-cert` — возвращает CA cert PEM без аутентификации
+
+### Важные нюансы
+- `rustls 0.23` требует `CryptoProvider::install_default()` при старте (`ring::default_provider().install_default()`)
+- `axum-server 0.6` НЕ компилируется с нашим hyper 1.x — используем tokio-rustls напрямую
+- Порт 443 привязан к `<vpn_ip>` (WireGuard IP, не 0.0.0.0) — доступен только через VPN/WireGuard
+- DNS: `*.master.r4a.local` → `10.42.0.1`, `*.<node>.r4a.local` → node VPN IP
+- CORS: добавлены `https://` варианты для `master.r4a.local`, `web.master.r4a.local`, `api.master.r4a.local`
+
+### r4a-cli trust store
+- macOS: `security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/r4a-ca.crt`
+- Debian: `/usr/local/share/ca-certificates/r4a-ca.crt` + `update-ca-certificates`
+- Fedora: `/etc/pki/ca-trust/source/anchors/r4a-ca.crt` + `update-ca-trust extract`
+- При `connect down` / Ctrl-C: удаляется из trust store
+- `ConnectionState` добавлено поле `ca_cert_path: Option<String>`
+
+### Доступ после connect up
+- `https://web.master.r4a.local` — Web UI (→ port 8081)
+- `https://api.master.r4a.local` — API (→ port 8080)
+- `https://myapp.master.r4a.local` — user apps (→ port 8000 Pingora)
+- Старые HTTP порты 8080/8081/8000 продолжают работать
+
+---
+
 ## Security (реализовано 2026-05-21)
 
 ### Что изменилось в архитектуре безопасности
@@ -224,3 +256,9 @@
 2. Меняем код → `make dev-deploy`
 3. TUI: `docker exec -it node-agent1 R4A_SECRET=test_secret_for_cluster_123 r4a-tui`
 4. Логи: `docker compose logs agent1 agent2 -f`
+
+## 2026-07-13: admin_secret отделён от cluster_secret
+- `/api/tokens/exchange` теперь требует admin-секрет (`R4A_ADMIN_SECRET` / генерируется в identity.json), cluster-секрет больше не даёт admin-токен.
+- Проверено в docker compose: cluster-секрет → 401, admin-секрет → 200, агенты джойнятся как раньше.
+- ВАЖНО для prod-деплоя: вход в web UI теперь по admin-секрету (смотреть в ~/.r4a-server/identity.json на мастере).
+- Из код-ревью остались нерешёнными: delete не реплицируется между мастерами; RBAC `can()` матчит resource_names как префиксы (starts_with); CORS-предикат обходится префиксом (10.42.evil.com); мёртвый поиск existing_token_id в join_handler; next_ip не учитывает connections после рестарта.

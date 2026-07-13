@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[command(name = "r4a-cli", about = "r4a cluster management CLI")]
 struct Cli {
     /// Master node API URL
-    #[arg(long, env = "R4A_MASTER", default_value = "http://master.local:8080")]
+    #[arg(long, env = "R4A_MASTER", default_value = "http://master.r4a.local:3501")]
     master: String,
     
     #[arg(long, env = "R4A_SECRET")]
@@ -79,6 +79,36 @@ enum ConnectCommands {
     Status,
     /// List all active connections on the master
     List,
+    /// Manually remove all r4a network leftovers (DNS, hosts, certs) if connect down failed
+    Cleanup,
+    /// Install or remove the auto-connect background service (systemd on Linux, launchd on macOS)
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommands {
+    /// Install and enable the auto-connect service (systemd on Linux, launchd on macOS)
+    Install {
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        wg_endpoint: Option<String>,
+        /// Linux only: "user" (~/.config/systemd/user/, no root) or "system" (/etc/systemd/system/, requires root)
+        #[arg(long, default_value = "user")]
+        scope: String,
+        /// Remove existing service before installing
+        #[arg(long)]
+        reinstall: bool,
+    },
+    /// Remove the auto-connect service
+    Uninstall {
+        /// Linux only: "user" or "system"
+        #[arg(long, default_value = "user")]
+        scope: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -93,6 +123,8 @@ struct ConnectionState {
     added_hosts: Vec<String>,
     #[serde(default)]
     resolver_domain: Option<String>,
+    #[serde(default)]
+    ca_cert_path: Option<String>,
 }
 
 fn connection_state_path() -> PathBuf {
@@ -196,6 +228,397 @@ enum UpdateCommands {
     Test,
     /// Trigger cluster-wide update
     Run,
+}
+
+/// Download CA cert from master and install it into the system trust store.
+/// Returns the path where the cert was written (for cleanup on disconnect), or None on failure.
+async fn install_ca_cert(client: &r4a_client::ApiClient) -> Option<String> {
+    let pem = match client.ca_cert().await {
+        Ok(p) => p,
+        Err(e) => { eprintln!("Warning: could not download CA cert: {}", e); return None; }
+    };
+
+    // Determine OS-specific cert path
+    let (cert_path, _update_cmd): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("/tmp/r4a-ca.crt", &[])  // macOS uses security command directly
+    } else if std::path::Path::new("/usr/sbin/update-ca-certificates").exists()
+        || std::path::Path::new("/usr/bin/update-ca-certificates").exists()
+    {
+        ("/usr/local/share/ca-certificates/r4a-ca.crt", &["update-ca-certificates"])
+    } else if std::path::Path::new("/usr/bin/update-ca-trust").exists() {
+        ("/etc/pki/ca-trust/source/anchors/r4a-ca.crt", &["update-ca-trust", "extract"])
+    } else {
+        eprintln!("Warning: unknown system, skipping CA cert install. Save manually:\n{}", pem);
+        return None;
+    };
+
+    if let Err(e) = std::fs::write(cert_path, pem.as_bytes()) {
+        eprintln!("Warning: could not write CA cert to {}: {}", cert_path, e);
+        return None;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("security")
+            .args(["add-trusted-cert", "-d", "-r", "trustRoot",
+                   "-k", "/Library/Keychains/System.keychain", cert_path])
+            .status();
+        match status {
+            Ok(s) if s.success() => println!("  CA cert:       installed to macOS keychain"),
+            _ => eprintln!("Warning: could not install CA cert (try: sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {})", cert_path),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    if !update_cmd.is_empty() {
+        let status = std::process::Command::new(update_cmd[0])
+            .args(&update_cmd[1..])
+            .status();
+        match status {
+            Ok(s) if s.success() => println!("  CA cert:       installed to system trust store ({})", cert_path),
+            _ => eprintln!("Warning: could not run {}. Cert saved to {}. Run manually.", update_cmd[0], cert_path),
+        }
+    }
+
+    Some(cert_path.to_string())
+}
+
+/// Remove CA cert installed by install_ca_cert.
+fn remove_ca_cert(cert_path: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("security")
+            .args(["remove-trusted-cert", "-d", cert_path])
+            .status();
+        let _ = std::fs::remove_file(cert_path);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if std::fs::remove_file(cert_path).is_ok() {
+            if std::path::Path::new("/usr/sbin/update-ca-certificates").exists()
+                || std::path::Path::new("/usr/bin/update-ca-certificates").exists()
+            {
+                let _ = std::process::Command::new("update-ca-certificates").status();
+            } else if std::path::Path::new("/usr/bin/update-ca-trust").exists() {
+                let _ = std::process::Command::new("update-ca-trust").args(["extract"]).status();
+            }
+        }
+    }
+}
+
+// ── Linux systemd ────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn linux_env_file_path(scope: &str) -> std::path::PathBuf {
+    if scope == "system" {
+        std::path::PathBuf::from("/etc/r4a-connect.env")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        std::path::PathBuf::from(home).join(".r4a-connect.env")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_service_path(scope: &str) -> std::path::PathBuf {
+    if scope == "system" {
+        std::path::PathBuf::from("/etc/systemd/system/r4a-connect.service")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        std::path::PathBuf::from(home).join(".config/systemd/user/r4a-connect.service")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_systemd_service(
+    bin: &str,
+    up_args: &[String],
+    master: &str,
+    token: Option<&str>,
+    is_bearer: bool,
+    scope: &str,
+) -> Result<()> {
+    // Write credentials to env file (not visible in `ps aux`)
+    let env_path = linux_env_file_path(scope);
+    let mut env_content = format!("R4A_MASTER={}\n", master);
+    if let Some(tok) = token {
+        let key = if is_bearer { "R4A_TOKEN" } else { "R4A_SECRET" };
+        env_content.push_str(&format!("{}={}\n", key, tok));
+    }
+    std::fs::write(&env_path, &env_content)
+        .with_context(|| format!("Could not write env file to {}", env_path.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    // Write systemd unit file
+    let service_path = linux_service_path(scope);
+    if let Some(dir) = service_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let exec_start = std::iter::once(bin.to_string())
+        .chain(up_args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let unit = if scope == "system" {
+        let user = std::env::var("USER").unwrap_or_else(|_| "nobody".to_string());
+        format!(
+            "[Unit]\nDescription=r4a cluster VPN connection\nAfter=network-online.target\nWants=network-online.target\n\n\
+             [Service]\nType=simple\nUser={user}\nEnvironmentFile={env}\nExecStart={exec}\nRestart=always\nRestartSec=10\n\n\
+             [Install]\nWantedBy=multi-user.target\n",
+            user = user,
+            env = env_path.display(),
+            exec = exec_start,
+        )
+    } else {
+        format!(
+            "[Unit]\nDescription=r4a cluster VPN connection\nAfter=network.target\n\n\
+             [Service]\nType=simple\nEnvironmentFile={env}\nExecStart={exec}\nRestart=always\nRestartSec=10\n\n\
+             [Install]\nWantedBy=default.target\n",
+            env = env_path.display(),
+            exec = exec_start,
+        )
+    };
+
+    std::fs::write(&service_path, &unit)
+        .with_context(|| format!("Could not write service file to {}", service_path.display()))?;
+
+    let run_ctl = |args: &[&str]| {
+        if scope == "user" {
+            std::process::Command::new("systemctl").arg("--user").args(args).status()
+        } else {
+            std::process::Command::new("sudo").arg("systemctl").args(args).status()
+        }
+    };
+
+    let _ = run_ctl(&["daemon-reload"]);
+    let _ = run_ctl(&["enable", "r4a-connect"]);
+    let flag = if scope == "user" { "--user " } else { "" };
+    match run_ctl(&["start", "r4a-connect"]) {
+        Ok(s) if s.success() => {
+            println!("  Env file:  {}", env_path.display());
+            println!("  Service:   {}", service_path.display());
+            println!("  Status:    systemctl {}status r4a-connect", flag);
+            println!("  Logs:      journalctl {}--unit r4a-connect -f", flag);
+        }
+        _ => {
+            eprintln!("Warning: service start failed. Files written.");
+            eprintln!("Run manually: systemctl {}enable --now r4a-connect", flag);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_systemd_service(scope: &str) -> Result<()> {
+    let service_path = linux_service_path(scope);
+    let env_path = linux_env_file_path(scope);
+
+    let run_ctl = |args: &[&str]| {
+        if scope == "user" {
+            std::process::Command::new("systemctl").arg("--user").args(args).status()
+        } else {
+            std::process::Command::new("sudo").arg("systemctl").args(args).status()
+        }
+    };
+
+    let _ = run_ctl(&["stop", "r4a-connect"]);
+    let _ = run_ctl(&["disable", "r4a-connect"]);
+    let _ = std::fs::remove_file(&service_path);
+    let _ = std::fs::remove_file(&env_path);
+    let _ = run_ctl(&["daemon-reload"]);
+    println!("  Removed: {}", service_path.display());
+    Ok(())
+}
+
+// ── macOS launchd ────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn launchd_plist_path() -> Result<PathBuf> {
+    // When running as root, install as a system daemon so it can manage WireGuard interfaces
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(PathBuf::from("/Library/LaunchDaemons/com.r4a.connect.plist"));
+    }
+    let home = std::env::var("HOME").context("HOME not set")?;
+    Ok(PathBuf::from(home).join("Library/LaunchAgents/com.r4a.connect.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd_service(
+    bin: &str,
+    up_args: &[String],
+    master: &str,
+    token: Option<&str>,
+    is_bearer: bool,
+) -> Result<()> {
+    // System daemons must run from a system path — copy binary to /usr/local/bin
+    let system_bin = "/usr/local/bin/r4a-cli";
+    if bin != system_bin {
+        std::fs::copy(bin, system_bin)
+            .with_context(|| format!("copy {} to {} (run as root?)", bin, system_bin))?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(system_bin, std::fs::Permissions::from_mode(0o755));
+    }
+    let bin = system_bin;
+
+    let plist_path = launchd_plist_path()?;
+    if let Some(dir) = plist_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    let args_xml: String = std::iter::once(bin.to_string())
+        .chain(up_args.iter().cloned())
+        .map(|a| format!("        <string>{}</string>", xml_escape(&a)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Credentials go into EnvironmentVariables (not ProgramArguments, so not visible in ps)
+    let mut env_entries = format!(
+        "        <key>PATH</key>\n        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n\
+         <key>R4A_MASTER</key>\n        <string>{}</string>",
+        xml_escape(master)
+    );
+    if let Some(tok) = token {
+        let key = if is_bearer { "R4A_TOKEN" } else { "R4A_SECRET" };
+        env_entries.push_str(&format!(
+            "\n        <key>{}</key>\n        <string>{}</string>",
+            key,
+            xml_escape(tok)
+        ));
+    }
+
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+             <key>Label</key>\n\
+             <string>com.r4a.connect</string>\n\
+             <key>ProgramArguments</key>\n\
+             <array>\n\
+         {args}\n\
+             </array>\n\
+             <key>EnvironmentVariables</key>\n\
+             <dict>\n\
+         {env}\n\
+             </dict>\n\
+             <key>RunAtLoad</key>\n\
+             <true/>\n\
+             <key>KeepAlive</key>\n\
+             <true/>\n\
+             <key>StandardOutPath</key>\n\
+             <string>/tmp/r4a-connect.log</string>\n\
+             <key>StandardErrorPath</key>\n\
+             <string>/tmp/r4a-connect.log</string>\n\
+         </dict>\n\
+         </plist>\n",
+        args = args_xml,
+        env = env_entries,
+    );
+
+    std::fs::write(&plist_path, plist.as_bytes())
+        .with_context(|| format!("Could not write plist to {}", plist_path.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&plist_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let path_str = plist_path.to_string_lossy().to_string();
+    let is_system = unsafe { libc::geteuid() } == 0;
+    let domain = if is_system {
+        "system".to_string()
+    } else {
+        format!("gui/{}", unsafe { libc::getuid() })
+    };
+    let label = "com.r4a.connect";
+
+    let service_target = format!("{}/{}", domain, label);
+
+    // Stop any running instance first
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &service_target])
+        .output();
+
+    // Enable + kickstart: works reliably for both LaunchAgents and LaunchDaemons
+    let _ = std::process::Command::new("launchctl")
+        .args(["enable", &service_target])
+        .output();
+    let load_ok = std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &service_target])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    // Fallback: try old-style load if kickstart failed
+    if !load_ok {
+        let _ = std::process::Command::new("launchctl")
+            .args(["load", "-w", &path_str])
+            .output();
+    }
+
+    println!("  Plist:   {}", plist_path.display());
+    println!("  Logs:    tail -f /tmp/r4a-connect.log");
+    println!("  Stop:    launchctl bootout {}/{}", domain, label);
+
+    // Wait up to 15s for the WireGuard interface to come up
+    print!("Waiting for VPN...");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let wg_bin = if std::path::Path::new("/opt/homebrew/bin/wg").exists() {
+        "/opt/homebrew/bin/wg"
+    } else {
+        "wg"
+    };
+    let connected = (0..15).any(|_| {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        print!(".");
+        let _ = std::io::stdout().flush();
+        std::process::Command::new(wg_bin)
+            .args(["show", "wg0"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    });
+    println!();
+    if connected {
+        println!("VPN connected.");
+    } else {
+        eprintln!("Warning: VPN did not come up in 15s. Check logs: tail -f /tmp/r4a-connect.log");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_launchd_service() -> Result<()> {
+    let plist_path = launchd_plist_path()?;
+    let is_system = unsafe { libc::geteuid() } == 0;
+    let domain = if is_system { "system".to_string() } else {
+        format!("gui/{}", unsafe { libc::getuid() })
+    };
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("{}/com.r4a.connect", domain)])
+        .output();
+    let _ = std::fs::remove_file(&plist_path);
+    if plist_path.exists() {
+        // fallback: try old unload
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", "-w", &plist_path.to_string_lossy()])
+            .output();
+        let _ = std::fs::remove_file(&plist_path);
+    }
+    println!("  Removed: {}", plist_path.display());
+    Ok(())
 }
 
 #[tokio::main]
@@ -351,7 +774,7 @@ async fn main() -> Result<()> {
                 // Bring down old WG interface if any, but do NOT delete the server-side
                 // connection — let server evict by label and reuse the same VPN IP.
                 if let Ok(old) = load_connection_state() {
-                    let _ = std::process::Command::new("wg-quick").args(["down", "wg0"]).status();
+                    let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin()).args(["down", r4a_vpn::wireguard::wg_conf_path()]).status();
                     for host in &old.added_hosts {
                         let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
                     }
@@ -404,12 +827,14 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Configure macOS DNS resolver: *.r4a.local → 10.42.0.1:53
-                // This allows dynamic resolution of node names without /etc/hosts
+                // Configure system DNS resolver: *.r4a.local → 10.42.0.1:53
                 match r4a_vpn::dns::set_resolver_domain("r4a.local", "10.42.0.1") {
                     Ok(_) => resolver_domain = Some("r4a.local".to_string()),
                     Err(e) => eprintln!("Warning: could not configure DNS resolver: {}", e),
                 }
+
+                // Download and install CA cert into system trust store
+                let ca_cert_path = install_ca_cert(&client).await;
 
                 save_connection_state(&ConnectionState {
                     id: resp.id.clone(),
@@ -420,6 +845,7 @@ async fn main() -> Result<()> {
                     label: label.clone(),
                     added_hosts: added_hosts.clone(),
                     resolver_domain: resolver_domain.clone(),
+                    ca_cert_path: ca_cert_path.clone(),
                 })?;
 
                 println!("Connected!");
@@ -430,8 +856,9 @@ async fn main() -> Result<()> {
                     println!("  DNS resolver:  *.r4a.local → 10.42.0.1:53");
                 }
                 println!("  Hosts entries: {}", added_hosts.join(", "));
-                println!("  Ingress:       http://master.r4a.local:8000");
-                println!("  Web UI:        http://master.r4a.local:8081");
+                println!("  Ingress:       https://master.r4a.local");
+                println!("  Web UI:        https://web.master.r4a.local");
+                println!("  API:           https://api.master.r4a.local");
                 println!("  Heartbeat:     every {}s", resp.heartbeat_interval_secs);
                 println!();
 
@@ -449,37 +876,55 @@ async fn main() -> Result<()> {
                 let interval = std::time::Duration::from_secs(resp.heartbeat_interval_secs);
                 let mut ticker = tokio::time::interval(interval);
                 ticker.tick().await; // skip immediate first tick
+
+                #[cfg(unix)]
+                let mut term_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+                #[cfg(not(unix))]
+                let mut term_signal = futures_util::future::pending::<()>(); // Dummy for non-unix
+
                 loop {
                     tokio::select! {
                         _ = ticker.tick() => {
                             let _ = client.connection_heartbeat(&resp.id).await;
                         }
                         _ = tokio::signal::ctrl_c() => {
-                            println!("\nDisconnecting...");
-                            let _ = client.connection_delete(&resp.id).await;
-                            let _ = std::process::Command::new("wg-quick").args(["down", "wg0"]).status();
-                            for host in &added_hosts {
-                                let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
-                            }
-                            if let Some(ref domain) = resolver_domain {
-                                let _ = r4a_vpn::dns::remove_resolver_domain(domain);
-                            }
-                            remove_connection_state();
-                            println!("Disconnected.");
+                            println!("\nReceived SIGINT, disconnecting...");
+                            break;
+                        }
+                        _ = term_signal.recv() => {
+                            println!("\nReceived SIGTERM, disconnecting...");
                             break;
                         }
                     }
                 }
+
+                // Cleanup logic (shared for both signals)
+                let _ = client.connection_delete(&resp.id).await;
+                let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin()).args(["down", r4a_vpn::wireguard::wg_conf_path()]).status();
+                for host in &added_hosts {
+                    let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
+                }
+                if let Some(ref domain) = resolver_domain {
+                    let _ = r4a_vpn::dns::remove_resolver_domain(domain);
+                }
+                if let Some(ref path) = ca_cert_path {
+                    remove_ca_cert(path);
+                }
+                remove_connection_state();
+                println!("Disconnected.");
             }
             ConnectCommands::Down => {
                 let state = load_connection_state()?;
                 let _ = client.connection_delete(&state.id).await;
-                let _ = std::process::Command::new("wg-quick").args(["down", "wg0"]).status();
+                let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin()).args(["down", r4a_vpn::wireguard::wg_conf_path()]).status();
                 for host in &state.added_hosts {
                     let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
                 }
                 if let Some(ref domain) = state.resolver_domain {
                     let _ = r4a_vpn::dns::remove_resolver_domain(domain);
+                }
+                if let Some(ref path) = state.ca_cert_path {
+                    remove_ca_cert(path);
                 }
                 remove_connection_state();
                 println!("Disconnected.");
@@ -514,6 +959,110 @@ async fn main() -> Result<()> {
                         age_str);
                 }
             }
+            ConnectCommands::Cleanup => {
+                println!("Performing thorough cleanup of r4a network leftovers...");
+                
+                // 1. WireGuard down
+                let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin())
+                    .args(["down", r4a_vpn::wireguard::wg_conf_path()])
+                    .status();
+                
+                // 2. Remove /etc/resolver/r4a.local
+                let _ = r4a_vpn::dns::remove_resolver_domain("r4a.local");
+                
+                // 3. Clean /etc/hosts (brute force search for managed entries)
+                let _ = r4a_vpn::dns::set_hosts_entries(&[], "master.r4a.local");
+                // Also try to clean up any labelled hosts if we can find them
+                if let Ok(hosts) = std::fs::read_to_string("/etc/hosts") {
+                    for line in hosts.lines() {
+                        if line.contains("# r4a-managed") {
+                            if let Some(host) = line.split_whitespace().nth(1) {
+                                let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
+                            }
+                        }
+                    }
+                }
+
+                // 4. Remove CA certs from keychain
+                #[cfg(target_os = "macos")]
+                {
+                    let output = std::process::Command::new("security")
+                        .args(["find-certificate", "-a", "-c", "r4a Local CA", "-Z", "/Library/Keychains/System.keychain"])
+                        .output();
+                    if let Ok(out) = output {
+                        let out_str = String::from_utf8_lossy(&out.stdout);
+                        for line in out_str.lines() {
+                            if line.starts_with("SHA-1 hash:") {
+                                if let Some(hash) = line.split(':').nth(1) {
+                                    let hash = hash.trim();
+                                    let _ = std::process::Command::new("security")
+                                        .args(["delete-certificate", "-Z", hash, "/Library/Keychains/System.keychain"])
+                                        .status();
+                                }
+                            }
+                        }
+                    }
+                    let _ = std::fs::remove_file("/tmp/r4a-ca.crt");
+                }
+
+                // 5. Remove state file
+                remove_connection_state();
+                
+                println!("Cleanup complete.");
+            }
+            ConnectCommands::Service { cmd } => match cmd {
+                ServiceCommands::Install { label, wg_endpoint, scope, reinstall } => {
+                    let bin = std::env::current_exe()
+                        .context("Could not determine binary path")?
+                        .to_string_lossy()
+                        .to_string();
+                    let token = cli.token.as_deref().or(cli.secret.as_deref());
+                    let is_bearer = cli.token.is_some();
+
+                    // Non-sensitive connect args
+                    let mut up_args = vec!["connect".to_string(), "up".to_string()];
+                    if let Some(ref l) = label {
+                        up_args.extend_from_slice(&["--label".to_string(), l.clone()]);
+                    }
+                    if let Some(ref e) = wg_endpoint {
+                        up_args.extend_from_slice(&["--wg-endpoint".to_string(), e.clone()]);
+                    }
+
+                    if reinstall {
+                        #[cfg(target_os = "linux")]
+                        let _ = uninstall_systemd_service(&scope);
+                        #[cfg(target_os = "macos")]
+                        let _ = uninstall_launchd_service();
+                    }
+
+                    println!("Installing r4a-connect service...");
+
+                    #[cfg(target_os = "linux")]
+                    install_systemd_service(&bin, &up_args, &cli.master, token, is_bearer, &scope)?;
+
+                    #[cfg(target_os = "macos")]
+                    { let _ = &scope; install_launchd_service(&bin, &up_args, &cli.master, token, is_bearer)?; }
+
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                    { let _ = (scope, bin, up_args, token, is_bearer); eprintln!("Service management is not supported on this platform."); }
+
+                    println!("Done. Connection will start automatically on next login/boot.");
+                }
+                ServiceCommands::Uninstall { scope } => {
+                    println!("Removing r4a-connect service...");
+
+                    #[cfg(target_os = "linux")]
+                    uninstall_systemd_service(&scope)?;
+
+                    #[cfg(target_os = "macos")]
+                    { let _ = &scope; uninstall_launchd_service()?; }
+
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                    { let _ = scope; eprintln!("Service management is not supported on this platform."); }
+
+                    println!("Service removed.");
+                }
+            },
         },
     }
 

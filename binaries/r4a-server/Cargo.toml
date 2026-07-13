@@ -33,4 +33,11 @@ r4a-service = { version = "0.1.0", path = "../../crates/r4a-service" }
 reqwest = { workspace = true }
 constant_time_eq = { workspace = true }
 ed25519-dalek = { workspace = true }
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
 

@@ -6,6 +6,11 @@ pub struct Identity {
     pub private_key: String,
     pub public_key: String,
     pub cluster_secret: Option<String>,
+    // Admin login secret: exchanged for an admin token via /api/tokens/exchange.
+    // Separate from cluster_secret so agents (which hold cluster_secret) cannot
+    // obtain admin tokens.
+    #[serde(default)]
+    pub admin_secret: Option<String>,
     pub agent_token: Option<String>,
 }
 

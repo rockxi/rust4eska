@@ -20,7 +20,7 @@ impl ProxyHttp for IngressProxy {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
 
-        // Strip port from Host header (e.g. "app.cluster.local:8000" → "app.cluster.local")
+        // Strip port from Host header (e.g. "app.cluster.local:3500" → "app.cluster.local")
         let host = host_header.split(':').next().unwrap_or("");
 
         let manifests = match self.store.list_manifests() {

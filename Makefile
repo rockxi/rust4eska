@@ -75,7 +75,7 @@ prod-deploy-agent: build-all
 		sudo pkill $(BIN_AGENT) || true && \
 		sudo mv /tmp/$(BIN_AGENT) $(REMOTE_BIN_DIR)/$(BIN_AGENT) && \
 		sudo chmod +x $(REMOTE_BIN_DIR)/$(BIN_AGENT) && \
-		sudo $(REMOTE_BIN_DIR)/$(BIN_AGENT) service enable --master http://100.97.158.58:8080 && \
+		sudo $(REMOTE_BIN_DIR)/$(BIN_AGENT) service enable --master http://100.97.158.58:3501 && \
 		sudo systemctl restart $(BIN_AGENT)"
 	@echo "--- Agent binary deployed and service restarted ---"
 

@@ -1,5 +1,18 @@
 # TODO
 
+- [x] **Feature: HTTPS через самоподписанный CA (2026-05-25)**
+    - [x] rcgen: генерация root CA + server cert (SANs: `master.r4a.local`, `*.master.r4a.local`, `*.r4a.local`, IP `10.42.0.1`)
+    - [x] Хранение CA/cert в `vault_meta` Sled дереве
+    - [x] `GET /api/ca-cert` endpoint (без auth, VPN-only)
+    - [x] HTTPS proxy на `<vpn_ip>:443` (tokio-rustls + hyper-util)
+    - [x] Host-based routing: `web.*` → 8081, `api.*` → 8080, остальное → 8000 (Pingora)
+    - [x] DNS: `*.master.r4a.local` → 10.42.0.1, `*.<node>.r4a.local` → node VPN IP
+    - [x] CORS: добавлены https:// варианты origin
+    - [x] rustls 0.23: `ring::default_provider().install_default()` при старте
+    - [x] r4a-cli: download CA cert + install to system trust store (macOS + Linux Debian/Fedora)
+    - [x] r4a-cli: remove CA cert on connect down / Ctrl-C
+    - [x] compose.yaml: проброс порта 443
+
 - [x] **Манифесты через State (Sled DB)**
     - [x] Убрать git-based manifest polling
     - [x] Добавить CRUD методы в r4a-store (put_manifest, list_manifests, delete_manifest)
@@ -78,3 +91,9 @@
     - [x] r4a-vpn: `set_resolver_domain` / `remove_resolver_domain` — `/etc/resolver/<domain>` на macOS
     - [x] r4a-cli: `connect up` создаёт `/etc/resolver/r4a.local` → `10.42.0.1`; убраны node /etc/hosts
     - [x] r4a-cli: `connect down` / Ctrl-C удаляют `/etc/resolver/r4a.local`
+
+- [x] **Feature: r4a-cli connect service install/uninstall (2026-05-26)**
+    - [x] `r4a-cli connect service install [--label X] [--wg-endpoint X] [--scope user|system]`
+    - [x] Linux: systemd user-service (~/.config/systemd/user/) или system (/etc/systemd/system/), EnvironmentFile=~/.r4a-connect.env (0600)
+    - [x] macOS: launchd ~/Library/LaunchAgents/com.r4a.connect.plist, token в EnvironmentVariables (не в args), chmod 0600
+    - [x] `r4a-cli connect service uninstall [--scope user|system]`
