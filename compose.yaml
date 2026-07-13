@@ -8,12 +8,16 @@ services:
     container_name: node-master
     cap_add:
       - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
       - R4A_SECRET=test_secret_for_cluster_123
       - R4A_ADMIN_SECRET=test_admin_secret_456
       - RUST_LOG=info
+      # dev: явный endpoint, иначе автодетект уйдёт в ipify и вернёт IP хоста
+      - R4A_PUBLIC_ENDPOINT=172.20.0.10:51820
     command: sh -c "/usr/local/bin/r4a-web --port 3502 & /usr/local/bin/r4a-server init"
     restart: always
     ports:

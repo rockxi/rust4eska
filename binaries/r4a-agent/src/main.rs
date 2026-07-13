@@ -10,7 +10,7 @@ use bollard::Docker;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures_util::StreamExt;
-use r4a_core::{Identity, JoinRequest, JoinResponse, Manifest, MetricsReport};
+use r4a_core::{Identity, JoinRequest, JoinResponse, Manifest, MetricsReport, PeerInfo};
 use r4a_worker::Reconciler;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -111,6 +111,10 @@ enum Cmd {
         secret: Option<String>,
         #[arg(long)]
         name: Option<String>,
+        /// Публичный host:port этого агента (если есть белый IP или проброшен порт) —
+        /// другие агенты будут подключаться к нему напрямую, минуя хаб.
+        #[arg(long, env = "R4A_PUBLIC_ENDPOINT")]
+        public_endpoint: Option<String>,
     },
     Service {
         #[command(subcommand)]
@@ -157,7 +161,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Connect { master, secret, name } => connect(&master, secret, name).await,
+        Cmd::Connect { master, secret, name, public_endpoint } => connect(&master, secret, name, public_endpoint).await,
         Cmd::Service { action } => handle_service(action),
     }
 }
@@ -354,7 +358,7 @@ fn spawn_agent_api(cluster_secret: String, node_name: String, bind_ip: String) {
     });
 }
 
-async fn connect(master_api: &str, secret: Option<String>, name: Option<String>) -> Result<()> {
+async fn connect(master_api: &str, secret: Option<String>, name: Option<String>, my_public_endpoint: Option<String>) -> Result<()> {
     let name = name.unwrap_or_else(|| {
         System::host_name().unwrap_or_else(|| "agent".to_string())
     });
@@ -371,7 +375,7 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
             pub_key: identity.public_key.clone(), 
             name: Some(name.clone()),
             role: Some("agent".to_string()),
-            public_endpoint: None,
+            public_endpoint: my_public_endpoint.clone(),
         })
         .send()
         .await?
@@ -414,6 +418,13 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
     info!("Agent '{}' connected. VPN IP: {}", name, resp.agent_vpn_ip);
 
     spawn_agent_api(cluster_secret.clone(), name.clone(), resp.agent_vpn_ip.clone());
+
+    // Telemetry: стримим логи r4a-контейнеров на мастер
+    tokio::spawn(r4a_telemetry::collector::run_collector(
+        name.clone(),
+        "http://master.r4a.local:3501".to_string(),
+        cluster_secret.clone(),
+    ));
 
     let vpn_ip = resp.agent_vpn_ip.clone();
     let metrics_secret = cluster_secret.clone();
@@ -506,8 +517,173 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>)
         }
     });
 
+    // P2P: прямые туннели агент↔агент в обход хаба
+    let p2p_secret = cluster_secret.clone();
+    let p2p_my_pubkey = identity.public_key.clone();
+    let p2p_master_pubkey = resp.master_pub_key.clone();
+    tokio::spawn(async move {
+        run_p2p_sync(p2p_secret, p2p_my_pubkey, p2p_master_pubkey).await;
+    });
+
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+// ── P2P: прямые WG-туннели между агентами ─────────────────────────────────────
+//
+// Механика: мастер видит реальный ip:port каждого агента после NAT (wg show
+// endpoints) и раздаёт их через /api/peers. Оба агента добавляют друг друга
+// peer'ом с AllowedIPs <ip>/32 — маршрут специфичнее хабового /24, трафик идёт
+// напрямую; keepalive с обеих сторон пробивает NAT (full-cone/restricted).
+// Если handshake не появился — peer удаляется (маршрут откатывается на хаб)
+// и ретрай с экспоненциальным backoff. Symmetric NAT так не пробить — там
+// остаётся релей через мастера.
+
+struct P2pPeerState {
+    endpoint: String,
+    added_at: u64,
+    established: bool,
+    failures: u32,
+    backoff_until: u64,
+}
+
+const P2P_SYNC_INTERVAL_SECS: u64 = 30;
+// Сколько ждём первый handshake после добавления peer'а
+const P2P_GRACE_SECS: u64 = 60;
+// Handshake старше этого = туннель мёртв (штатно wg делает handshake каждые ~2 мин)
+const P2P_STALE_SECS: u64 = 180;
+
+fn p2p_backoff_secs(failures: u32) -> u64 {
+    match failures {
+        0 | 1 => 60,
+        2 => 300,
+        _ => 1800,
+    }
+}
+
+async fn run_p2p_sync(cluster_secret: String, my_pubkey: String, master_pubkey: String) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let mut states: HashMap<String, P2pPeerState> = HashMap::new();
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(P2P_SYNC_INTERVAL_SECS)).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let peers: HashMap<String, PeerInfo> = match client
+            .get("http://master.r4a.local:3501/api/peers")
+            .header("X-R4A-Secret", &cluster_secret)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(r) => match r.json().await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("p2p: bad /api/peers response: {}", e);
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!("p2p: /api/peers failed: {}", e);
+                continue;
+            }
+        };
+
+        let handshakes = r4a_vpn::wireguard::latest_handshakes().unwrap_or_default();
+
+        // Кандидаты: другие агенты с известным endpoint (явный public_endpoint
+        // приоритетнее наблюдаемого мастером)
+        for peer in peers.values() {
+            if peer.pub_key == my_pubkey || peer.pub_key == master_pubkey || peer.role != "agent" {
+                continue;
+            }
+            let endpoint = match peer.public_endpoint.as_ref().or(peer.observed_endpoint.as_ref()) {
+                Some(ep) => ep.clone(),
+                None => continue,
+            };
+
+            match states.get_mut(&peer.pub_key) {
+                None => {
+                    if try_add_p2p_peer(peer, &endpoint) {
+                        states.insert(peer.pub_key.clone(), P2pPeerState {
+                            endpoint, added_at: now, established: false, failures: 0, backoff_until: 0,
+                        });
+                    }
+                }
+                Some(st) if st.backoff_until > 0 => {
+                    // В backoff: пробуем снова, когда время пришло или у peer'а новый endpoint
+                    if now >= st.backoff_until || st.endpoint != endpoint {
+                        if try_add_p2p_peer(peer, &endpoint) {
+                            st.endpoint = endpoint;
+                            st.added_at = now;
+                            st.established = false;
+                            st.backoff_until = 0;
+                        }
+                    }
+                }
+                Some(st) => {
+                    // Активный p2p-peer: следим за handshake
+                    let hs = handshakes.get(&peer.pub_key).copied().unwrap_or(0);
+                    let alive = hs > 0 && now.saturating_sub(hs) < P2P_STALE_SECS;
+                    if alive {
+                        if !st.established {
+                            st.established = true;
+                            st.failures = 0;
+                            info!("p2p established with '{}' via {}", peer.name, st.endpoint);
+                        }
+                        // Endpoint у peer'а сменился (переехал NAT) — переподключаемся
+                        if st.endpoint != endpoint && peer.public_endpoint.is_some() {
+                            if try_add_p2p_peer(peer, &endpoint) {
+                                st.endpoint = endpoint;
+                                st.added_at = now;
+                                st.established = false;
+                            }
+                        }
+                    } else if now.saturating_sub(st.added_at) > P2P_GRACE_SECS {
+                        // Туннель не пробился или умер → откат на релей через хаб
+                        st.failures += 1;
+                        st.backoff_until = now + p2p_backoff_secs(st.failures);
+                        st.established = false;
+                        warn!(
+                            "p2p with '{}' failed ({} attempt(s)), falling back to hub relay, retry in {}s",
+                            peer.name, st.failures, p2p_backoff_secs(st.failures)
+                        );
+                        if let Err(e) = r4a_vpn::wireguard::remove_peer(&peer.pub_key) {
+                            warn!("p2p: remove_peer failed: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Ноды, исчезнувшие из кластера — убираем их p2p-peer'ов
+        let gone: Vec<String> = states.keys().filter(|pk| !peers.contains_key(*pk)).cloned().collect();
+        for pk in gone {
+            let st = states.remove(&pk);
+            if st.map(|s| s.backoff_until == 0).unwrap_or(false) {
+                let _ = r4a_vpn::wireguard::remove_peer(&pk);
+            }
+        }
+    }
+}
+
+fn try_add_p2p_peer(peer: &PeerInfo, endpoint: &str) -> bool {
+    match r4a_vpn::wireguard::add_peer_with_endpoint(&peer.pub_key, &peer.ip, endpoint) {
+        Ok(()) => {
+            info!("p2p: trying direct tunnel to '{}' ({}) via {}", peer.name, peer.ip, endpoint);
+            true
+        }
+        Err(e) => {
+            warn!("p2p: add peer '{}' failed: {}", peer.name, e);
+            false
+        }
+    }
 }
 
 #[derive(Deserialize)]

@@ -12,6 +12,7 @@ import RBAC from './pages/RBAC';
 import Updates from './pages/Updates';
 import Containers from './pages/Containers';
 import Connections from './pages/Connections';
+import Logs from './pages/Logs';
 
 const queryClient = new QueryClient();
 
@@ -49,6 +50,7 @@ function App() {
               <Route path="updates" element={<Updates />} />
               <Route path="containers" element={<Containers />} />
               <Route path="connections" element={<Connections />} />
+              <Route path="logs" element={<Logs />} />
             </Route>
             
             <Route path="*" element={<Navigate to="/" replace />} />

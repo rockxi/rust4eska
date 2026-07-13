@@ -68,6 +68,12 @@ pub fn setup_master_with_peers(
     let mut conf = format!(
         "[Interface]\nPrivateKey = {private_key}\nAddress = {vpn_ip}/24\nListenPort = {listen_port}\n"
     );
+    // Форвардинг агент↔агент через хаб: wg-quick сам ip_forward не включает.
+    // `|| true` — в docker sysctl может быть запрещён (там форвардинг включается
+    // через compose sysctls), а ошибка PostUp фатальна для wg-quick.
+    if cfg!(target_os = "linux") {
+        conf.push_str("PostUp = sysctl -w net.ipv4.ip_forward=1 || true\n");
+    }
     for (pub_key, peer_ip) in peers {
         conf.push_str(&format!(
             "\n[Peer]\nPublicKey = {pub_key}\nAllowedIPs = {peer_ip}/32\nPersistentKeepalive = 25\n"
@@ -98,19 +104,94 @@ pub fn setup_agent(
     Ok(())
 }
 
+/// Имя активного WG-интерфейса: на Linux всегда wg0, на macOS — utunN из state-файла.
+pub fn iface_name() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(data) = std::fs::read_to_string(MACOS_WG_STATE) {
+            if let Ok(state) = serde_json::from_str::<MacosWgState>(&data) {
+                return state.iface;
+            }
+        }
+    }
+    "wg0".to_string()
+}
+
+fn wg_bin() -> String {
+    if cfg!(target_os = "macos") {
+        for p in ["/opt/homebrew/bin/wg", "/usr/local/bin/wg"] {
+            if std::path::Path::new(p).exists() {
+                return p.to_string();
+            }
+        }
+    }
+    "wg".to_string()
+}
+
 pub fn add_peer(pubkey: &str, vpn_ip: &str) -> Result<()> {
     validate_wg_pubkey(pubkey)?;
     if vpn_ip.contains('\n') || vpn_ip.contains('\r') || vpn_ip.contains('\0') {
         anyhow::bail!("VPN IP contains forbidden control characters");
     }
-    run("wg", &["set", "wg0", "peer", pubkey, "allowed-ips", &format!("{vpn_ip}/32"), "persistent-keepalive", "25"])?;
+    let iface = iface_name();
+    run(&wg_bin(), &["set", &iface, "peer", pubkey, "allowed-ips", &format!("{vpn_ip}/32"), "persistent-keepalive", "25"])?;
+    Ok(())
+}
+
+/// Добавить peer'а с явным endpoint (P2P-туннель агент↔агент).
+pub fn add_peer_with_endpoint(pubkey: &str, vpn_ip: &str, endpoint: &str) -> Result<()> {
+    validate_wg_pubkey(pubkey)?;
+    validate_endpoint(endpoint)?;
+    if vpn_ip.contains('\n') || vpn_ip.contains('\r') || vpn_ip.contains('\0') {
+        anyhow::bail!("VPN IP contains forbidden control characters");
+    }
+    let iface = iface_name();
+    run(&wg_bin(), &[
+        "set", &iface, "peer", pubkey,
+        "endpoint", endpoint,
+        "allowed-ips", &format!("{vpn_ip}/32"),
+        "persistent-keepalive", "25",
+    ])?;
     Ok(())
 }
 
 pub fn remove_peer(pubkey: &str) -> Result<()> {
     validate_wg_pubkey(pubkey)?;
-    run("wg", &["set", "wg0", "peer", pubkey, "remove"])?;
+    let iface = iface_name();
+    run(&wg_bin(), &["set", &iface, "peer", pubkey, "remove"])?;
     Ok(())
+}
+
+/// pubkey → ip:port, наблюдаемый ядром WG (реальный адрес peer'а после NAT).
+pub fn observed_endpoints() -> Result<std::collections::HashMap<String, String>> {
+    let iface = iface_name();
+    let out = run(&wg_bin(), &["show", &iface, "endpoints"])?;
+    let mut map = std::collections::HashMap::new();
+    for line in out.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(pk), Some(ep)) = (parts.next(), parts.next()) {
+            if ep != "(none)" {
+                map.insert(pk.to_string(), ep.to_string());
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// pubkey → unix-время последнего handshake (0 = ни одного).
+pub fn latest_handshakes() -> Result<std::collections::HashMap<String, u64>> {
+    let iface = iface_name();
+    let out = run(&wg_bin(), &["show", &iface, "latest-handshakes"])?;
+    let mut map = std::collections::HashMap::new();
+    for line in out.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(pk), Some(ts)) = (parts.next(), parts.next()) {
+            if let Ok(ts) = ts.parse::<u64>() {
+                map.insert(pk.to_string(), ts);
+            }
+        }
+    }
+    Ok(map)
 }
 
 /// Bring down the WireGuard interface (platform-aware).

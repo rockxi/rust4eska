@@ -97,3 +97,92 @@
     - [x] Linux: systemd user-service (~/.config/systemd/user/) или system (/etc/systemd/system/), EnvironmentFile=~/.r4a-connect.env (0600)
     - [x] macOS: launchd ~/Library/LaunchAgents/com.r4a.connect.plist, token в EnvironmentVariables (не в args), chmod 0600
     - [x] `r4a-cli connect service uninstall [--scope user|system]`
+
+- [x] **Feature: r4a-telemetry MVP — централизованные логи контейнеров (2026-07-13)**
+    - [x] Крейт `crates/r4a-telemetry`: LogEntry/LogBatch, LogStore (отдельный sled `~/.r4a-server/logs-db`, append-only ключи, tail-query, prune), collector (bollard follow-стрим r4a-контейнеров, батчи 2s/200 строк)
+    - [x] r4a-core: `Resource::Logs` для RBAC
+    - [x] r4a-server: POST /api/logs (ingest, cluster secret), GET /api/logs?node=&container=&tail= (RBAC Get Logs), GET /api/logs/containers (List), GET /api/logs/stream (SSE, token в header или ?token=), retention 3 дня/час
+    - [x] r4a-agent: spawn collector после connect
+    - [x] Тест на docker-кластере: логи nginx (stdout+stderr) в store, SSE live, RBAC 401/403, переподхват после рестарта контейнера
+    - [x] Follow-up: вкладка Logs в Web UI (EventSource + ?token=) — сделано 2026-07-13
+    - [ ] Follow-up: экран логов в TUI
+    - [ ] Follow-up: LLM-трейсы / OpenTelemetry-спаны (MAIN.md §2.7)
+    - [ ] Follow-up: метрики нод в telemetry-store (история CPU/RAM, сейчас только last-value в peers)
+
+- [x] **Fix A: IP forwarding на мастере (агент↔агент трафик через хаб)**
+
+    Контекст: агент шлёт весь 10.42.0.0/24 через мастера (`AllowedIPs = 10.42.0.0/24`),
+    но мастер не форвардит пакеты между wg-пирами — `net.ipv4.ip_forward` нигде не включается.
+    Сейчас agent1 не может достучаться до agent2 по VPN IP.
+
+    - [x] `crates/r4a-vpn/src/wireguard.rs::setup_master_with_peers`: добавить в `[Interface]`
+          строку `PostUp = sysctl -w net.ipv4.ip_forward=1` (только Linux; на macOS мастер
+          не поддерживается в проде, пропустить)
+    - [x] Проверка: `make dev-up` → `docker exec node-agent1 ping 10.42.0.3` (agent1 → agent2 через мастера)
+
+- [x] **Fix B: корректное определение публичного endpoint мастера**
+
+    Контекст: `get_external_ip()` (binaries/r4a-server/src/main.rs:1961) сканирует `ip -4 addr`:
+    (1) на облаках с 1:1 NAT (AWS/GCP/Oracle) вернёт приватный IP — агенты получат нерабочий
+    endpoint; (2) приоритет адресов `100.x` отдаст Tailscale-IP, если он есть на машине.
+
+    - [x] CLI-аргумент `--public-endpoint <host:port>` + env `R4A_PUBLIC_ENDPOINT` для r4a-server —
+          явное значение всегда выигрывает у автодетекта; валидация через `validate_endpoint`
+    - [x] `get_external_ip()`: убрать приоритет `100.x`; если на интерфейсах только приватные
+          RFC-1918 адреса — спросить внешний сервис (`https://api.ipify.org`, таймаут 3s),
+          иначе fallback на текущее поведение; результат кэшировать (OnceLock)
+    - [x] Использовать во всех трёх местах: `join_handler` (master_endpoint в ответе),
+          `join_master`, регистрация себя в peers
+    - [x] Проверка: `R4A_PUBLIC_ENDPOINT=1.2.3.4:51820` → в ответе `/api/join` поле
+          `master_endpoint == 1.2.3.4:51820`; без env — реальный внешний IP
+
+- [x] **Feature: синхронизация peer'ов (фундамент для P2P)**
+
+    Контекст: агент получает список peer'ов ровно один раз при `connect` (JoinResponse.peers),
+    никакого `/api/peers` нет; мастер не отслеживает наблюдаемые WG endpoint'ы агентов.
+    Без этого P2P невозможен.
+
+    - [x] r4a-vpn: параметризовать имя интерфейса в `add_peer`/`remove_peer` — сейчас
+          захардкожен `wg0`, на macOS интерфейс `utunN` (брать из MacosWgState)
+    - [x] r4a-vpn: `observed_endpoints()` — парсинг `wg show <iface> endpoints`
+          (pubkey → ip:port после NAT; это бесплатный STUN, мастер видит реальный адрес агента)
+    - [x] r4a-server: фоновая задача (каждые ~15s) — обновлять `observed_endpoint` в peers map
+    - [x] r4a-server: `GET /api/peers` (VPN-only, RBAC) — PeerInfo + `public_endpoint`
+          + `observed_endpoint` для каждой ноды
+    - [x] r4a-core: поле `observed_endpoint: Option<String>` в PeerInfo
+    - [x] r4a-agent: опция `--public-endpoint` (если у агента белый IP/проброшен порт) —
+          заполнять `JoinRequest.public_endpoint` (поле уже есть, сейчас всегда None)
+    - [x] r4a-agent: цикл (каждые ~30s) — GET /api/peers, поддерживать локальный кэш peer'ов
+          (пока без изменения WG-конфигурации — это следующая задача)
+    - [x] Проверка: на docker-кластере `curl master:8080/api/peers` показывает обоих агентов
+          с observed_endpoint
+
+- [x] **Feature: P2P-туннели агент↔агент в обход хаба (WireGuard hole punching)**
+
+    Контекст: cryptokey routing делает маршрутизацию сам — если добавить агенту peer'а
+    с `AllowedIPs <ip>/32`, этот маршрут специфичнее хабового /24 и трафик пойдёт напрямую;
+    при удалении peer'а трафик автоматически возвращается через хаб. Механика hole punching:
+    мастер раздаёт обеим сторонам наблюдаемые endpoint'ы друг друга, оба добавляют peer'а
+    с keepalive и одновременные исходящие пакеты пробивают NAT (full-cone/restricted-cone).
+    Symmetric NAT не пробивается — остаётся релей через хаб (текущее поведение).
+
+    Зависимость: «синхронизация peer'ов» должна быть сделана.
+
+    - [x] r4a-agent: для каждого peer'а-агента с известным endpoint (приоритет:
+          public_endpoint → observed_endpoint) — `wg set <iface> peer <pub> endpoint <ep>
+          allowed-ips <vpn_ip>/32 persistent-keepalive 25`
+    - [x] Координация одновременности: обе стороны получают endpoint'ы из одного /api/peers
+          и добавляют peer'ов в своём 30s-цикле — этого достаточно, отдельный сигнальный
+          механизм не нужен (keepalive 25s держит попытки)
+    - [x] Health check / fallback (критично!): каждые ~30s парсить
+          `wg show <iface> latest-handshakes`; если для p2p-peer'а handshake отсутствует
+          или старше 180s — `remove_peer` (маршрут откатывается на /24 через хаб),
+          ретрай с экспоненциальным backoff (1m → 5m → 30m)
+    - [x] Не добавлять p2p-peer'а для мастера (он и так прямой peer)
+    - [x] Логи: `p2p established with <name>` / `p2p failed, falling back to hub relay`
+    - [x] Проверка (docker): в одной сети direct всегда пробьётся — agent1↔agent2 ping,
+          `wg show` на agent1 показывает peer agent2 со свежим handshake; убить agent2 →
+          через ≤180s peer удалён, ping идёт через хаб (после Fix A)
+    - [ ] Проверка (реальные NAT): asus + home за разными NAT через VPS —
+          `wg show` handshake напрямую; отключить UDP между ними (firewall) → fallback на хаб
+    - [ ] Follow-up: Web UI/TUI — колонка connection type (direct / relay) в списке нод

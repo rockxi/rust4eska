@@ -21,6 +21,9 @@ pub struct PeerInfo {
     pub name: String,
     pub role: String,
     pub public_endpoint: Option<String>,
+    /// ip:port агента, наблюдаемый мастером через `wg show` (адрес после NAT).
+    #[serde(default)]
+    pub observed_endpoint: Option<String>,
     pub cpu_percent: Option<f32>,
     pub ram_used_mb: Option<u64>,
     pub ram_total_mb: Option<u64>,
@@ -68,6 +71,7 @@ pub enum Resource {
     Policies,
     Bindings,
     Connections,
+    Logs,
     All,
 }
 

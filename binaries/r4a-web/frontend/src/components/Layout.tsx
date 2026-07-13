@@ -11,7 +11,8 @@ import {
   LogOut,
   Server,
   Container,
-  Wifi
+  Wifi,
+  ScrollText
 } from 'lucide-react';
 
 const Layout: React.FC = () => {
@@ -26,6 +27,7 @@ const Layout: React.FC = () => {
   const navItems = [
     { path: '/', label: 'Dashboard', icon: LayoutDashboard },
     { path: '/containers', label: 'Containers', icon: Container },
+    { path: '/logs', label: 'Logs', icon: ScrollText },
     { path: '/git', label: 'Git', icon: GitBranch },
     { path: '/manifests', label: 'Manifests', icon: FileCode },
     { path: '/vault', label: 'Vault', icon: Lock },

@@ -10,6 +10,8 @@ BIN_WEB = r4a-web
 
 HOST_MASTER = asus
 HOST_AGENT = home
+# WG endpoint мастера, который получают агенты (LAN IP asus; Tailscale на asus лежит)
+MASTER_PUBLIC_ENDPOINT = 192.168.3.18:51820
 
 LOCAL_BIN_SERVER_MUSL = target/$(TARGET)/release/$(BIN_SERVER)
 LOCAL_BIN_AGENT_MUSL = target/$(TARGET)/release/$(BIN_AGENT)
@@ -64,7 +66,7 @@ prod-deploy-master: build-all
 		sudo mv /tmp/$(BIN_CLI) $(REMOTE_BIN_DIR)/$(BIN_CLI) && \
 		sudo mv /tmp/$(BIN_WEB) $(REMOTE_BIN_DIR)/$(BIN_WEB) && \
 		sudo chmod +x $(REMOTE_BIN_DIR)/$(BIN_SERVER) $(REMOTE_BIN_DIR)/$(BIN_CLI) $(REMOTE_BIN_DIR)/$(BIN_WEB) && \
-		sudo $(REMOTE_BIN_DIR)/$(BIN_SERVER) service enable && \
+		sudo R4A_PUBLIC_ENDPOINT=$(MASTER_PUBLIC_ENDPOINT) $(REMOTE_BIN_DIR)/$(BIN_SERVER) service enable && \
 		sudo systemctl restart $(BIN_SERVER)"
 	@echo "--- Master binary deployed and service restarted ---"
 
@@ -75,7 +77,7 @@ prod-deploy-agent: build-all
 		sudo pkill $(BIN_AGENT) || true && \
 		sudo mv /tmp/$(BIN_AGENT) $(REMOTE_BIN_DIR)/$(BIN_AGENT) && \
 		sudo chmod +x $(REMOTE_BIN_DIR)/$(BIN_AGENT) && \
-		sudo $(REMOTE_BIN_DIR)/$(BIN_AGENT) service enable --master http://100.97.158.58:3501 && \
+		sudo $(REMOTE_BIN_DIR)/$(BIN_AGENT) service enable --master http://192.168.3.18:3501 && \
 		sudo systemctl restart $(BIN_AGENT)"
 	@echo "--- Agent binary deployed and service restarted ---"
 

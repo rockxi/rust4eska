@@ -137,6 +137,8 @@ struct AppState {
     update_pending: Arc<Mutex<bool>>,
     agent_update_states: Arc<Mutex<HashMap<String, AgentUpdateState>>>,
     store: Store,
+    log_store: r4a_telemetry::store::LogStore,
+    log_tx: tokio::sync::broadcast::Sender<r4a_telemetry::LogEntry>,
 }
 
 use axum::extract::FromRequestParts;
@@ -243,6 +245,10 @@ impl FromRequestParts<AppState> for Auth {
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
+    /// Публичный endpoint WireGuard (host:port), который получат агенты.
+    /// Нужен на облаках с 1:1 NAT (AWS/GCP), где на интерфейсе приватный IP.
+    #[arg(long, global = true)]
+    public_endpoint: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -349,6 +355,10 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+    if let Some(ep) = &cli.public_endpoint {
+        r4a_vpn::wireguard::validate_endpoint(ep)?;
+        std::env::set_var("R4A_PUBLIC_ENDPOINT", ep);
+    }
     match cli.command {
         Cmd::Init => init("10.42.0.1", None).await,
         Cmd::JoinMaster { master, name } => join_master(&master, name).await,
@@ -369,7 +379,12 @@ fn handle_service(action: ServiceAction) -> Result<()> {
     match action {
         ServiceAction::Enable => {
             let exec = "/usr/local/bin/r4a-server init";
-            manager.enable("r4a-server", "r4a Master Node", exec, &[])?;
+            // Прокидываем публичный endpoint в сервис, если задан при установке
+            let ep = std::env::var("R4A_PUBLIC_ENDPOINT").ok();
+            let env_pairs: Vec<(&str, &str)> = ep.as_deref()
+                .map(|e| vec![("R4A_PUBLIC_ENDPOINT", e)])
+                .unwrap_or_default();
+            manager.enable("r4a-server", "r4a Master Node", exec, &env_pairs)?;
         }
         ServiceAction::Disable => {
             manager.disable("r4a-server")?;
@@ -380,7 +395,7 @@ fn handle_service(action: ServiceAction) -> Result<()> {
 
 async fn join_master(first_master_url: &str, name: Option<String>) -> Result<()> {
     let identity = load_identity()?;
-    let my_endpoint = format!("{}:{}", get_external_ip(), WG_PORT);
+    let my_endpoint = public_endpoint();
     let my_name = name.unwrap_or_else(|| {
         System::host_name().unwrap_or_else(|| "master-node".to_string())
     });
@@ -451,7 +466,7 @@ async fn init(my_vpn_ip: &str, _store: Option<Store>) -> Result<()> {
         .as_secs();
 
     let mut peers = load_peers(&store);
-    let my_endpoint = format!("{}:{}", get_external_ip(), WG_PORT);
+    let my_endpoint = public_endpoint();
     let my_name = System::host_name().unwrap_or_else(|| "master".to_string());
 
     if !peers.contains_key(&identity.public_key) {
@@ -463,6 +478,7 @@ async fn init(my_vpn_ip: &str, _store: Option<Store>) -> Result<()> {
                 name: my_name.clone(),
                 role: "master".to_string(),
                 public_endpoint: Some(my_endpoint.clone()),
+                observed_endpoint: None,
                 cpu_percent: None,
                 ram_used_mb: None,
                 ram_total_mb: None,
@@ -521,6 +537,9 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         warn!("Admin secret is empty — /api/tokens/exchange will reject all requests");
     }
 
+    let log_store = r4a_telemetry::store::LogStore::open(state_dir().join("logs-db"))?;
+    let (log_tx, _) = tokio::sync::broadcast::channel(1024);
+
     let state = AppState {
         master_pub_key: identity.public_key.clone(),
         cluster_secret: cluster_secret.clone(),
@@ -531,7 +550,21 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         update_pending: Arc::new(Mutex::new(false)),
         agent_update_states: Arc::new(Mutex::new(HashMap::new())),
         store: store.clone(),
+        log_store: log_store.clone(),
+        log_tx,
     };
+
+    // Retention: удаляем логи старше 3 суток раз в час
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            match log_store.prune(3 * 24 * 3600) {
+                Ok(0) => {}
+                Ok(n) => info!("Log retention: pruned {} old entries", n),
+                Err(e) => warn!("Log retention failed: {}", e),
+            }
+        }
+    });
     
     store.set_secret(cluster_secret);
 
@@ -635,6 +668,25 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         }
     });
 
+    // P2P: наблюдаемые endpoint'ы агентов из `wg show` → peers map (мастер как STUN)
+    let observed_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            let observed = match r4a_vpn::wireguard::observed_endpoints() {
+                Ok(map) => map,
+                Err(e) => {
+                    warn!("wg show endpoints failed: {}", e);
+                    continue;
+                }
+            };
+            let mut peers = observed_state.peers.lock().unwrap();
+            for peer in peers.values_mut() {
+                peer.observed_endpoint = observed.get(&peer.pub_key).cloned();
+            }
+        }
+    });
+
     let hosts_state = state.clone();
     tokio::spawn(async move {
         loop {
@@ -659,6 +711,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/join", post(join_handler))
+        .route("/api/peers", get(peers_handler))
         .route("/api/nodes", get(nodes_handler))
         .route("/api/metrics", post(metrics_handler))
         .route("/api/manifests", get(manifests_handler).post(manifest_upsert_handler).delete(manifest_delete_handler))
@@ -690,6 +743,9 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         .route("/api/nodes/:node/containers/:container/restart", post(node_container_restart_handler))
         .route("/api/nodes/:node/containers/:container/stop", post(node_container_stop_handler))
         .route("/api/nodes/:node/containers/:container/start", post(node_container_start_handler))
+        .route("/api/logs", get(logs_query_handler).post(logs_ingest_handler))
+        .route("/api/logs/containers", get(logs_containers_handler))
+        .route("/api/logs/stream", get(logs_stream_handler))
         .route("/api/connections", get(connections_list_handler).post(connect_handler))
         .route("/api/connections/:id", axum::routing::delete(disconnect_handler))
         .route("/api/connections/:id/heartbeat", post(connection_heartbeat_handler))
@@ -900,6 +956,7 @@ async fn join_handler(
             name: name.clone(),
             role: role_str.clone(),
             public_endpoint: req.public_endpoint.clone(),
+            observed_endpoint: None,
             cpu_percent: None,
             ram_used_mb: None,
             ram_total_mb: None,
@@ -961,10 +1018,19 @@ async fn join_handler(
     Ok(Json(JoinResponse {
         master_pub_key: state.master_pub_key.clone(),
         agent_vpn_ip: agent_ip,
-        master_endpoint: format!("{}:{}", get_external_ip(), WG_PORT),
+        master_endpoint: public_endpoint(),
         peers: peers.clone(),
         agent_token: Some(token_str),
     }))
+}
+
+/// Список peer'ов с endpoint'ами для P2P-координации. Агенты опрашивают
+/// периодически (cluster secret); VPN-only middleware закрывает от интернета.
+async fn peers_handler(
+    State(state): State<AppState>,
+    _auth: RequireSecret,
+) -> Json<HashMap<String, PeerInfo>> {
+    Json(state.peers.lock().unwrap().clone())
 }
 
 #[derive(Deserialize)]
@@ -1936,7 +2002,38 @@ async fn node_container_start_handler(
     Ok(StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
 }
 
+/// WireGuard endpoint мастера, который получат агенты.
+/// R4A_PUBLIC_ENDPOINT (или --public-endpoint) всегда выигрывает у автодетекта.
+fn public_endpoint() -> String {
+    if let Ok(ep) = std::env::var("R4A_PUBLIC_ENDPOINT") {
+        let ep = ep.trim().to_string();
+        if !ep.is_empty() {
+            return ep;
+        }
+    }
+    format!("{}:{}", get_external_ip(), WG_PORT)
+}
+
 fn get_external_ip() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(detect_external_ip).clone()
+}
+
+/// Приватные диапазоны, включая CGNAT (100.64/10 — например Tailscale) и link-local.
+fn is_private_ipv4(ip: &str) -> bool {
+    match ip.parse::<std::net::Ipv4Addr>() {
+        Ok(a) => {
+            let o = a.octets();
+            a.is_private()
+                || a.is_loopback()
+                || a.is_link_local()
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+        }
+        Err(_) => true,
+    }
+}
+
+fn detect_external_ip() -> String {
     let out = std::process::Command::new("ip").args(["-4", "addr", "show"]).output();
     let mut fallback = "127.0.0.1".to_string();
 
@@ -1947,16 +2044,45 @@ fn get_external_ip() -> String {
             if line.starts_with("inet ") && !line.contains("127.") && !line.contains("10.42.") {
                 if let Some(ip_with_mask) = line.split_whitespace().nth(1) {
                     if let Some(ip) = ip_with_mask.split('/').next() {
-                        if ip.starts_with("100.") {
+                        if !is_private_ipv4(ip) {
                             return ip.to_string();
                         }
-                        fallback = ip.to_string();
+                        if fallback == "127.0.0.1" {
+                            fallback = ip.to_string();
+                        }
                     }
                 }
             }
         }
     }
+
+    // На интерфейсах только приватные адреса (1:1 NAT облака) — спрашиваем внешний сервис
+    if let Some(ip) = query_external_ip_service() {
+        return ip;
+    }
     fallback
+}
+
+/// GET api.ipify.org по plain HTTP через std TcpStream — без reqwest, чтобы
+/// безопасно вызываться из синхронного кода внутри tokio-рантайма.
+fn query_external_ip_service() -> Option<String> {
+    use std::io::{Read, Write};
+    let timeout = std::time::Duration::from_secs(3);
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&"api.ipify.org:80")
+        .ok()?
+        .next()?;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).ok()?;
+    let body = resp.split("\r\n\r\n").nth(1)?.trim();
+    body.parse::<std::net::Ipv4Addr>().ok()?;
+    tracing::info!("External IP detected via ipify: {}", body);
+    Some(body.to_string())
 }
 
 // --- Connection handlers ---
@@ -2054,7 +2180,7 @@ async fn connect_handler(
     state.store.put_connection(&conn).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let master_endpoint = format!("{}:{}", get_external_ip(), WG_PORT);
+    let master_endpoint = public_endpoint();
 
     Ok(Json(ConnectResponse {
         id,
@@ -2110,6 +2236,109 @@ async fn connection_heartbeat_handler(
     } else {
         Err((StatusCode::NOT_FOUND, "Connection not found".to_string()))
     }
+}
+
+// ── Telemetry: centralized container logs ─────────────────────────────────────
+
+async fn logs_ingest_handler(
+    State(state): State<AppState>,
+    _auth: RequireSecret,
+    Json(batch): Json<r4a_telemetry::LogBatch>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state.log_store.append(&batch.entries)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    for entry in batch.entries {
+        // Ошибка = нет активных подписчиков стрима, это нормально
+        let _ = state.log_tx.send(entry);
+    }
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct LogsQueryParams {
+    node: String,
+    container: String,
+    tail: Option<usize>,
+}
+
+async fn logs_query_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Query(q): Query<LogsQueryParams>,
+) -> Result<Json<Vec<r4a_telemetry::LogEntry>>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Get, Resource::Logs, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+    let tail = q.tail.unwrap_or(200).min(5000);
+    let entries = state.log_store.query(&q.node, &q.container, tail)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(entries))
+}
+
+async fn logs_containers_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+) -> Result<Json<Vec<(String, String)>>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::List, Resource::Logs, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+    let list = state.log_store.list_containers()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(list))
+}
+
+#[derive(Deserialize)]
+struct LogsStreamParams {
+    node: String,
+    container: String,
+    /// Bearer-токен для браузерного EventSource (он не умеет ставить заголовки)
+    token: Option<String>,
+}
+
+async fn logs_stream_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<LogsStreamParams>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures_util::StreamExt;
+
+    let token_str = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+        .or(q.token.clone())
+        .ok_or((StatusCode::UNAUTHORIZED, "Missing token".to_string()))?;
+
+    let token = state.store.get_token(&token_str)
+        .ok()
+        .flatten()
+        .ok_or((StatusCode::UNAUTHORIZED, "Invalid token".to_string()))?;
+
+    if !state.store.can(&token.username, Verb::Get, Resource::Logs, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+
+    let rx = state.log_tx.subscribe();
+    let node = q.node.clone();
+    let container = q.container.clone();
+
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |item| {
+        let node = node.clone();
+        let container = container.clone();
+        async move {
+            match item {
+                Ok(e) if e.node == node && e.container == container => {
+                    let data = serde_json::to_string(&e).unwrap_or_default();
+                    Some(Ok::<Event, std::convert::Infallible>(Event::default().data(data)))
+                }
+                _ => None, // чужой контейнер или Lagged (отставший подписчик)
+            }
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 // ── DNS server for *.r4a.local ────────────────────────────────────────────────

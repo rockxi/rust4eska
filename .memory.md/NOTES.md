@@ -1,3 +1,49 @@
+## Сеть: ip_forward, public endpoint, P2P (реализовано 2026-07-13)
+
+### Что сделано
+- Fix A: `PostUp = sysctl -w net.ipv4.ip_forward=1 || true` в конфиге мастера (wireguard.rs).
+  `|| true` обязателен: в docker sysctl запрещён, а ошибка PostUp фатальна для wg-quick
+  (интерфейс не поднимается). В dev форвардинг включён через `sysctls:` в compose.yaml.
+- Fix B: `public_endpoint()` — env `R4A_PUBLIC_ENDPOINT` / флаг `--public-endpoint` всегда
+  выигрывают у автодетекта. `get_external_ip()`: убран приоритет `100.x`; если на интерфейсах
+  только приватные адреса — опрос api.ipify.org (plain HTTP через std TcpStream, 3s timeout,
+  кэш в OnceLock).
+- Peer sync: `GET /api/peers` (RequireSecret) отдаёт peers с `observed_endpoint`
+  (мастер собирает из `wg show wg0 endpoints` каждые 15s — это адрес агента после NAT).
+- P2P: агент каждые 30s опрашивает /api/peers и добавляет прямых peer'ов с AllowedIPs /32
+  (специфичнее хабового /24 → cryptokey routing переключает трафик сам). Health check по
+  `latest-handshakes`: нет handshake 180s (grace 60s после добавления) → remove_peer
+  (откат на релей через хаб) + backoff 60s/300s/1800s.
+- r4a-vpn: `add_peer`/`remove_peer` больше не хардкодят wg0 — `iface_name()` (macOS: utunN
+  из state-файла); новые: `add_peer_with_endpoint`, `observed_endpoints`, `latest_handshakes`.
+
+### Важные нюансы
+- В dev-кластере у мастера в compose задан `R4A_PUBLIC_ENDPOINT=172.20.0.10:51820` —
+  иначе автодетект уходит в ipify и возвращает IP хоста (контейнеры имеют интернет),
+  агенты получили бы нерабочий endpoint.
+- ПРОД (asus/home): старый код нарочно предпочитал `100.x` (Tailscale IP asus) — после
+  моего изменения asus ОБЯЗАН получать явный endpoint. Сделано: Makefile
+  `MASTER_PUBLIC_ENDPOINT=100.97.158.58:51820` → `sudo R4A_PUBLIC_ENDPOINT=... service enable`,
+  а `r4a-server service enable` теперь прокидывает эту переменную в systemd unit.
+- Проверено на docker-кластере: ping агент↔агент через хаб (после удаления p2p-peer'ов
+  с ОБЕИХ сторон — односторонний p2p ломает обратный путь), p2p established (~0.5ms),
+  самовосстановление после ручного kill туннеля (fallback → retry 60s → established).
+- ПРОД ЗАДЕПЛОЕН 2026-07-13 (через home как ssh-прокси: `ssh home "ssh asus ..."`).
+  Выяснилось: Tailscale на asus лежит (агент на home крашлупил 787 рестартов с таймаутами
+  к 100.97.158.58), а home и asus в одной LAN (192.168.3.x). Кластер переведён на LAN:
+  master URL http://192.168.3.18:3501, R4A_PUBLIC_ENDPOINT=192.168.3.18:51820
+  (в /etc/r4a/r4a-server.env на asus и в Makefile). Проверено: WG handshake, ping 10.42.0.1,
+  API через туннель, /api/peers отдаёт observed_endpoint агента. P2P на разных NAT всё ещё
+  не протестирован (оба прод-хоста в одной сети, агент один).
+- `Sync rejected: tree 'core' is not in the allowed list` в логах мастера — pre-existing
+  ошибка (не связана с этими изменениями).
+- ЛОВУШКА: `docker compose up -d <node>` (пересоздание контейнера) откатывает ВСЕ бинарники
+  в /usr/local/bin к версиям из образа. После любого пересоздания — полный `make dev-deploy`,
+  а не ручной docker cp одного бинарника (так 2026-07-13 «пропала» вкладка Logs: r4a-web
+  с вшитым фронтендом откатился к старой версии).
+
+---
+
 ## HTTPS / TLS (реализовано 2026-05-25)
 
 ### Архитектура
@@ -262,3 +308,19 @@
 - Проверено в docker compose: cluster-секрет → 401, admin-секрет → 200, агенты джойнятся как раньше.
 - ВАЖНО для prod-деплоя: вход в web UI теперь по admin-секрету (смотреть в ~/.r4a-server/identity.json на мастере).
 - Из код-ревью остались нерешёнными: delete не реплицируется между мастерами; RBAC `can()` матчит resource_names как префиксы (starts_with); CORS-предикат обходится префиксом (10.42.evil.com); мёртвый поиск existing_token_id в join_handler; next_ip не учитывает connections после рестарта.
+
+## 2026-07-13: r4a-telemetry MVP
+- Логи пишутся в ОТДЕЛЬНЫЙ sled-инстанс `~/.r4a-server/logs-db` (не в основную БД) — по MAIN.md.
+- collector стримит с `since=now`: история до подключения агента не заливается (защита от дублей при рестарте агента).
+- ts_ms — время получения строки агентом (не docker-timestamp) — упрощение MVP.
+- Буфер collector при недоступном мастере ограничен 2000 строк (старые дропаются).
+- SSE-стрим принимает токен и через `?token=` (браузерный EventSource не умеет заголовки).
+- Попутно исправлен билд r4a-cli под Linux: `_update_cmd` → `update_cmd` (переменная была переименована, но используется в #[cfg(not(macos))]-ветке).
+- Замечено (не чинил): в логах мастера "Sync rejected: tree 'core' is not in the allowed list" — save_peers на мульти-мастере не реплицируется, т.к. 'core' не в ALLOWED_SYNC_TREES.
+
+## 2026-07-13: вкладка Logs в Web UI
+- `pages/Logs.tsx`: селектор контейнера из `GET /logs/containers` (пары [node, container]), история `GET /logs?tail=`, live через `EventSource` на `/logs/stream?token=` (токен из sessionStorage, EventSource не умеет заголовки), кап 2000 строк в стейте.
+- Консоль — `h-[70vh]`: `flex-1`/`h-full` внутри Layout не работают (обёртка `main > div.p-8` не ограничивает высоту, скроллилась вся страница и ломался автоскролл).
+- `/api/tokens/exchange` возвращает `{"id": "...", ...}` — токен в поле `id`, не `token`.
+- Dev-порты мастера наружу: 3500 (ingress), 3501 (API), 3502 (Web UI) — client.ts захардкожен на 3501.
+- Проверено в браузере: история, подсветка stderr/error/warn, автоскролл, SSE live без перезагрузки. Тестовый манифест: POST /api/manifests `{"app":{"name":"test-nginx","node_selector":"agent1"},"container":{"image":"nginx:alpine","ports":["8888:80"]}}`.

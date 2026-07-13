@@ -239,7 +239,9 @@ async fn install_ca_cert(client: &r4a_client::ApiClient) -> Option<String> {
     };
 
     // Determine OS-specific cert path
-    let (cert_path, _update_cmd): (&str, &[&str]) = if cfg!(target_os = "macos") {
+    // update_cmd используется только в linux-ветке ниже; на macOS глушим warning
+    #[cfg_attr(target_os = "macos", allow(unused_variables))]
+    let (cert_path, update_cmd): (&str, &[&str]) = if cfg!(target_os = "macos") {
         ("/tmp/r4a-ca.crt", &[])  // macOS uses security command directly
     } else if std::path::Path::new("/usr/sbin/update-ca-certificates").exists()
         || std::path::Path::new("/usr/bin/update-ca-certificates").exists()

@@ -2423,6 +2423,7 @@ dependencies = [
  "hex",
  "r4a-core",
  "r4a-service",
+ "r4a-telemetry",
  "r4a-vpn",
  "r4a-worker",
  "reqwest",
@@ -2518,6 +2519,7 @@ dependencies = [
  "clap 4.6.1",
  "constant_time_eq",
  "ed25519-dalek",
+ "futures-util",
  "hex",
  "hyper",
  "hyper-util",
@@ -2527,6 +2529,7 @@ dependencies = [
  "r4a-ingress",
  "r4a-service",
  "r4a-store",
+ "r4a-telemetry",
  "r4a-vpn",
  "rand 0.8.6",
  "rcgen",
@@ -2539,6 +2542,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
  "toml",
  "tower 0.4.13",
  "tower-http 0.5.2",
@@ -2573,6 +2577,22 @@ dependencies = [
  "tracing",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "r4a-telemetry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bollard",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sled",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3656,6 +3676,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
