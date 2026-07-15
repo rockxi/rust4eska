@@ -30,6 +30,8 @@ toml = "0.8"
 pingora = { workspace = true }
 r4a-store = { version = "0.1.0", path = "../../crates/r4a-store" }
 r4a-telemetry = { workspace = true }
+r4a-worker = { workspace = true }
+bollard = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 r4a-service = { version = "0.1.0", path = "../../crates/r4a-service" }
@@ -43,4 +45,3 @@ rustls-pemfile = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 tower = { workspace = true }
-

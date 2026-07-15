@@ -66,6 +66,10 @@ struct App {
     manifests_selected_idx: usize,
     manifests_input: Option<String>,
     manifests_message: Option<String>,
+    logs_containers: Option<Vec<(String, String)>>,
+    logs_selected_idx: usize,
+    logs_entries: Option<Vec<r4a_client::LogEntry>>,
+    logs_message: Option<String>,
     client: ApiClient,
 }
 
@@ -97,6 +101,10 @@ impl App {
             manifests_selected_idx: 0,
             manifests_input: None,
             manifests_message: None,
+            logs_containers: None,
+            logs_selected_idx: 0,
+            logs_entries: None,
+            logs_message: None,
             client: ApiClient::new(master_url, secret),
         }
     }
@@ -156,6 +164,30 @@ impl App {
             match self.client.tokens_list().await {
                 Ok(t) => { self.rbac_tokens = Some(t); }
                 Err(e) => self.rbac_message = Some(format!("Error: {e}")),
+            }
+        }
+
+        if self.screen == Screen::Logs {
+            match self.client.logs_containers().await {
+                Ok(c) => {
+                    if self.logs_selected_idx >= c.len() {
+                        self.logs_selected_idx = c.len().saturating_sub(1);
+                    }
+                    self.logs_containers = Some(c);
+                    self.logs_message = None;
+                }
+                Err(e) => self.logs_message = Some(format!("Error: {e}")),
+            }
+            let selected = self.logs_containers.as_ref()
+                .and_then(|c| c.get(self.logs_selected_idx))
+                .cloned();
+            if let Some((node, container)) = selected {
+                match self.client.logs(&node, &container, 500).await {
+                    Ok(entries) => self.logs_entries = Some(entries),
+                    Err(e) => self.logs_message = Some(format!("Error: {e}")),
+                }
+            } else {
+                self.logs_entries = None;
             }
         }
 
@@ -431,6 +463,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                                         restart: "always".to_string(),
                                         command: None,
                                         ports: None,
+                                        volumes: None,
                                     }),
                                     systemd: None,
                                     ingress: None,
@@ -651,6 +684,22 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                             app.rbac_selected_idx = tokens.len().saturating_sub(1);
                         }
                     }
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) if app.screen == Screen::Logs => {
+                        if app.logs_selected_idx > 0 {
+                            app.logs_selected_idx -= 1;
+                            app.logs_entries = None;
+                            app.refresh().await;
+                        }
+                    }
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) if app.screen == Screen::Logs => {
+                        if let Some(ref list) = app.logs_containers {
+                            if app.logs_selected_idx < list.len().saturating_sub(1) {
+                                app.logs_selected_idx += 1;
+                                app.logs_entries = None;
+                                app.refresh().await;
+                            }
+                        }
+                    }
                     (KeyCode::Char('t'), _) if app.screen == Screen::Update => {
                         match app.client.update_test().await {
                             Ok(r) => {
@@ -774,8 +823,15 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 app.rbac_message.as_deref(),
             );
         }
-        Screen::Observability => {
-            ui::not_implemented::render(f, chunks[1], Screen::Observability.title());
+        Screen::Logs => {
+            ui::logs::render(
+                f,
+                chunks[1],
+                app.logs_containers.as_deref(),
+                app.logs_selected_idx,
+                app.logs_entries.as_deref(),
+                app.logs_message.as_deref(),
+            );
         }
         Screen::Update => {
             ui::update::render(

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { ScrollText, RefreshCw, Radio } from 'lucide-react';
+import { Database, RefreshCw, Radio, ScrollText, Search, X } from 'lucide-react';
 import apiClient from '../api/client';
 
 interface LogEntry {
@@ -11,7 +11,30 @@ interface LogEntry {
     line: string;
 }
 
+interface LogsConfig {
+    configured: boolean;
+    node: string | null;
+    endpoint: string | null;
+    ready: boolean;
+}
+
+interface NodeInfo {
+    ip: string;
+    name: string;
+    role: string;
+}
+
 const MAX_LINES = 2000;
+
+const fetchLogsConfig = async (): Promise<LogsConfig> => {
+    const r = await apiClient.get('/logs/config');
+    return r.data;
+};
+
+const fetchNodes = async (): Promise<NodeInfo[]> => {
+    const r = await apiClient.get('/nodes');
+    return r.data;
+};
 
 // [node, container] пары
 const fetchLogContainers = async (): Promise<[string, string][]> => {
@@ -19,10 +42,16 @@ const fetchLogContainers = async (): Promise<[string, string][]> => {
     return r.data;
 };
 
-const fetchLogs = async (node: string, container: string, tail: number): Promise<LogEntry[]> => {
-    const r = await apiClient.get(
-        `/logs?node=${encodeURIComponent(node)}&container=${encodeURIComponent(container)}&tail=${tail}`
-    );
+const fetchLogs = async (
+    node: string,
+    container: string,
+    tail: number,
+    opts?: { q?: string; stream?: string }
+): Promise<LogEntry[]> => {
+    const params = new URLSearchParams({ node, container, tail: String(tail) });
+    if (opts?.q) params.set('q', opts.q);
+    if (opts?.stream && opts.stream !== 'all') params.set('stream', opts.stream);
+    const r = await apiClient.get(`/logs?${params.toString()}`);
     return r.data;
 };
 
@@ -38,19 +67,66 @@ function formatTs(ts_ms: number) {
     return d.toLocaleTimeString('en-GB', { hour12: false }) + '.' + String(ts_ms % 1000).padStart(3, '0');
 }
 
+type StreamFilter = 'all' | 'stdout' | 'stderr';
+
+function highlightLine(line: string, query: string) {
+    if (!query) return line;
+    const parts = line.split(new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'ig'));
+    return parts.map((part, i) =>
+        part.toLowerCase() === query.toLowerCase() ? (
+            <mark key={i} className="bg-yellow-500/40 text-yellow-100 rounded-sm">
+                {part}
+            </mark>
+        ) : (
+            part
+        )
+    );
+}
+
 const Logs: React.FC = () => {
     const [selected, setSelected] = useState<{ node: string; container: string } | null>(null);
     const [tail, setTail] = useState(200);
     const [live, setLive] = useState(true);
     const [entries, setEntries] = useState<LogEntry[]>([]);
     const [historyLoading, setHistoryLoading] = useState(false);
+    const [search, setSearch] = useState('');
+    const [debouncedSearch, setDebouncedSearch] = useState('');
+    const [streamFilter, setStreamFilter] = useState<StreamFilter>('all');
+    const [setupNode, setSetupNode] = useState('');
+    const [setupEndpoint, setSetupEndpoint] = useState('');
+    const [setupPending, setSetupPending] = useState(false);
+    const [setupError, setSetupError] = useState<string | null>(null);
     const logRef = useRef<HTMLDivElement>(null);
+
+    const { data: config, isLoading: configLoading, refetch: refetchConfig } = useQuery({
+        queryKey: ['logs-config'],
+        queryFn: fetchLogsConfig,
+        refetchInterval: q => {
+            const data = q.state.data;
+            return data?.configured && !data.ready ? 2000 : false;
+        },
+    });
+
+    const { data: nodes } = useQuery({
+        queryKey: ['nodes'],
+        queryFn: fetchNodes,
+        enabled: !!config && !config.ready,
+    });
 
     const { data: containers, isLoading } = useQuery({
         queryKey: ['log-containers'],
         queryFn: fetchLogContainers,
         refetchInterval: 15000,
+        enabled: !!config?.ready,
     });
+
+    const deployNodes = nodes || [];
+
+    useEffect(() => {
+        if (!setupNode && deployNodes.length > 0) {
+            setSetupNode(deployNodes[0].name);
+        }
+    }, [deployNodes, setupNode]);
 
     // Автовыбор первого контейнера
     useEffect(() => {
@@ -59,35 +135,47 @@ const Logs: React.FC = () => {
         }
     }, [containers, selected]);
 
-    // История при выборе контейнера / смене tail
+    // Debounce поиска, чтобы не долбить ClickHouse на каждое нажатие клавиши
+    useEffect(() => {
+        const id = window.setTimeout(() => setDebouncedSearch(search.trim()), 300);
+        return () => window.clearTimeout(id);
+    }, [search]);
+
+    // История при выборе контейнера / смене tail / фильтров — поиск и фильтр по stream
+    // выполняются на стороне ClickHouse (WHERE + skip-индекс), не в браузере.
     useEffect(() => {
         if (!selected) return;
         let cancelled = false;
         setHistoryLoading(true);
-        fetchLogs(selected.node, selected.container, tail)
+        fetchLogs(selected.node, selected.container, tail, { q: debouncedSearch, stream: streamFilter })
             .then(lines => { if (!cancelled) setEntries(lines); })
             .catch(() => { if (!cancelled) setEntries([]); })
             .finally(() => { if (!cancelled) setHistoryLoading(false); });
         return () => { cancelled = true; };
-    }, [selected, tail]);
+    }, [selected, tail, debouncedSearch, streamFilter]);
 
-    // Live-стрим через SSE (EventSource не умеет заголовки — токен в query)
+    // Live через polling: ClickHouse является source of truth, SSE больше нет.
     useEffect(() => {
         if (!selected || !live) return;
-        const token = sessionStorage.getItem('r4a_token') || '';
-        const url = `${apiClient.defaults.baseURL}/logs/stream?node=${encodeURIComponent(selected.node)}&container=${encodeURIComponent(selected.container)}&token=${encodeURIComponent(token)}`;
-        const es = new EventSource(url);
-        es.onmessage = ev => {
-            try {
-                const entry: LogEntry = JSON.parse(ev.data);
-                setEntries(prev => {
-                    const next = [...prev, entry];
-                    return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
-                });
-            } catch { /* пропускаем битые события */ }
+        let cancelled = false;
+        const tick = () => {
+            fetchLogs(selected.node, selected.container, Math.min(MAX_LINES, Math.max(tail, 500)), {
+                q: debouncedSearch,
+                stream: streamFilter,
+            })
+                .then(lines => {
+                    if (!cancelled) {
+                        setEntries(lines.length > MAX_LINES ? lines.slice(lines.length - MAX_LINES) : lines);
+                    }
+                })
+                .catch(() => {});
         };
-        return () => es.close();
-    }, [selected, live]);
+        const id = window.setInterval(tick, 2000);
+        return () => {
+            cancelled = true;
+            window.clearInterval(id);
+        };
+    }, [selected, live, debouncedSearch, streamFilter]);
 
     // Автоскролл вниз
     useEffect(() => {
@@ -99,13 +187,30 @@ const Logs: React.FC = () => {
     const refetchHistory = () => {
         if (!selected) return;
         setHistoryLoading(true);
-        fetchLogs(selected.node, selected.container, tail)
+        fetchLogs(selected.node, selected.container, tail, { q: debouncedSearch, stream: streamFilter })
             .then(setEntries)
             .catch(() => setEntries([]))
             .finally(() => setHistoryLoading(false));
     };
 
     const selectedKey = selected ? `${selected.node}/${selected.container}` : '';
+
+    const deployClickHouse = async () => {
+        if (!setupNode || setupPending) return;
+        setSetupPending(true);
+        setSetupError(null);
+        try {
+            await apiClient.post('/logs/setup', {
+                node: setupNode,
+                endpoint: setupEndpoint.trim() || null,
+            });
+            await refetchConfig();
+        } catch (e: any) {
+            setSetupError(e?.response?.data || e?.message || 'Failed to start ClickHouse deployment');
+        } finally {
+            setSetupPending(false);
+        }
+    };
 
     return (
         <div className="p-6 max-w-7xl mx-auto">
@@ -114,7 +219,85 @@ const Logs: React.FC = () => {
                 <p className="text-text-silver mt-2">Centralized container logs from all nodes</p>
             </div>
 
-            {isLoading ? (
+            {configLoading ? (
+                <div className="flex items-center justify-center h-64">
+                    <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-accent-teal" />
+                </div>
+            ) : !config?.ready ? (
+                <div className="bg-slate-dark border border-gray-800 rounded-xl p-8 max-w-2xl">
+                    <div className="flex items-start gap-4">
+                        <div className="p-3 rounded-lg bg-accent-teal/10 border border-accent-teal/20">
+                            <Database className="w-7 h-7 text-accent-teal" />
+                        </div>
+                        <div className="flex-1">
+                            <h2 className="text-xl font-semibold text-white">
+                                {config?.configured ? 'ClickHouse is starting' : 'Deploy ClickHouse for logs'}
+                            </h2>
+                            <p className="text-gray-400 mt-2 text-sm leading-6">
+                                Logs are optional. r4a will deploy a managed ClickHouse container on the selected node,
+                                create the schema, and agents will start shipping container logs directly to it.
+                            </p>
+
+                            {config?.configured ? (
+                                <div className="mt-6 rounded-lg bg-deep-dark border border-gray-800 p-4">
+                                    <p className="text-sm text-gray-300">
+                                        Waiting for ClickHouse on <span className="text-white font-mono">{config.node}</span>
+                                    </p>
+                                    <p className="text-xs text-gray-500 font-mono mt-1">{config.endpoint}</p>
+                                    <div className="mt-4 flex items-center gap-3 text-accent-teal text-sm">
+                                        <RefreshCw className="w-4 h-4 animate-spin" />
+                                        Initializing schema...
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="mt-6 space-y-4">
+                                    <label className="block">
+                                        <span className="block text-sm text-gray-300 mb-2">Node</span>
+                                        <select
+                                            value={setupNode}
+                                            onChange={e => setSetupNode(e.target.value)}
+                                            className="w-full bg-deep-dark border border-gray-700 text-white rounded px-3 py-2 focus:outline-none"
+                                        >
+                                            {deployNodes.map(node => (
+                                                <option key={node.name} value={node.name}>
+                                                    {node.name} ({node.role}, {node.ip})
+                                                </option>
+                                            ))}
+                                        </select>
+                                    </label>
+
+                                    <label className="block">
+                                        <span className="block text-sm text-gray-300 mb-2">Endpoint override (optional)</span>
+                                        <input
+                                            value={setupEndpoint}
+                                            onChange={e => setSetupEndpoint(e.target.value)}
+                                            placeholder="http://host.docker.internal:8123"
+                                            className="w-full bg-deep-dark border border-gray-700 text-white rounded px-3 py-2 focus:outline-none font-mono text-sm"
+                                        />
+                                        <p className="text-xs text-gray-500 mt-2">
+                                            Leave empty in production. Use an override for local Docker dev if the node VPN IP cannot reach the published port.
+                                        </p>
+                                    </label>
+
+                                    {setupError && (
+                                        <div className="text-sm text-red-400 bg-red-950/30 border border-red-900 rounded p-3">
+                                            {setupError}
+                                        </div>
+                                    )}
+
+                                    <button
+                                        onClick={deployClickHouse}
+                                        disabled={!setupNode || setupPending || deployNodes.length === 0}
+                                        className="px-4 py-2 rounded bg-accent-teal text-deep-dark font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        {setupPending ? 'Deploying...' : 'Deploy ClickHouse'}
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            ) : isLoading ? (
                 <div className="flex items-center justify-center h-64">
                     <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-accent-teal" />
                 </div>
@@ -140,6 +323,33 @@ const Logs: React.FC = () => {
                                     {container} @ {node}
                                 </option>
                             ))}
+                        </select>
+                        <div className="relative">
+                            <Search className="w-3.5 h-3.5 text-gray-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                            <input
+                                value={search}
+                                onChange={e => setSearch(e.target.value)}
+                                placeholder="Search logs..."
+                                className="bg-deep-dark border border-gray-700 text-white text-sm rounded pl-8 pr-7 py-1 focus:outline-none w-56"
+                            />
+                            {search && (
+                                <button
+                                    onClick={() => setSearch('')}
+                                    className="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white"
+                                    title="Clear search"
+                                >
+                                    <X className="w-3.5 h-3.5" />
+                                </button>
+                            )}
+                        </div>
+                        <select
+                            value={streamFilter}
+                            onChange={e => setStreamFilter(e.target.value as StreamFilter)}
+                            className="bg-deep-dark border border-gray-700 text-white text-sm rounded px-2 py-1 focus:outline-none"
+                        >
+                            <option value="all">All streams</option>
+                            <option value="stdout">stdout</option>
+                            <option value="stderr">stderr</option>
                         </select>
                         <div className="ml-auto flex items-center gap-3">
                             <select
@@ -183,12 +393,14 @@ const Logs: React.FC = () => {
                                 <div className="animate-spin rounded-full h-6 w-6 border-t-2 border-b-2 border-accent-teal" />
                             </div>
                         ) : entries.length === 0 ? (
-                            <p className="text-gray-500 italic">No logs</p>
+                            <p className="text-gray-500 italic">
+                                {debouncedSearch || streamFilter !== 'all' ? 'No logs match the filter' : 'No logs'}
+                            </p>
                         ) : (
                             entries.map((e, i) => (
                                 <div key={i} className={`whitespace-pre-wrap break-all ${lineColor(e)}`}>
                                     <span className="text-gray-600 select-none">{formatTs(e.ts_ms)} </span>
-                                    {e.line || ' '}
+                                    {highlightLine(e.line || ' ', debouncedSearch)}
                                 </div>
                             ))
                         )}

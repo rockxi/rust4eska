@@ -219,6 +219,7 @@ impl Reconciler {
         }
 
         let host_config = HostConfig {
+            binds: config.volumes.clone(),
             port_bindings: Some(port_bindings),
             restart_policy: Some(bollard::models::RestartPolicy {
                 name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),

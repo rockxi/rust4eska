@@ -256,27 +256,27 @@ const Containers: React.FC = () => {
         refetchInterval: 10000,
     });
 
-    const agentNodes = nodes?.filter(n => n.role === 'agent') ?? [];
+    const workloadNodes = nodes ?? [];
 
     return (
         <div className="p-6 max-w-7xl mx-auto">
             <div className="mb-8">
                 <h1 className="text-3xl font-bold text-white tracking-tight">Containers</h1>
-                <p className="text-text-silver mt-2">Running workloads on agent nodes</p>
+                <p className="text-text-silver mt-2">Running workloads on cluster nodes</p>
             </div>
 
             {isLoading ? (
                 <div className="flex items-center justify-center h-64">
                     <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-accent-teal" />
                 </div>
-            ) : agentNodes.length === 0 ? (
+            ) : workloadNodes.length === 0 ? (
                 <div className="bg-slate-dark border border-gray-800 rounded-lg p-12 text-center">
                     <Container className="w-12 h-12 text-gray-600 mx-auto mb-4" />
-                    <p className="text-gray-400 text-lg">No agent nodes connected</p>
+                    <p className="text-gray-400 text-lg">No nodes connected</p>
                 </div>
             ) : (
                 <div className="space-y-4">
-                    {agentNodes.map(node => (
+                    {workloadNodes.map(node => (
                         <NodeContainers
                             key={node.name}
                             node={node}

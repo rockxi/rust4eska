@@ -13,6 +13,7 @@ interface NodeInfo {
     vram_used_mb: number | null;
     vram_total_mb: number | null;
     last_seen: number | null;
+    p2p_direct: string[] | null;
 }
 
 const fetchNodes = async (): Promise<NodeInfo[]> => {
@@ -177,6 +178,17 @@ const NodeCard = ({ node, currentTime, onClick }: { node: NodeInfo, currentTime:
                         </span>
                     </h3>
                     <p className="text-sm text-gray-400 font-mono mt-1">{node.ip}</p>
+                    {node.role.toLowerCase() !== 'master' && node.p2p_direct !== null && node.p2p_direct !== undefined && (
+                        node.p2p_direct.length > 0 ? (
+                            <span className="inline-block mt-2 text-[10px] px-2 py-0.5 rounded-full font-medium bg-green-500/15 text-green-400 border border-green-500/30" title={`Direct P2P tunnels: ${node.p2p_direct.join(', ')}`}>
+                                P2P direct: {node.p2p_direct.join(', ')}
+                            </span>
+                        ) : (
+                            <span className="inline-block mt-2 text-[10px] px-2 py-0.5 rounded-full font-medium bg-yellow-500/10 text-yellow-400 border border-yellow-500/30" title="All agent-to-agent traffic goes through the master hub">
+                                P2P relay
+                            </span>
+                        )
+                    )}
                 </div>
                 <div className="flex items-center gap-1.5">
                     <div className={`w-2.5 h-2.5 rounded-full ${isOnline ? 'bg-accent-teal shadow-[0_0_8px_rgba(102,252,241,0.6)]' : 'bg-red-500'}`}></div>

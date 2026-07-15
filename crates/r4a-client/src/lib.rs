@@ -17,6 +17,16 @@ pub struct UpdateStatus {
     pub agents: HashMap<String, AgentUpdateInfo>,
 }
 
+/// Строка лога контейнера из telemetry-store мастера.
+#[derive(Deserialize, Clone, Debug)]
+pub struct LogEntry {
+    pub node: String,
+    pub container: String,
+    pub ts_ms: u64,
+    pub stream: String,
+    pub line: String,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct TestResponse {
     pub ok: bool,
@@ -387,6 +397,23 @@ impl ApiClient {
         self.authenticated_post(format!("{}/api/connections/{}/heartbeat", self.base_url, id))
             .send().await?.error_for_status()?;
         Ok(())
+    }
+
+    /// Пары (node, container), по которым на мастере есть логи.
+    pub async fn logs_containers(&self) -> Result<Vec<(String, String)>> {
+        self.ensure_token().await?;
+        Ok(self.authenticated_get(format!("{}/api/logs/containers", self.base_url))
+            .send().await?.error_for_status()?.json().await?)
+    }
+
+    /// Последние `tail` строк лога контейнера.
+    pub async fn logs(&self, node: &str, container: &str, tail: usize) -> Result<Vec<LogEntry>> {
+        self.ensure_token().await?;
+        Ok(self.authenticated_get(format!(
+                "{}/api/logs?node={}&container={}&tail={}",
+                self.base_url, node, container, tail
+            ))
+            .send().await?.error_for_status()?.json().await?)
     }
 
     pub async fn ca_cert(&self) -> Result<String> {

@@ -24,6 +24,10 @@ pub struct PeerInfo {
     /// ip:port агента, наблюдаемый мастером через `wg show` (адрес после NAT).
     #[serde(default)]
     pub observed_endpoint: Option<String>,
+    /// Имена нод, с которыми у этого агента установлен прямой P2P-туннель
+    /// (репортится самим агентом в MetricsReport).
+    #[serde(default)]
+    pub p2p_direct: Option<Vec<String>>,
     pub cpu_percent: Option<f32>,
     pub ram_used_mb: Option<u64>,
     pub ram_total_mb: Option<u64>,
@@ -144,6 +148,9 @@ pub struct MetricsReport {
     pub ram_total_mb: u64,
     pub vram_used_mb: Option<u64>,
     pub vram_total_mb: Option<u64>,
+    /// Имена нод, с которыми установлен прямой P2P-туннель (пустой список = все через хаб).
+    #[serde(default)]
+    pub p2p_direct: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -179,6 +186,9 @@ pub struct NodeInfo {
     pub vram_used_mb: Option<u64>,
     pub vram_total_mb: Option<u64>,
     pub last_seen: Option<u64>,
+    /// Имена нод, с которыми у этой ноды прямой P2P-туннель (None у мастера).
+    #[serde(default)]
+    pub p2p_direct: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

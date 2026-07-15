@@ -33,6 +33,8 @@ pub struct ContainerConfig {
     pub restart: String,
     pub command: Option<Vec<String>>,
     pub ports: Option<Vec<String>>,
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
 }
 
 fn default_restart() -> String {

@@ -1,4 +1,11 @@
 use anyhow::Result;
+use bollard::{
+    container::{
+        ListContainersOptions, LogsOptions, RestartContainerOptions, StartContainerOptions,
+        StopContainerOptions,
+    },
+    Docker,
+};
 use constant_time_eq::constant_time_eq;
 use axum::{
     body::Body,
@@ -9,6 +16,7 @@ use axum::{
     Json, Router,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use futures_util::StreamExt;
 use rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose, SanType};
 
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -138,7 +146,6 @@ struct AppState {
     agent_update_states: Arc<Mutex<HashMap<String, AgentUpdateState>>>,
     store: Store,
     log_store: r4a_telemetry::store::LogStore,
-    log_tx: tokio::sync::broadcast::Sender<r4a_telemetry::LogEntry>,
 }
 
 use axum::extract::FromRequestParts;
@@ -479,6 +486,7 @@ async fn init(my_vpn_ip: &str, _store: Option<Store>) -> Result<()> {
                 role: "master".to_string(),
                 public_endpoint: Some(my_endpoint.clone()),
                 observed_endpoint: None,
+                p2p_direct: None,
                 cpu_percent: None,
                 ram_used_mb: None,
                 ram_total_mb: None,
@@ -538,7 +546,6 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     }
 
     let log_store = r4a_telemetry::store::LogStore::open(state_dir().join("logs-db"))?;
-    let (log_tx, _) = tokio::sync::broadcast::channel(1024);
 
     let state = AppState {
         master_pub_key: identity.public_key.clone(),
@@ -551,22 +558,22 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         agent_update_states: Arc::new(Mutex::new(HashMap::new())),
         store: store.clone(),
         log_store: log_store.clone(),
-        log_tx,
     };
 
-    // Retention: удаляем логи старше 3 суток раз в час
+    // Retention: удаляем точки метрик старше 3 суток раз в час
+    // (логи контейнеров живут в ClickHouse со своим TTL)
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-            match log_store.prune(3 * 24 * 3600) {
+            match log_store.prune_metrics(3 * 24 * 3600) {
                 Ok(0) => {}
-                Ok(n) => info!("Log retention: pruned {} old entries", n),
-                Err(e) => warn!("Log retention failed: {}", e),
+                Ok(n) => info!("Metrics retention: pruned {} old points", n),
+                Err(e) => warn!("Metrics retention failed: {}", e),
             }
         }
     });
     
-    store.set_secret(cluster_secret);
+    store.set_secret(cluster_secret.clone());
 
     // Migrate manifests from old single-blob format to per-entry format
     if let Ok(Some(data)) = store.get("core", b"manifests") {
@@ -581,6 +588,63 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     }
 
     let _ = store.migrate_rbac_v1_to_v2();
+
+    // Master can host system workloads explicitly targeted to the master node
+    // (for example ClickHouse logs storage). Do not include node_selector="all":
+    // historically only agents reconciled "all", and changing that would move
+    // arbitrary workloads onto the control-plane node.
+    let master_reconcile_store = store.clone();
+    let master_reconcile_name = System::host_name().unwrap_or_else(|| "master".to_string());
+    let master_reconcile_ip = my_vpn_ip.clone();
+    tokio::spawn(async move {
+        let reconciler = match r4a_worker::Reconciler::new(master_reconcile_name.clone(), String::new()) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Master reconciler disabled: {}", e);
+                return;
+            }
+        };
+        loop {
+            let manifests = match master_reconcile_store.list_manifests() {
+                Ok(items) => items
+                    .into_iter()
+                    .filter(|m| {
+                        m.app.node_selector == master_reconcile_name
+                            || m.app.node_selector == master_reconcile_ip
+                    })
+                    .map(|m| (m.app.name.clone(), m))
+                    .collect(),
+                Err(e) => {
+                    warn!("Master reconciler failed to list manifests: {}", e);
+                    HashMap::new()
+                }
+            };
+            if let Err(e) = reconciler.reconcile(manifests).await {
+                warn!("Master reconcile failed: {}", e);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+    });
+
+    // Telemetry collector for r4a-managed containers hosted on the master itself.
+    // Agents run their own collector; master needs one now that it can host
+    // system workloads such as ClickHouse.
+    tokio::spawn(r4a_telemetry::collector::run_collector(
+        System::host_name().unwrap_or_else(|| "master".to_string()),
+        "http://127.0.0.1:3501".to_string(),
+        cluster_secret.clone(),
+        state_dir().join("logs-state.json"),
+    ));
+
+    // Догоняем схему ClickHouse (в т.ч. line_ngram индекс поиска) при старте, если
+    // логи уже были настроены раньше — /api/logs/setup запускается только один раз
+    // на деплой, а не при каждом рестарте мастера.
+    let schema_store = store.clone();
+    tokio::spawn(async move {
+        if let Ok(Some(cfg)) = load_active_logs_ch_config(&schema_store).await {
+            ensure_logs_ch_schema(cfg).await;
+        }
+    });
 
     // Background task: expire connections that haven't sent a heartbeat in 90s
     let cleanup_store = store.clone();
@@ -635,11 +699,12 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
             .build()
             .unwrap_or_default();
         let mut sys = System::new_all();
+        let my_name = System::host_name().unwrap_or_else(|| "master".to_string());
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             sys.refresh_all();
             let (vram_used_mb, vram_total_mb) = query_vram();
-            
+
             let report = MetricsReport {
                 agent_vpn_ip: broadcast_state.my_vpn_ip.clone(),
                 cpu_percent: sys.global_cpu_usage(),
@@ -647,7 +712,23 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
                 ram_total_mb: sys.total_memory() / 1024 / 1024,
                 vram_used_mb,
                 vram_total_mb,
+                p2p_direct: None,
             };
+
+            // Своя история метрик — в telemetry-store (агенты пишутся в metrics_handler)
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let _ = broadcast_state.log_store.append_metric(&r4a_telemetry::MetricPoint {
+                node: my_name.clone(),
+                ts_ms: now_ms,
+                cpu_percent: report.cpu_percent,
+                ram_used_mb: report.ram_used_mb,
+                ram_total_mb: report.ram_total_mb,
+                vram_used_mb: report.vram_used_mb,
+                vram_total_mb: report.vram_total_mb,
+            });
 
             let masters: Vec<String> = {
                 let peers = broadcast_state.peers.lock().unwrap();
@@ -714,6 +795,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         .route("/api/peers", get(peers_handler))
         .route("/api/nodes", get(nodes_handler))
         .route("/api/metrics", post(metrics_handler))
+        .route("/api/metrics/history", get(metrics_history_handler))
         .route("/api/manifests", get(manifests_handler).post(manifest_upsert_handler).delete(manifest_delete_handler))
         .route("/api/vault", get(vault_get_handler).post(vault_set_handler).delete(vault_delete_handler))
         .route("/api/vault/list", get(vault_list_handler))
@@ -743,9 +825,11 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         .route("/api/nodes/:node/containers/:container/restart", post(node_container_restart_handler))
         .route("/api/nodes/:node/containers/:container/stop", post(node_container_stop_handler))
         .route("/api/nodes/:node/containers/:container/start", post(node_container_start_handler))
-        .route("/api/logs", get(logs_query_handler).post(logs_ingest_handler))
+        .route("/api/logs", get(logs_query_handler))
         .route("/api/logs/containers", get(logs_containers_handler))
-        .route("/api/logs/stream", get(logs_stream_handler))
+        .route("/api/logs/config", get(logs_config_handler))
+        .route("/api/logs/setup", post(logs_setup_handler))
+        .route("/api/logs/agent-config", get(logs_agent_config_handler))
         .route("/api/connections", get(connections_list_handler).post(connect_handler))
         .route("/api/connections/:id", axum::routing::delete(disconnect_handler))
         .route("/api/connections/:id/heartbeat", post(connection_heartbeat_handler))
@@ -957,6 +1041,7 @@ async fn join_handler(
             role: role_str.clone(),
             public_endpoint: req.public_endpoint.clone(),
             observed_endpoint: None,
+            p2p_direct: None,
             cpu_percent: None,
             ram_used_mb: None,
             ram_total_mb: None,
@@ -1291,20 +1376,62 @@ async fn metrics_handler(
     _auth: RequireSecret,
     Json(report): Json<MetricsReport>,
 ) -> StatusCode {
-    let mut peers = state.peers.lock().unwrap();
-    if let Some(peer) = peers.values_mut().find(|p| p.ip == report.agent_vpn_ip) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        peer.cpu_percent = Some(report.cpu_percent);
-        peer.ram_used_mb = Some(report.ram_used_mb);
-        peer.ram_total_mb = Some(report.ram_total_mb);
-        peer.vram_used_mb = report.vram_used_mb;
-        peer.vram_total_mb = report.vram_total_mb;
-        peer.last_seen = Some(now);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let node_name = {
+        let mut peers = state.peers.lock().unwrap();
+        match peers.values_mut().find(|p| p.ip == report.agent_vpn_ip) {
+            Some(peer) => {
+                peer.cpu_percent = Some(report.cpu_percent);
+                peer.ram_used_mb = Some(report.ram_used_mb);
+                peer.ram_total_mb = Some(report.ram_total_mb);
+                peer.vram_used_mb = report.vram_used_mb;
+                peer.vram_total_mb = report.vram_total_mb;
+                peer.last_seen = Some(now);
+                if report.p2p_direct.is_some() {
+                    peer.p2p_direct = report.p2p_direct.clone();
+                }
+                Some(peer.name.clone())
+            }
+            None => None,
+        }
+    };
+
+    // История метрик в telemetry-store (retention как у логов)
+    if let Some(name) = node_name {
+        let _ = state.log_store.append_metric(&r4a_telemetry::MetricPoint {
+            node: name,
+            ts_ms: now * 1000,
+            cpu_percent: report.cpu_percent,
+            ram_used_mb: report.ram_used_mb,
+            ram_total_mb: report.ram_total_mb,
+            vram_used_mb: report.vram_used_mb,
+            vram_total_mb: report.vram_total_mb,
+        });
     }
     StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct MetricsHistoryParams {
+    node: String,
+    tail: Option<usize>,
+}
+
+async fn metrics_history_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Query(q): Query<MetricsHistoryParams>,
+) -> Result<Json<Vec<r4a_telemetry::MetricPoint>>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Get, Resource::Nodes, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+    let tail = q.tail.unwrap_or(720).min(10_000);
+    let points = state.log_store.query_metrics(&q.node, tail)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(points))
 }
 
 async fn nodes_handler(State(state): State<AppState>, auth: RequireToken) -> Result<Json<Vec<NodeInfo>>, (StatusCode, String)> {
@@ -1330,6 +1457,7 @@ async fn nodes_handler(State(state): State<AppState>, auth: RequireToken) -> Res
         vram_used_mb: master_vram_used,
         vram_total_mb: master_vram_total,
         last_seen: Some(now),
+        p2p_direct: None,
     }];
 
     for peer in state.peers.lock().unwrap().values() {
@@ -1348,6 +1476,7 @@ async fn nodes_handler(State(state): State<AppState>, auth: RequireToken) -> Res
             vram_used_mb: peer.vram_used_mb,
             vram_total_mb: peer.vram_total_mb,
             last_seen: peer.last_seen,
+            p2p_direct: peer.p2p_direct.clone(),
         });
     }
 
@@ -1428,6 +1557,12 @@ async fn manifest_delete_handler(
 
     state.store.delete_manifest(&query.name).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if query.name == "clickhouse" {
+        state.store.delete("core", LOGS_CH_CONFIG_KEY).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        info!("Logs ClickHouse config cleared after manifest deletion by {}", auth.token.username);
+    }
 
     info!("Manifest '{}' deleted by {}", query.name, auth.token.username);
     Ok(StatusCode::OK)
@@ -1912,6 +2047,104 @@ fn find_peer_ip(state: &AppState, node_name: &str) -> Option<String> {
         .map(|p| p.ip.clone())
 }
 
+fn is_current_master_node(state: &AppState, node_name: &str) -> bool {
+    let master_name = System::host_name().unwrap_or_else(|| "master".to_string());
+    node_name == master_name || node_name == state.my_vpn_ip
+}
+
+#[derive(Serialize)]
+struct ContainerInfo {
+    id: String,
+    name: String,
+    image: String,
+    status: String,
+    state: String,
+}
+
+async fn master_docker() -> Result<Docker, (StatusCode, String)> {
+    Docker::connect_with_local_defaults()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn master_containers(state: &AppState) -> Result<Json<Vec<ContainerInfo>>, (StatusCode, String)> {
+    let docker = master_docker().await?;
+    let mut filters = HashMap::new();
+    let master_name = System::host_name().unwrap_or_else(|| "master".to_string());
+    filters.insert("label".to_string(), vec![format!("r4a.node={}", master_name)]);
+    let opts = ListContainersOptions { all: true, filters, ..Default::default() };
+    let containers = docker
+        .list_containers(Some(opts))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let result = containers
+        .into_iter()
+        .map(|c| {
+            let name = c
+                .names
+                .and_then(|ns| ns.into_iter().next())
+                .unwrap_or_default()
+                .trim_start_matches('/')
+                .to_string();
+            ContainerInfo {
+                id: c.id.unwrap_or_default(),
+                name,
+                image: c.image.unwrap_or_default(),
+                status: c.status.unwrap_or_default(),
+                state: c.state.unwrap_or_default(),
+            }
+        })
+        .collect();
+    let _ = state; // keep signature parallel to future auth/audit needs
+    Ok(Json(result))
+}
+
+async fn master_container_logs(container: &str, tail: u64) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let docker = master_docker().await?;
+    let opts = LogsOptions::<String> {
+        stdout: true,
+        stderr: true,
+        tail: tail.to_string(),
+        timestamps: false,
+        ..Default::default()
+    };
+    let mut stream = docker.logs(container, Some(opts));
+    let mut lines = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(output) => lines.push(output.to_string()),
+            Err(e) => lines.push(format!("[error] {}", e)),
+        }
+    }
+    Ok(Json(lines))
+}
+
+async fn master_container_restart(container: &str) -> Result<StatusCode, (StatusCode, String)> {
+    let docker = master_docker().await?;
+    docker
+        .restart_container(container, Some(RestartContainerOptions { t: 5 }))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+async fn master_container_stop(container: &str) -> Result<StatusCode, (StatusCode, String)> {
+    let docker = master_docker().await?;
+    docker
+        .stop_container(container, Some(StopContainerOptions { t: 5 }))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+async fn master_container_start(container: &str) -> Result<StatusCode, (StatusCode, String)> {
+    let docker = master_docker().await?;
+    docker
+        .start_container(container, None::<StartContainerOptions<String>>)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
 async fn proxy_get(url: &str, secret: &str) -> Result<reqwest::Response, (StatusCode, String)> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -1941,13 +2174,16 @@ async fn node_containers_handler(
     _auth: RequireToken,
     Path(NodePath { node }): Path<NodePath>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if is_current_master_node(&state, &node) {
+        return master_containers(&state).await.map(IntoResponse::into_response);
+    }
     let ip = find_peer_ip(&state, &node)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Node '{}' not found", node)))?;
     let url = format!("http://{}:{}/containers", ip, AGENT_API_PORT);
     let resp = proxy_get(&url, &state.cluster_secret).await?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let body = resp.bytes().await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    Ok((status, axum::body::Body::from(body)))
+    Ok((status, axum::body::Body::from(body)).into_response())
 }
 
 async fn node_container_logs_handler(
@@ -1956,6 +2192,10 @@ async fn node_container_logs_handler(
     Path(NodeContainerPath { node, container }): Path<NodeContainerPath>,
     Query(q): Query<ContainerLogsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if is_current_master_node(&state, &node) {
+        let tail = q.tail.unwrap_or(200);
+        return master_container_logs(&container, tail).await.map(IntoResponse::into_response);
+    }
     let ip = find_peer_ip(&state, &node)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Node '{}' not found", node)))?;
     let tail = q.tail.unwrap_or(200);
@@ -1963,7 +2203,7 @@ async fn node_container_logs_handler(
     let resp = proxy_get(&url, &state.cluster_secret).await?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let body = resp.bytes().await.map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    Ok((status, axum::body::Body::from(body)))
+    Ok((status, axum::body::Body::from(body)).into_response())
 }
 
 async fn node_container_restart_handler(
@@ -1971,6 +2211,9 @@ async fn node_container_restart_handler(
     _auth: RequireToken,
     Path(NodeContainerPath { node, container }): Path<NodeContainerPath>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if is_current_master_node(&state, &node) {
+        return master_container_restart(&container).await;
+    }
     let ip = find_peer_ip(&state, &node)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Node '{}' not found", node)))?;
     let url = format!("http://{}:{}/containers/{}/restart", ip, AGENT_API_PORT, container);
@@ -1983,6 +2226,9 @@ async fn node_container_stop_handler(
     _auth: RequireToken,
     Path(NodeContainerPath { node, container }): Path<NodeContainerPath>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if is_current_master_node(&state, &node) {
+        return master_container_stop(&container).await;
+    }
     let ip = find_peer_ip(&state, &node)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Node '{}' not found", node)))?;
     let url = format!("http://{}:{}/containers/{}/stop", ip, AGENT_API_PORT, container);
@@ -1995,6 +2241,9 @@ async fn node_container_start_handler(
     _auth: RequireToken,
     Path(NodeContainerPath { node, container }): Path<NodeContainerPath>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if is_current_master_node(&state, &node) {
+        return master_container_start(&container).await;
+    }
     let ip = find_peer_ip(&state, &node)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Node '{}' not found", node)))?;
     let url = format!("http://{}:{}/containers/{}/start", ip, AGENT_API_PORT, container);
@@ -2238,20 +2487,234 @@ async fn connection_heartbeat_handler(
     }
 }
 
-// ── Telemetry: centralized container logs ─────────────────────────────────────
+// ── Telemetry: centralized container logs in ClickHouse ──────────────────────
 
-async fn logs_ingest_handler(
+const LOGS_CH_CONFIG_KEY: &[u8] = b"logs_ch_config";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LogsChConfig {
+    node: String,
+    endpoint: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LogsConfigResponse {
+    configured: bool,
+    node: Option<String>,
+    endpoint: Option<String>,
+    ready: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsSetupRequest {
+    node: String,
+    endpoint: Option<String>,
+}
+
+fn load_logs_ch_config(store: &Store) -> Result<Option<LogsChConfig>, (StatusCode, String)> {
+    store
+        .get("core", LOGS_CH_CONFIG_KEY)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(|bytes| {
+            serde_json::from_slice::<LogsChConfig>(&bytes)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        })
+        .transpose()
+}
+
+async fn load_active_logs_ch_config(store: &Store) -> Result<Option<LogsChConfig>, (StatusCode, String)> {
+    let Some(cfg) = load_logs_ch_config(store)? else {
+        return Ok(None);
+    };
+
+    let has_manifest = store
+        .list_manifests()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .any(|m| m.app.name == "clickhouse");
+
+    if has_manifest {
+        Ok(Some(cfg))
+    } else {
+        store.delete("core", LOGS_CH_CONFIG_KEY).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        info!("Removed stale Logs ClickHouse config because manifest 'clickhouse' is absent");
+        Ok(None)
+    }
+}
+
+fn ch_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+async fn ch_ping(client: &reqwest::Client, cfg: &LogsChConfig) -> bool {
+    client
+        .get(format!("{}/ping", cfg.endpoint.trim_end_matches('/')))
+        .basic_auth("default", Some(&cfg.password))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+async fn ch_exec(client: &reqwest::Client, cfg: &LogsChConfig, sql: &str) -> Result<String, (StatusCode, String)> {
+    let resp = client
+        .post(cfg.endpoint.trim_end_matches('/'))
+        .basic_auth("default", Some(&cfg.password))
+        .body(sql.to_string())
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err((StatusCode::BAD_GATEWAY, format!("ClickHouse HTTP {}: {}", status, body)))
+    }
+}
+
+async fn ensure_logs_ch_schema(cfg: LogsChConfig) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    for _ in 0..60 {
+        if ch_ping(&client, &cfg).await {
+            let db = ch_exec(&client, &cfg, r4a_telemetry::CH_CREATE_DATABASE).await;
+            let table = ch_exec(&client, &cfg, r4a_telemetry::CH_CREATE_LOGS_TABLE).await;
+            match (db, table) {
+                (Ok(_), Ok(_)) => {
+                    // Догоняем индекс поиска на таблицах, созданных до его появления.
+                    if let Err((_, e)) = ch_exec(&client, &cfg, r4a_telemetry::CH_ADD_LOGS_LINE_INDEX).await {
+                        warn!("ClickHouse line index add failed: {}", e);
+                    } else if let Err((_, e)) =
+                        ch_exec(&client, &cfg, r4a_telemetry::CH_MATERIALIZE_LOGS_LINE_INDEX).await
+                    {
+                        warn!("ClickHouse line index materialize failed: {}", e);
+                    }
+                    info!("ClickHouse logs schema is ready at {}", cfg.endpoint);
+                    return;
+                }
+                (Err((_, e)), _) | (_, Err((_, e))) => warn!("ClickHouse schema init failed: {}", e),
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+
+    warn!("ClickHouse logs schema init timed out for {}", cfg.endpoint);
+}
+
+async fn logs_config_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+) -> Result<Json<LogsConfigResponse>, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Get, Resource::Logs, None) {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+    let Some(cfg) = load_active_logs_ch_config(&state.store).await? else {
+        return Ok(Json(LogsConfigResponse {
+            configured: false,
+            node: None,
+            endpoint: None,
+            ready: false,
+        }));
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+    let ready = ch_ping(&client, &cfg).await;
+    Ok(Json(LogsConfigResponse {
+        configured: true,
+        node: Some(cfg.node),
+        endpoint: Some(cfg.endpoint),
+        ready,
+    }))
+}
+
+async fn logs_setup_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Json(req): Json<LogsSetupRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !state.store.can(&auth.token.username, Verb::Create, Resource::Logs, None)
+        && !state.store.can(&auth.token.username, Verb::Update, Resource::Logs, None)
+    {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+
+    let node = req.node.trim().to_string();
+    if node.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "node is required".to_string()));
+    }
+
+    let master_name = System::host_name().unwrap_or_else(|| "master".to_string());
+    let node_ip = if node == master_name || node == state.my_vpn_ip {
+        state.my_vpn_ip.clone()
+    } else {
+        let peers = state.peers.lock().unwrap();
+        peers
+            .values()
+            .find(|p| p.name == node)
+            .map(|p| p.ip.clone())
+            .ok_or((StatusCode::BAD_REQUEST, "Unknown node".to_string()))?
+    };
+
+    let endpoint = req
+        .endpoint
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("http://{}:8123", node_ip));
+    let password = generate_secret();
+    let cfg = LogsChConfig { node: node.clone(), endpoint: endpoint.clone(), password: password.clone() };
+
+    let mut env = HashMap::new();
+    env.insert("CLICKHOUSE_PASSWORD".to_string(), password);
+    env.insert("CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT".to_string(), "1".to_string());
+
+    let manifest = Manifest {
+        app: r4a_core::AppConfig {
+            name: "clickhouse".to_string(),
+            node_selector: node.clone(),
+        },
+        container: Some(r4a_core::ContainerConfig {
+            image: "clickhouse/clickhouse-server:24.8-alpine".to_string(),
+            restart: "always".to_string(),
+            command: None,
+            ports: Some(vec!["8123:8123".to_string()]),
+            volumes: Some(vec!["r4a-clickhouse-data:/var/lib/clickhouse".to_string()]),
+        }),
+        systemd: None,
+        ingress: None,
+        env,
+    };
+
+    state.store.put_manifest(&manifest).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state.store.put(
+        "core",
+        LOGS_CH_CONFIG_KEY,
+        &serde_json::to_vec(&cfg).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+    ).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tokio::spawn(ensure_logs_ch_schema(cfg));
+    info!("Logs ClickHouse setup requested by {} on node {}", auth.token.username, node);
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn logs_agent_config_handler(
     State(state): State<AppState>,
     _auth: RequireSecret,
-    Json(batch): Json<r4a_telemetry::LogBatch>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    state.log_store.append(&batch.entries)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    for entry in batch.entries {
-        // Ошибка = нет активных подписчиков стрима, это нормально
-        let _ = state.log_tx.send(entry);
-    }
-    Ok(StatusCode::OK)
+) -> Result<Json<r4a_telemetry::LogsChTarget>, (StatusCode, String)> {
+    let cfg = load_active_logs_ch_config(&state.store).await?
+        .ok_or((StatusCode::NOT_FOUND, "Logs ClickHouse is not configured".to_string()))?;
+    Ok(Json(r4a_telemetry::LogsChTarget {
+        endpoint: cfg.endpoint,
+        password: cfg.password,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -2259,6 +2722,10 @@ struct LogsQueryParams {
     node: String,
     container: String,
     tail: Option<usize>,
+    /// Полнотекстовый поиск по строке (case-insensitive substring).
+    q: Option<String>,
+    /// "stdout" | "stderr" — без параметра ищем в обоих.
+    stream: Option<String>,
 }
 
 async fn logs_query_handler(
@@ -2270,8 +2737,63 @@ async fn logs_query_handler(
         return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
     }
     let tail = q.tail.unwrap_or(200).min(5000);
-    let entries = state.log_store.query(&q.node, &q.container, tail)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let cfg = load_active_logs_ch_config(&state.store).await?
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Logs ClickHouse is not configured".to_string()))?;
+
+    let mut filters = format!(
+        "node = '{}' AND container = '{}'",
+        ch_escape(&q.node),
+        ch_escape(&q.container),
+    );
+    if let Some(stream) = q.stream.as_deref().filter(|s| !s.is_empty()) {
+        filters.push_str(&format!(" AND stream = '{}'", ch_escape(stream)));
+    }
+    if let Some(search) = q.q.as_deref().filter(|s| !s.is_empty()) {
+        // positionCaseInsensitive работает по индексируемому line — узкий диапазон
+        // node/container уже отфильтрован по primary key, поиск быстрый даже без
+        // попадания в line_ngram skip-индекс (он всё равно помогает CH пропускать
+        // гранулы, не содержащие искомую подстроку, на больших партициях).
+        filters.push_str(&format!(" AND positionCaseInsensitive(line, '{}') > 0", ch_escape(search)));
+    }
+
+    let sql = format!(
+        "SELECT node, container, ts_ms, stream, line FROM \
+         (SELECT node, container, ts_ms, stream, line FROM r4a.logs \
+          WHERE {} ORDER BY ts_ms DESC LIMIT {}) \
+         ORDER BY ts_ms ASC FORMAT JSONEachRow",
+        filters,
+        tail,
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let body = ch_exec(&client, &cfg, &sql).await?;
+    #[derive(Deserialize)]
+    struct LogRow {
+        node: String,
+        container: String,
+        ts_ms: serde_json::Value,
+        stream: String,
+        line: String,
+    }
+    let entries = body
+        .lines()
+        .filter_map(|line| {
+            let row = serde_json::from_str::<LogRow>(line).ok()?;
+            let ts_ms = row
+                .ts_ms
+                .as_u64()
+                .or_else(|| row.ts_ms.as_str().and_then(|s| s.parse::<u64>().ok()))?;
+            Some(r4a_telemetry::LogEntry {
+                node: row.node,
+                container: row.container,
+                ts_ms,
+                stream: row.stream,
+                line: row.line,
+            })
+        })
+        .collect();
     Ok(Json(entries))
 }
 
@@ -2282,63 +2804,28 @@ async fn logs_containers_handler(
     if !state.store.can(&auth.token.username, Verb::List, Resource::Logs, None) {
         return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
     }
-    let list = state.log_store.list_containers()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(list))
-}
-
-#[derive(Deserialize)]
-struct LogsStreamParams {
-    node: String,
-    container: String,
-    /// Bearer-токен для браузерного EventSource (он не умеет ставить заголовки)
-    token: Option<String>,
-}
-
-async fn logs_stream_handler(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Query(q): Query<LogsStreamParams>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    use axum::response::sse::{Event, KeepAlive, Sse};
-    use futures_util::StreamExt;
-
-    let token_str = headers
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.to_string())
-        .or(q.token.clone())
-        .ok_or((StatusCode::UNAUTHORIZED, "Missing token".to_string()))?;
-
-    let token = state.store.get_token(&token_str)
-        .ok()
-        .flatten()
-        .ok_or((StatusCode::UNAUTHORIZED, "Invalid token".to_string()))?;
-
-    if !state.store.can(&token.username, Verb::Get, Resource::Logs, None) {
-        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    let cfg = load_active_logs_ch_config(&state.store).await?
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Logs ClickHouse is not configured".to_string()))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let body = ch_exec(
+        &client,
+        &cfg,
+        "SELECT node, container FROM r4a.logs GROUP BY node, container ORDER BY node, container FORMAT JSONEachRow",
+    ).await?;
+    #[derive(Deserialize)]
+    struct Row {
+        node: String,
+        container: String,
     }
-
-    let rx = state.log_tx.subscribe();
-    let node = q.node.clone();
-    let container = q.container.clone();
-
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |item| {
-        let node = node.clone();
-        let container = container.clone();
-        async move {
-            match item {
-                Ok(e) if e.node == node && e.container == container => {
-                    let data = serde_json::to_string(&e).unwrap_or_default();
-                    Some(Ok::<Event, std::convert::Infallible>(Event::default().data(data)))
-                }
-                _ => None, // чужой контейнер или Lagged (отставший подписчик)
-            }
-        }
-    });
-
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    let list = body
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Row>(line).ok())
+        .map(|r| (r.node, r.container))
+        .collect();
+    Ok(Json(list))
 }
 
 // ── DNS server for *.r4a.local ────────────────────────────────────────────────
@@ -2704,4 +3191,3 @@ async fn proxy_handler(
     resp.body(Body::from(body_bytes))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
-

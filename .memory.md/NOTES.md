@@ -1,3 +1,99 @@
+## ClickHouse logs: backend + collector + Web UI (реализовано кодом 2026-07-13)
+
+- `ContainerConfig.volumes` + `HostConfig.binds` уже добавлены: системный манифест ClickHouse
+  получает volume `r4a-clickhouse-data:/var/lib/clickhouse`.
+- r4a-server:
+  - `POST /api/logs/setup {node, endpoint?}` генерирует пароль, upsert'ит manifest `clickhouse`,
+    сохраняет `LogsChConfig` в `core/logs_ch_config`, фоном ждёт `/ping` и создаёт БД/таблицу.
+  - `GET /api/logs/config` показывает `{configured,node,endpoint,ready}`.
+  - `GET /api/logs/agent-config` по cluster secret отдаёт `{endpoint,password}` или 404.
+  - `GET /api/logs` и `/api/logs/containers` читают из ClickHouse через HTTP Basic Auth.
+  - Старые server-side ingest/SSE обработчики удалены из кода.
+- r4a-telemetry collector: ждёт agent-config, шипит JSONEachRow напрямую в ClickHouse,
+  включает docker timestamps и хранит per-container last shipped timestamp в
+  `~/.r4a-agent/logs-state.json`.
+- Web UI Logs: wizard деплоя ClickHouse (выбор любой ноды: master или agent + optional endpoint override),
+  ожидание ready через `/logs/config`, просмотр логов через polling `/logs` каждые 2s
+  вместо EventSource/SSE.
+- ClickHouse startup lines вида `Processing configuration file...`, `Logging errors to...`,
+  `/entrypoint.sh: create new user 'default' instead 'default'` — штатный stdout/stderr
+  контейнера, не ошибка запуска. В dev `/api/logs/config` возвращал `ready:true`, а
+  `SELECT`/`/api/logs` читали строки из `r4a.logs`.
+- Баг e2e: ClickHouse отдаёт `UInt64` в JSONEachRow как строку (`"ts_ms":"..."`), из-за чего
+  серверный парсер `LogEntry` отбрасывал строки и `/api/logs` возвращал `[]`. Исправлено:
+  backend принимает `ts_ms` и как number, и как string.
+- Проверки: `cargo check --workspace`, `cargo test -p r4a-telemetry`, `npm run build`
+  в `binaries/r4a-web/frontend` — проходят.
+- Dev e2e проверено: `POST /api/logs/setup {node:"agent1", endpoint:"http://host.docker.internal:8123"}`
+  → `r4a-clickhouse` запущен, `/api/logs/config` → `ready:true`, `/api/logs/containers`
+  → `r4a-clickhouse` и `r4a-test-nginx`, `/api/logs?node=agent1&container=r4a-test-nginx&tail=3`
+  возвращает nginx access logs.
+- Исправление после замечания пользователя: если пользователь удаляет manifest `clickhouse`,
+  сервер удаляет и `core/logs_ch_config`. Иначе Logs оставался `configured`, агенты продолжали
+  получать `/api/logs/agent-config`, а UI не возвращался к явному Deploy. Docker restart policy
+  для ClickHouse оставлен `always` по требованию пользователя.
+- Дополнительно: добавлен guard от уже залипшего состояния. Если `core/logs_ch_config` есть,
+  но manifest `clickhouse` отсутствует, любой `/api/logs/config`, `/api/logs/agent-config`,
+  `/api/logs` или `/api/logs/containers` удаляет stale config и ведёт себя как "Logs не настроены".
+- Исправление deploy на master: `/api/logs/setup` больше не ищет master только в `peers`
+  (master в `/api/nodes` синтетический из hostname). Если выбран hostname текущего master
+  или его VPN IP, используется `state.my_vpn_ip`.
+- Чтобы manifest `clickhouse` реально исполнялся на master, добавлен master-side
+  `r4a_worker::Reconciler` для manifest'ов, где `node_selector` равен hostname master или его VPN IP.
+  `node_selector="all"` намеренно НЕ применяется к master, чтобы не менять старую семантику
+  и не переносить произвольные workload'ы на control-plane.
+- Для dev compose master получил mount `/var/run/docker.sock:/var/run/docker.sock`; без recreate
+  `node-master` новый mount не применится, и master reconciler не сможет запускать контейнеры.
+- Web UI Containers раньше фильтровал `role === "agent"`, поэтому master не показывался.
+  Фильтр убран: раздел Containers показывает все cluster nodes, включая master.
+- Containers API раньше проксировал `/api/nodes/:node/containers*` только в agent API `:8082`;
+  у master agent API нет, поэтому карточка master в Web UI падала с
+  "Failed to load containers". Добавлена local Docker-ветка для текущего master:
+  list/logs/restart/stop/start работают через Docker socket на master; agent-ноды по-прежнему
+  идут через agent API.
+- Master теперь запускает telemetry collector для своих r4a-managed контейнеров
+  (`r4a.node=<master hostname>`), иначе контейнеры на master были видны в Containers, но не
+  попадали в централизованный раздел Logs. Проверено в dev: `/api/logs/containers` содержит
+  `["495a89dabf9c","r4a-clickhouse"]`, tail возвращает startup logs ClickHouse.
+- Agent collector раньше читал `/api/logs/agent-config` только один раз при старте. После
+  redeploy ClickHouse менялся password/config, и агенты продолжали ship'ить в CH со старым
+  target. Исправлено: collector каждые 30s перечитывает agent-config и обновляет endpoint/password
+  без рестарта. Проверено nginx: запросы `/live-check-final-*` попали в `/api/logs` для
+  `agent1/r4a-test-nginx`, `logs-state.json` обновился до нового timestamp.
+
+---
+
+## Follow-ups: connection type, TUI Logs, история метрик (реализовано 2026-07-13, вечер)
+
+### Connection type (direct/relay)
+- Агент шарит имена established p2p-пиров через `Arc<Mutex<Vec<String>>>` между
+  run_p2p_sync и metrics-циклом; уходит в `MetricsReport.p2p_direct` (каждые 5s).
+- `PeerInfo.p2p_direct` / `NodeInfo.p2p_direct: Option<Vec<String>>` (#[serde(default)] —
+  обратная совместимость со старыми агентами: None = «неизвестно», UI показывает «—»).
+- Семантика: None = мастер/старый агент; Some([]) = relay (всё через хаб); Some([имена]) = direct.
+- metrics_handler обновляет peer.p2p_direct только если в репорте Some (мастера шлют None).
+- TUI: колонка "P2P" в Dashboard; Web UI: бейдж на карточке ноды (зелёный direct / жёлтый relay).
+- Лаг статуса: p2p-цикл агента 30s + metrics 5s → в UI статус появляется через ~35-65s.
+
+### TUI Logs (вместо заглушки Observability)
+- Screen::Observability переименован в Screen::Logs, ui/not_implemented.rs удалён.
+- Левая панель — контейнеры из GET /api/logs/containers (j/k); правая — tail 500 строк,
+  обновление в общем poll-цикле TUI (2s), показываются последние строки по высоте панели.
+- r4a-client: методы `logs_containers()`, `logs(node, container, tail)` + структура LogEntry.
+- stderr красным, "error"/"warn" в строке подсвечиваются.
+
+### История метрик нод
+- Дерево `metrics` в том же sled logs-db (~/.r4a-server/logs-db). Ключ `{node}\0{ts_ms:016x}{seq:08x}`.
+- Точки пишут: metrics_handler (репорты агентов, ts = секунды получения) и broadcast-цикл
+  мастера (свои метрики, каждые 5s). Имя ноды мастера = hostname (в docker — id контейнера).
+- `GET /api/metrics/history?node=<name>&tail=N` (RBAC Get Nodes, default 720 ≈ 1 час, max 10000).
+- Retention: prune_metrics(3 дня) в том же часовом цикле, что и логи.
+- Проверено на dev-кластере: p2p_direct=["agent2"] у agent1 в /api/nodes (~40s после старта),
+  история метрик для agent1 и мастера, /api/logs tail — ок; r4a-telemetry unit-тесты проходят.
+- Прод-деплой НЕ делался.
+
+---
+
 ## Сеть: ip_forward, public endpoint, P2P (реализовано 2026-07-13)
 
 ### Что сделано

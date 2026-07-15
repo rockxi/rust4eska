@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use sysinfo::System;
 use tracing::{info, warn, error};
 
@@ -419,15 +420,20 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>,
 
     spawn_agent_api(cluster_secret.clone(), name.clone(), resp.agent_vpn_ip.clone());
 
-    // Telemetry: стримим логи r4a-контейнеров на мастер
+    // Telemetry: стримим логи r4a-контейнеров в ClickHouse (когда настроен на мастере)
     tokio::spawn(r4a_telemetry::collector::run_collector(
         name.clone(),
         "http://master.r4a.local:3501".to_string(),
         cluster_secret.clone(),
+        state_dir().join("logs-state.json"),
     ));
+
+    // Имена нод с установленным прямым P2P-туннелем: пишет p2p-цикл, читает metrics-репорт
+    let p2p_direct: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     let vpn_ip = resp.agent_vpn_ip.clone();
     let metrics_secret = cluster_secret.clone();
+    let metrics_p2p_direct = p2p_direct.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
         let mut sys = System::new_all();
@@ -442,8 +448,9 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>,
                 ram_total_mb: sys.total_memory() / 1024 / 1024,
                 vram_used_mb,
                 vram_total_mb,
+                p2p_direct: Some(metrics_p2p_direct.lock().unwrap().clone()),
             };
-            
+
             let _ = client
                 .post("http://master.r4a.local:3501/api/metrics")
                 .header("X-R4A-Secret", &metrics_secret)
@@ -521,8 +528,9 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>,
     let p2p_secret = cluster_secret.clone();
     let p2p_my_pubkey = identity.public_key.clone();
     let p2p_master_pubkey = resp.master_pub_key.clone();
+    let p2p_direct_out = p2p_direct.clone();
     tokio::spawn(async move {
-        run_p2p_sync(p2p_secret, p2p_my_pubkey, p2p_master_pubkey).await;
+        run_p2p_sync(p2p_secret, p2p_my_pubkey, p2p_master_pubkey, p2p_direct_out).await;
     });
 
     tokio::signal::ctrl_c().await?;
@@ -561,7 +569,12 @@ fn p2p_backoff_secs(failures: u32) -> u64 {
     }
 }
 
-async fn run_p2p_sync(cluster_secret: String, my_pubkey: String, master_pubkey: String) {
+async fn run_p2p_sync(
+    cluster_secret: String,
+    my_pubkey: String,
+    master_pubkey: String,
+    p2p_direct_out: Arc<Mutex<Vec<String>>>,
+) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -670,6 +683,14 @@ async fn run_p2p_sync(cluster_secret: String, my_pubkey: String, master_pubkey: 
                 let _ = r4a_vpn::wireguard::remove_peer(&pk);
             }
         }
+
+        // Публикуем список established-пиров для metrics-репорта
+        let mut established: Vec<String> = states.iter()
+            .filter(|(_, st)| st.established)
+            .filter_map(|(pk, _)| peers.get(pk).map(|p| p.name.clone()))
+            .collect();
+        established.sort();
+        *p2p_direct_out.lock().unwrap() = established;
     }
 }
 

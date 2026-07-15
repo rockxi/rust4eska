@@ -1,7 +1,7 @@
 pub mod dashboard;
 pub mod git;
+pub mod logs;
 pub mod manifests;
-pub mod not_implemented;
 pub mod rbac;
 pub mod update;
 pub mod vault;
@@ -13,7 +13,7 @@ pub enum Screen {
     Git,
     Vault,
     Rbac,
-    Observability,
+    Logs,
     Update,
 }
 
@@ -24,7 +24,7 @@ impl Screen {
         Screen::Git,
         Screen::Vault,
         Screen::Rbac,
-        Screen::Observability,
+        Screen::Logs,
         Screen::Update,
     ];
 
@@ -35,7 +35,7 @@ impl Screen {
             Screen::Git => "Git",
             Screen::Vault => "Vault",
             Screen::Rbac => "RBAC",
-            Screen::Observability => "Observability",
+            Screen::Logs => "Logs",
             Screen::Update => "Update",
         }
     }

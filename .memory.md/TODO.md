@@ -105,9 +105,9 @@
     - [x] r4a-agent: spawn collector после connect
     - [x] Тест на docker-кластере: логи nginx (stdout+stderr) в store, SSE live, RBAC 401/403, переподхват после рестарта контейнера
     - [x] Follow-up: вкладка Logs в Web UI (EventSource + ?token=) — сделано 2026-07-13
-    - [ ] Follow-up: экран логов в TUI
-    - [ ] Follow-up: LLM-трейсы / OpenTelemetry-спаны (MAIN.md §2.7)
-    - [ ] Follow-up: метрики нод в telemetry-store (история CPU/RAM, сейчас только last-value в peers)
+    - [x] Follow-up: экран логов в TUI — сделано 2026-07-13 (вкладка Logs вместо Observability: список контейнеров + tail 500, live-поллинг 2s)
+    - [ ] Follow-up: LLM-трейсы / OpenTelemetry-спаны (MAIN.md §2.7) — крупная фича, нужен дизайн и согласование с пользователем
+    - [x] Follow-up: метрики нод в telemetry-store — сделано 2026-07-13 (дерево `metrics` в logs-db, точка каждые 5s на ноду, retention 3 дня, GET /api/metrics/history?node=&tail=)
 
 - [x] **Fix A: IP forwarding на мастере (агент↔агент трафик через хаб)**
 
@@ -184,5 +184,26 @@
           `wg show` на agent1 показывает peer agent2 со свежим handshake; убить agent2 →
           через ≤180s peer удалён, ping идёт через хаб (после Fix A)
     - [ ] Проверка (реальные NAT): asus + home за разными NAT через VPS —
-          `wg show` handshake напрямую; отключить UDP между ними (firewall) → fallback на хаб
-    - [ ] Follow-up: Web UI/TUI — колонка connection type (direct / relay) в списке нод
+          `wg show` handshake напрямую; отключить UDP между ними (firewall) → fallback на хаб.
+          ЗАБЛОКИРОВАНО: оба прод-хоста в одной LAN (192.168.3.x) и агент один — нужен VPS
+          или третья машина за другим NAT
+    - [x] Follow-up: Web UI/TUI — колонка connection type (direct / relay) — сделано 2026-07-13
+          (агент репортит established p2p-пиров в MetricsReport.p2p_direct → PeerInfo/NodeInfo;
+          TUI dashboard колонка "P2P", Web UI бейдж на карточке ноды)
+
+- [ ] **Feature: логи в ClickHouse, опциональный раздел Logs (согласовано 2026-07-13)**
+
+    Контекст: sled-хранилище логов на мастере не production-ready (нет полноценного retention,
+    поиска, теряется история до старта коллектора). Решение пользователя: свой Rust-коллектор
+    остаётся, хранилище — ClickHouse; раздел Logs опционален — из Web UI пользователь выбирает
+    ноду и деплоит CH прямо там (через существующую систему манифестов), логи подключаются
+    автоматически. Детали в TASK.md.
+
+    - [x] r4a-core: ContainerConfig.volumes + прокидывание binds в Reconciler
+    - [x] r4a-server: POST /api/logs/setup, GET /api/logs/config, GET /api/logs/agent-config;
+          /api/logs и /api/logs/containers переводятся на SELECT из CH; ingest/SSE/sled-логи выпилить
+    - [x] r4a-telemetry collector: поллинг agent-config, INSERT в CH, docker timestamps +
+          persist последнего ts (фикс расхождения Containers vs Logs)
+    - [x] Web UI Logs.tsx: wizard деплоя CH (выбор ноды) → поллинг готовности → просмотр (без SSE)
+    - [x] Проверка на dev-кластере (с endpoint override — см. ограничение dev в TASK.md):
+          `agent1` + `http://host.docker.internal:8123`, `ready:true`, nginx logs читаются через `/api/logs`
