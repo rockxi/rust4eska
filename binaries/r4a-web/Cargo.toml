@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 r4a-core = { workspace = true }
+r4a-service = { version = "0.1.0", path = "../../crates/r4a-service" }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

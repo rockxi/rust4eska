@@ -17,7 +17,7 @@ A lightweight, self-contained cluster management system written in Rust. One mas
 
 ## Quick install
 
-Master node (installs WireGuard deps via apt/brew, generates secrets, runs as a service):
+Master node (installs WireGuard deps via apt/brew, generates secrets, runs `r4a-server` and the Web UI as services):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-server.sh | sudo bash
@@ -168,10 +168,12 @@ If something breaks, see [Troubleshooting](#troubleshooting).
 
 ### Web UI
 
-Run on the master (Linux or macOS):
+Already running as a service if you used the [Quick install](#quick-install) script. Otherwise, on the master (Linux or macOS):
 
 ```bash
-r4a-web --port 3502
+r4a-web --port 3502          # foreground, good for the first test
+# or install as a systemd (Linux) / launchd (macOS) service:
+sudo r4a-web service enable
 ```
 
 Open `http://10.42.0.1:3502` and log in with the admin secret. Use it to create/edit workload manifests visually, or manage nodes, secrets and RBAC.

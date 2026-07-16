@@ -15,15 +15,18 @@ esac
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-echo "==> Downloading r4a-server, r4a-cli, r4a-tui (${T})..."
-for bin in r4a-server r4a-cli r4a-tui; do
+echo "==> Downloading r4a-server, r4a-cli, r4a-tui, r4a-web (${T})..."
+for bin in r4a-server r4a-cli r4a-tui r4a-web; do
   curl -4 -fL --retry 3 --retry-delay 2 --connect-timeout 10 -o "$TMP/$bin" \
     "https://github.com/${REPO}/releases/latest/download/${bin}-${T}"
   chmod +x "$TMP/$bin"
 done
 
 echo "==> Installing binaries to /usr/local/bin..."
-install -m 755 "$TMP/r4a-server" "$TMP/r4a-cli" "$TMP/r4a-tui" /usr/local/bin/
+install -m 755 "$TMP/r4a-server" "$TMP/r4a-cli" "$TMP/r4a-tui" "$TMP/r4a-web" /usr/local/bin/
 
 echo "==> Bootstrapping master node (WireGuard deps, secrets, service)..."
 r4a-server install
+
+echo "==> Starting Web UI as a service (port 3502)..."
+r4a-web service enable

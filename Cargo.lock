@@ -2648,6 +2648,7 @@ dependencies = [
  "clap 4.6.1",
  "mime_guess",
  "r4a-core",
+ "r4a-service",
  "rust-embed",
  "serde",
  "serde_json",

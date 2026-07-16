@@ -17,7 +17,7 @@
 
 ## Быстрая установка
 
-Мастер-нода (ставит зависимости WireGuard через apt/brew, генерит секреты, запускает как сервис):
+Мастер-нода (ставит зависимости WireGuard через apt/brew, генерит секреты, запускает `r4a-server` и Web UI как сервисы):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-server.sh | sudo bash
@@ -168,10 +168,12 @@ r4a-cli --master http://10.42.0.1:3501 --secret <админ-секрет> nodes 
 
 ### Web UI
 
-Запускается на мастере (Linux или macOS):
+Уже запущен как сервис, если вы использовали скрипт [быстрой установки](#быстрая-установка). Иначе — на мастере (Linux или macOS):
 
 ```bash
-r4a-web --port 3502
+r4a-web --port 3502          # в форграунде, удобно для первого теста
+# либо как systemd (Linux) / launchd (macOS) сервис:
+sudo r4a-web service enable
 ```
 
 Откройте `http://10.42.0.1:3502` и войдите по админ-секрету. Здесь можно создавать/редактировать манифесты workload'ов визуально, управлять нодами, секретами и RBAC.
