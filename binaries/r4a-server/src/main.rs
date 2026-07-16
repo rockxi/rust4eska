@@ -311,6 +311,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     Init,
+    /// Ставит зависимости (WireGuard) через apt/brew, генерит секреты кластера
+    /// и запускает r4a-server как системный сервис — для быстрого первого разворачивания.
+    Install,
     JoinMaster {
         #[arg(long)]
         master: String,
@@ -424,10 +427,66 @@ async fn main() -> Result<()> {
     }
     match cli.command {
         Cmd::Init => init("10.42.0.1", None).await,
+        Cmd::Install => install(),
         Cmd::JoinMaster { master, name } => join_master(&master, name).await,
         Cmd::PruneNodes => prune_nodes().await,
         Cmd::Service { action } => handle_service(action),
     }
+}
+
+/// Best-effort dependency install: WireGuard tooling via the platform's
+/// package manager. Failures are logged but non-fatal — the user may already
+/// have these installed some other way.
+fn install_dependencies() {
+    if cfg!(target_os = "linux") {
+        info!("Installing WireGuard dependencies via apt-get...");
+        let _ = std::process::Command::new("apt-get")
+            .args(["update"])
+            .status();
+        match std::process::Command::new("apt-get")
+            .args(["install", "-y", "wireguard-tools", "iproute2", "iptables"])
+            .status()
+        {
+            Ok(s) if s.success() => info!("apt-get install succeeded"),
+            _ => warn!(
+                "apt-get install failed — install wireguard-tools, iproute2, iptables manually"
+            ),
+        }
+    } else if cfg!(target_os = "macos") {
+        info!("Installing WireGuard dependencies via brew...");
+        match std::process::Command::new("brew")
+            .args(["install", "wireguard-tools", "wireguard-go"])
+            .status()
+        {
+            Ok(s) if s.success() => info!("brew install succeeded"),
+            _ => warn!("brew install failed — install wireguard-tools, wireguard-go manually"),
+        }
+    } else {
+        warn!("Unsupported OS — install WireGuard dependencies manually");
+    }
+}
+
+/// One-shot bootstrap for a fresh master node: installs WireGuard deps,
+/// generates (or loads) the cluster identity/secrets, prints them, and
+/// starts r4a-server as a system service.
+fn install() -> Result<()> {
+    install_dependencies();
+
+    let identity = load_identity()?;
+    handle_service(ServiceAction::Enable)?;
+
+    let cluster_secret = identity.cluster_secret.clone().unwrap_or_default();
+    let admin_secret = identity.admin_secret.clone().unwrap_or_default();
+
+    println!();
+    println!("=== r4a-server installed and running ===");
+    println!("Cluster join secret (R4A_SECRET, для агентов/r4a-cli connect):");
+    println!("  {}", cluster_secret);
+    println!("Admin secret (R4A_ADMIN_SECRET, для управления через CLI/TUI/Web):");
+    println!("  {}", admin_secret);
+    println!("Сохраните оба секрета в надёжном месте — они не выводятся повторно.");
+
+    Ok(())
 }
 
 async fn prune_nodes() -> Result<()> {

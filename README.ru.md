@@ -37,6 +37,16 @@ sudo install -m 755 r4a-server r4a-agent r4a-cli r4a-tui /usr/local/bin/
 
 Общие требования (Linux и macOS): поддержка WireGuard (любое современное ядро Linux, либо `wireguard-go` на macOS) + `wireguard-tools`, `iproute2`, `iptables` на Linux; root-доступ (настройка VPN-интерфейса); Docker — только на нодах, которые будут запускать workloads.
 
+Установка пакетов:
+
+```bash
+# Ubuntu/Debian
+sudo apt update && sudo apt install -y wireguard-tools iproute2 iptables
+
+# macOS (Homebrew)
+brew install wireguard-tools wireguard-go
+```
+
 ## Настройка мастер-ноды
 
 Мастер запускает `r4a-server`: он держит WireGuard mesh (`10.42.0.0/16`), control API, DNS для `*.r4a.local`, ingress и состояние кластера. Нужен `r4a-server` (плюс `r4a-cli` / `r4a-tui` для управления) из раздела [Установка бинарников](#установка-бинарников).
@@ -49,6 +59,20 @@ sudo install -m 755 r4a-server r4a-agent r4a-cli r4a-tui /usr/local/bin/
 | `3501` | TCP | Control API (не из VPN доступны только `/` и `/api/join`) |
 
 Если мастер за домашним роутером — пробросьте `51820/udp` (и `3501/tcp`) на него. На Linux также разрешите эти порты в `iptables`/`ufw`/`firewalld`, на macOS — в Системных настройках → Firewall, если он включён.
+
+Установка в одну команду (скачивает бинарники, ставит зависимости WireGuard через apt/brew, генерит секреты, запускает как сервис):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-server.sh | sudo bash
+```
+
+Секреты будут выведены один раз в конце — сохраните их. Либо по шагам, с полным контролем:
+
+```bash
+sudo -E r4a-server install
+```
+
+Либо полностью вручную:
 
 ```bash
 export R4A_SECRET=$(openssl rand -hex 16)         # секрет кластера — передайте агентам/клиентам
@@ -75,6 +99,15 @@ R4A_MASTER=http://10.42.0.1:3501 R4A_SECRET=<админ-секрет> r4a-tui   
 ## Настройка агент-ноды
 
 Агент подключается к уже работающему мастеру и может запускать workloads (Docker-контейнеры из TOML-манифестов). Нужен `r4a-agent` (плюс Docker) из раздела [Установка бинарников](#установка-бинарников) и уже запущенный мастер.
+
+Установка в одну команду (скачивает бинарник, ставит зависимости WireGuard через apt/brew, подключается к мастеру как сервис):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-agent.sh | sudo bash -s -- \
+  --master http://<публичный-ip-мастера>:3501 --secret <секрет-кластера> --name friend1
+```
+
+Либо полностью вручную:
 
 ```bash
 sudo r4a-agent connect \

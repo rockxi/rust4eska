@@ -37,6 +37,16 @@ You don't need all four binaries on every machine — see which ones each role b
 
 General requirements (Linux and macOS): WireGuard support (any modern Linux kernel, or `wireguard-go` on macOS) + `wireguard-tools`, `iproute2`, `iptables` on Linux; root access (VPN interface setup); Docker only on nodes that will run workloads.
 
+Package installation:
+
+```bash
+# Ubuntu/Debian
+sudo apt update && sudo apt install -y wireguard-tools iproute2 iptables
+
+# macOS (Homebrew)
+brew install wireguard-tools wireguard-go
+```
+
 ## Setting up the master node
 
 The master runs `r4a-server`: it holds the WireGuard mesh (`10.42.0.0/16`), the control API, DNS for `*.r4a.local`, ingress and cluster state. Needs `r4a-server` (plus `r4a-cli` / `r4a-tui` for management) from [Installing binaries](#installing-binaries).
@@ -49,6 +59,20 @@ These ports must be reachable from outside the master:
 | `3501` | TCP | Control API (only `/` and `/api/join` are served to non-VPN IPs) |
 
 If the master is behind a home router, forward `51820/udp` (and `3501/tcp`) to it. Allow the same ports through `iptables`/`ufw`/`firewalld` on Linux, or through Firewall in System Settings on macOS, if enabled.
+
+One-liner install (downloads the binaries, installs WireGuard deps via apt/brew, generates secrets, runs as a service):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-server.sh | sudo bash
+```
+
+Secrets are printed once at the end — save them. Or step by step, with full control:
+
+```bash
+sudo -E r4a-server install
+```
+
+Or fully manual:
 
 ```bash
 export R4A_SECRET=$(openssl rand -hex 16)         # cluster join secret — share it with agents/clients
@@ -75,6 +99,15 @@ R4A_MASTER=http://10.42.0.1:3501 R4A_SECRET=<admin-secret> r4a-tui   # dashboard
 ## Setting up an agent node
 
 An agent joins an existing master and can run workloads (Docker containers reconciled from TOML manifests). Needs `r4a-agent` (plus Docker) from [Installing binaries](#installing-binaries), and a master already running.
+
+One-liner install (downloads the binary, installs WireGuard deps via apt/brew, joins the master as a service):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-agent.sh | sudo bash -s -- \
+  --master http://<master-public-ip>:3501 --secret <cluster-secret> --name friend1
+```
+
+Or fully manual:
 
 ```bash
 sudo r4a-agent connect \
