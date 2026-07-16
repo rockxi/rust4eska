@@ -87,6 +87,7 @@ fn load_identity() -> Result<Identity> {
     let path = state_dir().join("identity.json");
     let env_secret = std::env::var("R4A_SECRET").ok();
     let env_admin_secret = std::env::var("R4A_ADMIN_SECRET").ok();
+    let env_node_name = std::env::var("R4A_NODE_NAME").ok();
 
     if path.exists() {
         let data = std::fs::read_to_string(&path)?;
@@ -117,8 +118,13 @@ fn load_identity() -> Result<Identity> {
             save_identity(&id)?;
         }
 
-        if id.node_name.is_none() {
-            id.node_name = Some(System::host_name().unwrap_or_else(|| "master".to_string()));
+        if let Some(name) = env_node_name {
+            if id.node_name.as_deref() != Some(name.as_str()) {
+                id.node_name = Some(name);
+                save_identity(&id)?;
+            }
+        } else if id.node_name.is_none() {
+            id.node_name = Some("master".to_string());
             save_identity(&id)?;
         }
 
@@ -144,7 +150,7 @@ fn load_identity() -> Result<Identity> {
         cluster_secret: Some(secret),
         admin_secret: Some(admin_secret),
         agent_token: None,
-        node_name: Some(System::host_name().unwrap_or_else(|| "master".to_string())),
+        node_name: Some(env_node_name.unwrap_or_else(|| "master".to_string())),
     };
     save_identity(&id)?;
     Ok(id)
@@ -297,6 +303,9 @@ struct Cli {
     /// Нужен на облаках с 1:1 NAT (AWS/GCP), где на интерфейсе приватный IP.
     #[arg(long, global = true)]
     public_endpoint: Option<String>,
+    /// Имя мастер-ноды (по умолчанию "master"). Сохраняется в identity.json.
+    #[arg(long, global = true)]
+    node_name: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -408,6 +417,10 @@ async fn main() -> Result<()> {
     if let Some(ep) = &cli.public_endpoint {
         r4a_vpn::wireguard::validate_endpoint(ep)?;
         std::env::set_var("R4A_PUBLIC_ENDPOINT", ep);
+    }
+    if let Some(name) = &cli.node_name {
+        r4a_vpn::wireguard::validate_node_name(name)?;
+        std::env::set_var("R4A_NODE_NAME", name);
     }
     match cli.command {
         Cmd::Init => init("10.42.0.1", None).await,
@@ -626,7 +639,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     let my_node_name = identity
         .node_name
         .clone()
-        .unwrap_or_else(|| System::host_name().unwrap_or_else(|| "master".to_string()));
+        .unwrap_or_else(|| "master".to_string());
 
     let state = AppState {
         master_pub_key: identity.public_key.clone(),
@@ -910,7 +923,9 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         .route("/api/tokens/exchange", post(token_exchange_handler))
         .route(
             "/api/users",
-            get(users_list_handler).post(user_create_handler),
+            get(users_list_handler)
+                .post(user_create_handler)
+                .delete(user_delete_handler),
         )
         .route(
             "/api/git/repos",
@@ -1787,6 +1802,62 @@ async fn user_create_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(UserInfo { username }))
+}
+
+async fn user_delete_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !state
+        .store
+        .can(&auth.token.username, Verb::Delete, Resource::Tokens, None)
+    {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+
+    let username = query
+        .get("username")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing username".to_string()))?
+        .trim()
+        .to_string();
+    if username.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Missing username".to_string()));
+    }
+
+    let users_tree = state
+        .store
+        .db
+        .open_tree("users")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if users_tree
+        .remove(username.as_bytes())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, "User not found".to_string()));
+    }
+
+    let policy_id = format!("policy-user-{}", username);
+    let binding_id = format!("binding-user-{}", username);
+    state
+        .store
+        .delete("policies", policy_id.as_bytes())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state
+        .store
+        .delete("bindings", binding_id.as_bytes())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state
+        .store
+        .db
+        .flush_async()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::OK)
 }
 
 async fn metrics_handler(

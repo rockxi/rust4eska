@@ -34,6 +34,10 @@ interface Manifest {
     env: Record<string, string>;
 }
 
+interface RegistryTagInfo {
+    tag: string;
+}
+
 const emptyManifest = (): Manifest => ({
     app: { name: '', node_selector: '' },
     container: { image: '', restart: 'always', ports: [] },
@@ -55,6 +59,20 @@ const deleteManifest = async (name: string): Promise<void> => {
     await apiClient.delete(`/manifests?name=${encodeURIComponent(name)}`);
 };
 
+const fetchRegistryImages = async (): Promise<string[]> => {
+    const response = await apiClient.get('/registry/repos');
+    const repos: Array<{ name: string }> = response.data;
+    const registryHost = 'master.r4a.local:3501';
+    const tagLists = await Promise.all(
+        repos.map(async (repo) => {
+            const tagsResponse = await apiClient.get(`/registry/repos/${encodeURIComponent(repo.name)}/tags`);
+            const tags: RegistryTagInfo[] = tagsResponse.data;
+            return tags.map((tag) => `${registryHost}/${repo.name}:${tag.tag}`);
+        })
+    );
+    return tagLists.flat().sort((a, b) => a.localeCompare(b));
+};
+
 const Manifests: React.FC = () => {
     const queryClient = useQueryClient();
     const [editing, setEditing] = useState<Manifest | null>(null);
@@ -65,6 +83,13 @@ const Manifests: React.FC = () => {
         queryKey: ['manifests'],
         queryFn: fetchManifests,
         refetchInterval: 5000,
+    });
+
+    const { data: registryImages } = useQuery({
+        queryKey: ['registry-image-suggestions'],
+        queryFn: fetchRegistryImages,
+        staleTime: 10000,
+        retry: false,
     });
 
     const manifests = manifestsMap
@@ -294,6 +319,26 @@ const Manifests: React.FC = () => {
                                 </div>
                                 {editing.container && (
                                     <div className="space-y-3">
+                                        <div>
+                                            <label className="block text-xs text-gray-400 mb-1">from registry</label>
+                                            <select
+                                                value=""
+                                                onChange={e => {
+                                                    if (e.target.value) {
+                                                        updateField(['container', 'image'], e.target.value);
+                                                    }
+                                                }}
+                                                className="w-full bg-deep-dark border border-gray-700 rounded px-3 py-2 text-white text-sm font-mono focus:outline-none focus:border-accent-teal/50"
+                                            >
+                                                <option value="">Select image from registry...</option>
+                                                {(registryImages ?? []).map((image) => (
+                                                    <option key={image} value={image}>{image}</option>
+                                                ))}
+                                            </select>
+                                            {(!registryImages || registryImages.length === 0) && (
+                                                <p className="text-xs text-gray-500 mt-1">No images currently found in registry.</p>
+                                            )}
+                                        </div>
                                         <div>
                                             <label className="block text-xs text-gray-400 mb-1">image</label>
                                             <input

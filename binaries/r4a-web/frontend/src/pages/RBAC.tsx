@@ -26,6 +26,10 @@ const fetchUsers = async (): Promise<BasicUser[]> => {
     return response.data;
 };
 
+const deleteUser = async (username: string) => {
+    await apiClient.delete(`/users?username=${encodeURIComponent(username)}`);
+};
+
 const deleteToken = async (id: string) => {
     await apiClient.delete(`/tokens?id=${id}`);
 };
@@ -83,6 +87,13 @@ const RBAC: React.FC = () => {
             setIsUserModalOpen(false);
             setNewUserUsername('');
             setNewUserPassword('');
+        },
+    });
+
+    const deleteUserMutation = useMutation({
+        mutationFn: deleteUser,
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['basic-users'] });
         },
     });
 
@@ -235,17 +246,31 @@ const RBAC: React.FC = () => {
                     <thead>
                         <tr className="bg-gray-800/50 border-b border-gray-800 text-gray-400 text-sm uppercase tracking-wider">
                             <th className="p-4 font-medium">Username</th>
+                            <th className="p-4 font-medium text-right">Actions</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-800">
                         {!users || users.length === 0 ? (
                             <tr>
-                                <td className="p-8 text-center text-gray-500">No basic-auth users found.</td>
+                                <td colSpan={2} className="p-8 text-center text-gray-500">No basic-auth users found.</td>
                             </tr>
                         ) : (
                             users.map((user) => (
                                 <tr key={user.username} className="hover:bg-gray-800/30 transition-colors">
                                     <td className="p-4 text-white font-medium">{user.username}</td>
+                                    <td className="p-4 text-right">
+                                        <button
+                                            onClick={() => {
+                                                if (window.confirm(`Delete basic-auth user ${user.username}?`)) {
+                                                    deleteUserMutation.mutate(user.username);
+                                                }
+                                            }}
+                                            className="text-gray-500 hover:text-red-400 transition-colors p-2 rounded hover:bg-red-400/10"
+                                            title="Delete User"
+                                        >
+                                            <Trash2 className="w-5 h-5" />
+                                        </button>
+                                    </td>
                                 </tr>
                             ))
                         )}

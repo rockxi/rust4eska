@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronDown, ChevronRight, HardDrive, Package, Tag, Trash2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, Copy, HardDrive, Package, Tag, Trash2 } from 'lucide-react';
 import axios from 'axios';
 import apiClient from '../api/client';
 
@@ -183,11 +183,26 @@ const RepoCard: React.FC<{ repo: RegistryRepoInfo }> = ({ repo }) => {
 };
 
 const Registry: React.FC = () => {
+  const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
   const { data: repos, isLoading, isError, error } = useQuery({
     queryKey: ['registry-repos'],
     queryFn: fetchRepos,
     refetchInterval: 10000,
   });
+
+  const registryHost = `${window.location.hostname}:3501`;
+  const exampleRepo = 'demo/myapp';
+  const loginCommand = `docker login ${registryHost}`;
+  const tagCommand = `docker tag nginx:alpine ${registryHost}/${exampleRepo}:latest`;
+  const pushCommand = `docker push ${registryHost}/${exampleRepo}:latest`;
+  const pullCommand = `docker pull ${registryHost}/${exampleRepo}:latest`;
+  const manifestImage = `${registryHost}/${exampleRepo}:latest`;
+
+  const copyCommand = async (command: string) => {
+    await navigator.clipboard.writeText(command);
+    setCopiedCommand(command);
+    window.setTimeout(() => setCopiedCommand(null), 1500);
+  };
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
@@ -195,6 +210,30 @@ const Registry: React.FC = () => {
         <div>
           <h1 className="text-3xl font-bold text-white tracking-tight">Registry</h1>
           <p className="text-text-silver mt-2">Container repositories, tags and delete actions from Web UI</p>
+        </div>
+      </div>
+
+      <div className="bg-slate-dark border border-gray-800 rounded-lg p-5 mb-6">
+        <h2 className="text-lg font-bold text-white mb-2">How To Push</h2>
+        <p className="text-sm text-gray-400 mb-4">
+          Create a basic-auth user in <span className="text-white font-medium">RBAC</span>, then use standard Docker commands against this registry endpoint.
+        </p>
+        <div className="space-y-3">
+          {[loginCommand, tagCommand, pushCommand, pullCommand].map((command) => (
+            <div key={command} className="flex items-center gap-2 bg-deep-dark border border-gray-700 rounded px-3 py-2">
+              <code className="text-sm text-gray-300 font-mono flex-1 overflow-x-auto">{command}</code>
+              <button
+                onClick={() => copyCommand(command)}
+                className="text-gray-400 hover:text-white transition-colors p-1"
+                title="Copy command"
+              >
+                <Copy className={`w-4 h-4 ${copiedCommand === command ? 'text-accent-teal' : ''}`} />
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="mt-4 text-sm text-gray-500">
+          Manifest image example: <code className="text-gray-300 font-mono">{manifestImage}</code>
         </div>
       </div>
 
