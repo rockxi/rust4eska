@@ -419,7 +419,9 @@ impl ApiClient {
         pubkey: &str,
         label: Option<&str>,
     ) -> Result<ConnectResponse> {
-        self.ensure_token().await?;
+        // No ensure_token(): the cluster (join) secret authenticates connect
+        // directly on the server, same trust level as agents via /api/join —
+        // this must work without an admin secret to exchange for a token.
         Ok(self
             .authenticated_post(format!("{}/api/connections", self.base_url))
             .json(&ConnectRequest {
@@ -434,7 +436,6 @@ impl ApiClient {
     }
 
     pub async fn connection_delete(&self, id: &str) -> Result<()> {
-        self.ensure_token().await?;
         self.authenticated_delete(format!("{}/api/connections/{}", self.base_url, id))
             .send()
             .await?
@@ -443,7 +444,6 @@ impl ApiClient {
     }
 
     pub async fn connection_heartbeat(&self, id: &str) -> Result<()> {
-        self.ensure_token().await?;
         self.authenticated_post(format!(
             "{}/api/connections/{}/heartbeat",
             self.base_url, id

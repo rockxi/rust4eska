@@ -3435,19 +3435,21 @@ async fn connections_list_handler(
 
 async fn connect_handler(
     State(state): State<AppState>,
-    auth: RequireToken,
+    auth: Auth,
     Json(req): Json<ConnectRequest>,
 ) -> Result<Json<ConnectResponse>, (StatusCode, String)> {
-    if !state.store.can(
-        &auth.token.username,
-        Verb::Create,
-        Resource::Connections,
-        None,
-    ) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Insufficient permissions".to_string(),
-        ));
+    // Cluster (join) secret grants connect access directly, same trust level as
+    // agents via /api/join. A Bearer token still goes through RBAC.
+    if let Auth::Token(token) = &auth {
+        if !state
+            .store
+            .can(&token.username, Verb::Create, Resource::Connections, None)
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Insufficient permissions".to_string(),
+            ));
+        }
     }
 
     r4a_vpn::wireguard::validate_wg_pubkey(&req.pubkey)
@@ -3544,19 +3546,19 @@ async fn connect_handler(
 
 async fn disconnect_handler(
     State(state): State<AppState>,
-    auth: RequireToken,
+    auth: Auth,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    if !state.store.can(
-        &auth.token.username,
-        Verb::Delete,
-        Resource::Connections,
-        None,
-    ) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Insufficient permissions".to_string(),
-        ));
+    if let Auth::Token(token) = &auth {
+        if !state
+            .store
+            .can(&token.username, Verb::Delete, Resource::Connections, None)
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Insufficient permissions".to_string(),
+            ));
+        }
     }
 
     let conn = state
@@ -3580,19 +3582,19 @@ async fn disconnect_handler(
 
 async fn connection_heartbeat_handler(
     State(state): State<AppState>,
-    auth: RequireToken,
+    auth: Auth,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    if !state.store.can(
-        &auth.token.username,
-        Verb::Update,
-        Resource::Connections,
-        None,
-    ) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Insufficient permissions".to_string(),
-        ));
+    if let Auth::Token(token) = &auth {
+        if !state
+            .store
+            .can(&token.username, Verb::Update, Resource::Connections, None)
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Insufficient permissions".to_string(),
+            ));
+        }
     }
 
     let now = std::time::SystemTime::now()

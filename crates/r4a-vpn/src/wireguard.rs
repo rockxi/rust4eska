@@ -387,11 +387,21 @@ fn bring_up_macos(conf_path: &str) -> Result<()> {
     // Wait for the utun interface to appear
     wait_for_iface(&iface).with_context(|| format!("wireguard-go failed to create {}", iface))?;
 
-    // Load the config (private key + peer)
-    run(&wg_bin, &["setconf", &iface, conf_path]).context("wg setconf failed")?;
-
-    // Parse the Address= from the conf file to assign to the interface
+    // `wg setconf` (unlike wg-quick) only understands PrivateKey/ListenPort/FwMark
+    // and [Peer] fields — Address= is a wg-quick-only extension and must be
+    // stripped before loading, or it fails with "Line unrecognized".
     let conf_text = std::fs::read_to_string(conf_path).context("read wg conf")?;
+    let setconf_text: String = conf_text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("Address"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let setconf_path = format!("{}.setconf", conf_path);
+    std::fs::write(&setconf_path, &setconf_text).context("write stripped wg conf")?;
+
+    run(&wg_bin, &["setconf", &iface, &setconf_path]).context("wg setconf failed")?;
+
+    // Parse the Address= from the original conf file to assign to the interface
     let vpn_ip = conf_text
         .lines()
         .find(|l| l.trim_start().starts_with("Address"))
