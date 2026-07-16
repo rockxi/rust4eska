@@ -12,6 +12,11 @@ pub struct Identity {
     #[serde(default)]
     pub admin_secret: Option<String>,
     pub agent_token: Option<String>,
+    // Stable logical node name, persisted once so it survives container
+    // recreation (Docker's default hostname changes on recreate, which broke
+    // r4a.node container labels and node-name comparisons across restarts).
+    #[serde(default)]
+    pub node_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

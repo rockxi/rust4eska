@@ -9,11 +9,20 @@ interface Token {
     created_at: number;
 }
 
+interface BasicUser {
+    username: string;
+}
+
 const VERBS = ['get', 'list', 'create', 'update', 'delete', 'all'];
-const RESOURCES = ['nodes', 'manifests', 'vault', 'git_repos', 'tokens', 'policies', 'bindings', 'all'];
+const RESOURCES = ['nodes', 'manifests', 'vault', 'git_repos', 'registry', 'tokens', 'policies', 'bindings', 'all'];
 
 const fetchTokens = async (): Promise<Token[]> => {
     const response = await apiClient.get('/tokens');
+    return response.data;
+};
+
+const fetchUsers = async (): Promise<BasicUser[]> => {
+    const response = await apiClient.get('/users');
     return response.data;
 };
 
@@ -26,17 +35,30 @@ const createToken = async (data: { username: string; verbs: string[]; resources:
     return response.data;
 };
 
+const createUser = async (data: { username: string; password: string; verbs: string[]; resources: string[] }) => {
+    const response = await apiClient.post('/users', data);
+    return response.data;
+};
+
 const RBAC: React.FC = () => {
     const queryClient = useQueryClient();
     const [isModalOpen, setIsModalOpen] = useState(false);
+    const [isUserModalOpen, setIsUserModalOpen] = useState(false);
     const [newTokenUsername, setNewTokenUsername] = useState('');
     const [selectedVerbs, setSelectedVerbs] = useState<string[]>([]);
     const [selectedResources, setSelectedResources] = useState<string[]>([]);
     const [createdTokenId, setCreatedTokenId] = useState<string | null>(null);
+    const [newUserUsername, setNewUserUsername] = useState('');
+    const [newUserPassword, setNewUserPassword] = useState('');
 
     const { data: tokens, isLoading, isError } = useQuery({
         queryKey: ['tokens'],
         queryFn: fetchTokens,
+    });
+
+    const { data: users } = useQuery({
+        queryKey: ['basic-users'],
+        queryFn: fetchUsers,
     });
 
     const deleteMutation = useMutation({
@@ -51,6 +73,16 @@ const RBAC: React.FC = () => {
         onSuccess: (data) => {
             queryClient.invalidateQueries({ queryKey: ['tokens'] });
             setCreatedTokenId(data.id || 'Token created successfully');
+        },
+    });
+
+    const createUserMutation = useMutation({
+        mutationFn: createUser,
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['basic-users'] });
+            setIsUserModalOpen(false);
+            setNewUserUsername('');
+            setNewUserPassword('');
         },
     });
 
@@ -97,6 +129,13 @@ const RBAC: React.FC = () => {
         createMutation.reset();
     };
 
+    const resetUserModal = () => {
+        setIsUserModalOpen(false);
+        setNewUserUsername('');
+        setNewUserPassword('');
+        createUserMutation.reset();
+    };
+
     const formatDate = (timestamp: number) => {
         return new Date(timestamp * 1000).toLocaleString();
     };
@@ -117,6 +156,13 @@ const RBAC: React.FC = () => {
                 >
                     <Plus className="w-5 h-5" />
                     Create Token
+                </button>
+                <button
+                    onClick={() => setIsUserModalOpen(true)}
+                    className="bg-gray-800 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded flex items-center gap-2 transition-colors"
+                >
+                    <Key className="w-5 h-5" />
+                    Create Registry User
                 </button>
             </div>
 
@@ -179,6 +225,33 @@ const RBAC: React.FC = () => {
                     </table>
                 </div>
             )}
+
+            <div className="mt-8 bg-slate-dark border border-gray-800 rounded-lg overflow-hidden shadow-lg">
+                <div className="p-4 border-b border-gray-800">
+                    <h2 className="text-lg font-bold text-white">Basic Auth Users</h2>
+                    <p className="text-sm text-gray-500 mt-1">Use these credentials for `docker login` against the registry.</p>
+                </div>
+                <table className="w-full text-left border-collapse">
+                    <thead>
+                        <tr className="bg-gray-800/50 border-b border-gray-800 text-gray-400 text-sm uppercase tracking-wider">
+                            <th className="p-4 font-medium">Username</th>
+                        </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-800">
+                        {!users || users.length === 0 ? (
+                            <tr>
+                                <td className="p-8 text-center text-gray-500">No basic-auth users found.</td>
+                            </tr>
+                        ) : (
+                            users.map((user) => (
+                                <tr key={user.username} className="hover:bg-gray-800/30 transition-colors">
+                                    <td className="p-4 text-white font-medium">{user.username}</td>
+                                </tr>
+                            ))
+                        )}
+                    </tbody>
+                </table>
+            </div>
 
             {isModalOpen && (
                 <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
@@ -290,6 +363,79 @@ const RBAC: React.FC = () => {
                                 </button>
                             )}
                         </div>
+                    </div>
+                </div>
+            )}
+
+            {isUserModalOpen && (
+                <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                    <div className="bg-slate-dark border border-gray-800 rounded-lg shadow-2xl w-full max-w-lg overflow-hidden">
+                        <div className="flex justify-between items-center p-6 border-b border-gray-800">
+                            <h2 className="text-xl font-bold text-white">Create Registry User</h2>
+                            <button onClick={resetUserModal} className="text-gray-400 hover:text-white transition-colors">
+                                <X className="w-6 h-6" />
+                            </button>
+                        </div>
+                        <form
+                            onSubmit={(e) => {
+                                e.preventDefault();
+                                createUserMutation.mutate({
+                                    username: newUserUsername,
+                                    password: newUserPassword,
+                                    verbs: ['create', 'update', 'delete', 'list', 'get'],
+                                    resources: ['registry'],
+                                });
+                            }}
+                            className="p-6 space-y-5"
+                        >
+                            <div>
+                                <label className="block text-sm font-medium text-gray-300 mb-2">Username</label>
+                                <input
+                                    type="text"
+                                    required
+                                    value={newUserUsername}
+                                    onChange={(e) => setNewUserUsername(e.target.value)}
+                                    className="w-full bg-deep-dark border border-gray-700 rounded p-3 text-white focus:outline-none focus:border-accent-teal transition-colors"
+                                    placeholder="e.g. registry-ci"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-gray-300 mb-2">Password</label>
+                                <input
+                                    type="password"
+                                    required
+                                    minLength={8}
+                                    value={newUserPassword}
+                                    onChange={(e) => setNewUserPassword(e.target.value)}
+                                    className="w-full bg-deep-dark border border-gray-700 rounded p-3 text-white focus:outline-none focus:border-accent-teal transition-colors"
+                                    placeholder="At least 8 characters"
+                                />
+                            </div>
+                            <div className="text-sm text-gray-500">
+                                This user gets registry-only permissions for `docker login`, `docker push` and `docker pull`.
+                            </div>
+                            {createUserMutation.isError && (
+                                <div className="text-red-400 text-sm bg-red-900/20 p-3 rounded border border-red-500/30">
+                                    Failed to create user. Username may already exist.
+                                </div>
+                            )}
+                            <div className="flex justify-end gap-3 pt-2">
+                                <button
+                                    type="button"
+                                    onClick={resetUserModal}
+                                    className="px-4 py-2 rounded text-gray-300 hover:text-white hover:bg-gray-800 transition-colors"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    type="submit"
+                                    disabled={createUserMutation.isPending || !newUserUsername || !newUserPassword}
+                                    className="bg-accent-teal hover:bg-accent-teal/80 text-deep-dark font-bold py-2 px-6 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                                >
+                                    {createUserMutation.isPending ? 'Creating...' : 'Create User'}
+                                </button>
+                            </div>
+                        </form>
                     </div>
                 </div>
             )}

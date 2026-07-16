@@ -95,6 +95,7 @@ fn load_identity(secret: Option<String>) -> Result<Identity> {
         cluster_secret: secret,
         admin_secret: None,
         agent_token: None,
+        node_name: None,
     };
     save_identity(&id)?;
     info!("Saved identity to {}", path.display());

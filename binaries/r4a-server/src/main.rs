@@ -1,4 +1,5 @@
 use anyhow::Result;
+use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -116,6 +117,11 @@ fn load_identity() -> Result<Identity> {
             save_identity(&id)?;
         }
 
+        if id.node_name.is_none() {
+            id.node_name = Some(System::host_name().unwrap_or_else(|| "master".to_string()));
+            save_identity(&id)?;
+        }
+
         info!("Loaded existing identity, public key: {}", id.public_key);
         return Ok(id);
     }
@@ -138,6 +144,7 @@ fn load_identity() -> Result<Identity> {
         cluster_secret: Some(secret),
         admin_secret: Some(admin_secret),
         agent_token: None,
+        node_name: Some(System::host_name().unwrap_or_else(|| "master".to_string())),
     };
     save_identity(&id)?;
     Ok(id)
@@ -149,6 +156,7 @@ struct AppState {
     cluster_secret: String,
     admin_secret: String,
     my_vpn_ip: String,
+    my_node_name: String,
     peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
     next_ip: Arc<Mutex<u16>>,
     update_pending: Arc<Mutex<bool>>,
@@ -439,8 +447,12 @@ fn handle_service(action: ServiceAction) -> Result<()> {
 async fn join_master(first_master_url: &str, name: Option<String>) -> Result<()> {
     let identity = load_identity()?;
     let my_endpoint = public_endpoint();
-    let my_name =
-        name.unwrap_or_else(|| System::host_name().unwrap_or_else(|| "master-node".to_string()));
+    let my_name = name.unwrap_or_else(|| {
+        identity
+            .node_name
+            .clone()
+            .unwrap_or_else(|| "master-node".to_string())
+    });
 
     info!("Joining existing master at {}...", first_master_url);
     let client = reqwest::Client::new();
@@ -516,7 +528,10 @@ async fn init(my_vpn_ip: &str, _store: Option<Store>) -> Result<()> {
 
     let mut peers = load_peers(&store);
     let my_endpoint = public_endpoint();
-    let my_name = System::host_name().unwrap_or_else(|| "master".to_string());
+    let my_name = identity
+        .node_name
+        .clone()
+        .unwrap_or_else(|| "master".to_string());
 
     if !peers.contains_key(&identity.public_key) {
         peers.insert(
@@ -608,11 +623,17 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
 
     let log_store = r4a_telemetry::store::LogStore::open(state_dir().join("logs-db"))?;
 
+    let my_node_name = identity
+        .node_name
+        .clone()
+        .unwrap_or_else(|| System::host_name().unwrap_or_else(|| "master".to_string()));
+
     let state = AppState {
         master_pub_key: identity.public_key.clone(),
         cluster_secret: cluster_secret.clone(),
         admin_secret,
         my_vpn_ip: my_vpn_ip.clone(),
+        my_node_name: my_node_name.clone(),
         peers: Arc::new(Mutex::new(saved_peers)),
         next_ip: Arc::new(Mutex::new(next_ip)),
         update_pending: Arc::new(Mutex::new(false)),
@@ -658,7 +679,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     // historically only agents reconciled "all", and changing that would move
     // arbitrary workloads onto the control-plane node.
     let master_reconcile_store = store.clone();
-    let master_reconcile_name = System::host_name().unwrap_or_else(|| "master".to_string());
+    let master_reconcile_name = my_node_name.clone();
     let master_reconcile_ip = my_vpn_ip.clone();
     tokio::spawn(async move {
         let reconciler =
@@ -695,7 +716,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     // Agents run their own collector; master needs one now that it can host
     // system workloads such as ClickHouse.
     tokio::spawn(r4a_telemetry::collector::run_collector(
-        System::host_name().unwrap_or_else(|| "master".to_string()),
+        my_node_name.clone(),
         "http://127.0.0.1:3501".to_string(),
         cluster_secret.clone(),
         state_dir().join("logs-state.json"),
@@ -764,7 +785,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
             .build()
             .unwrap_or_default();
         let mut sys = System::new_all();
-        let my_name = System::host_name().unwrap_or_else(|| "master".to_string());
+        let my_name = broadcast_state.my_node_name.clone();
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             sys.refresh_all();
@@ -887,7 +908,10 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
                 .delete(token_delete_handler),
         )
         .route("/api/tokens/exchange", post(token_exchange_handler))
-        .route("/api/users", get(users_list_handler))
+        .route(
+            "/api/users",
+            get(users_list_handler).post(user_create_handler),
+        )
         .route(
             "/api/git/repos",
             get(git_repos_handler).post(git_create_repo_handler),
@@ -963,7 +987,7 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         .nest_service(
             "/v2",
             Router::new()
-                .route("/", any(r4a_git_registry::registry::registry_handler))
+                .route("/", any(r4a_git_registry::registry::registry_root_handler))
                 .route("/*path", any(r4a_git_registry::registry::registry_handler))
                 .with_state(r4a_git_registry::RegistryState::new(
                     r4a_git_registry::default_registry_root(),
@@ -1539,6 +1563,21 @@ struct TokenCreateRequest {
     resource_names: Option<Vec<String>>,
 }
 
+#[derive(Deserialize)]
+struct UserCreateRequest {
+    username: String,
+    password: String,
+    verbs: Vec<Verb>,
+    resources: Vec<Resource>,
+    #[serde(default)]
+    resource_names: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct UserInfo {
+    username: String,
+}
+
 async fn token_create_handler(
     State(state): State<AppState>,
     auth: RequireToken,
@@ -1628,7 +1667,7 @@ async fn token_delete_handler(
 async fn users_list_handler(
     State(state): State<AppState>,
     auth: RequireToken,
-) -> Result<Json<Vec<User>>, (StatusCode, String)> {
+) -> Result<Json<Vec<UserInfo>>, (StatusCode, String)> {
     if !state
         .store
         .can(&auth.token.username, Verb::List, Resource::Tokens, None)
@@ -1646,11 +1685,108 @@ async fn users_list_handler(
     for item in tree.iter() {
         if let Ok((_, v)) = item {
             if let Ok(user) = serde_json::from_slice::<User>(&v) {
-                users.push(user);
+                users.push(UserInfo {
+                    username: user.username,
+                });
             }
         }
     }
     Ok(Json(users))
+}
+
+async fn user_create_handler(
+    State(state): State<AppState>,
+    auth: RequireToken,
+    Json(req): Json<UserCreateRequest>,
+) -> Result<Json<UserInfo>, (StatusCode, String)> {
+    if !state
+        .store
+        .can(&auth.token.username, Verb::Create, Resource::Tokens, None)
+    {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+
+    let username = req.username.trim().to_string();
+    if username.is_empty()
+        || username.len() > 64
+        || !username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid username".to_string()));
+    }
+    if req.password.len() < 8 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Password must be at least 8 characters".to_string(),
+        ));
+    }
+
+    let users_tree = state
+        .store
+        .db
+        .open_tree("users")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if users_tree
+        .get(username.as_bytes())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some()
+    {
+        return Err((StatusCode::CONFLICT, "User already exists".to_string()));
+    }
+
+    let salt = SaltString::generate(&mut rand::rngs::OsRng);
+    let password_hash = Argon2::default()
+        .hash_password(req.password.as_bytes(), &salt)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .to_string();
+
+    let policy_id = format!("policy-user-{}", username);
+    let binding_id = format!("binding-user-{}", username);
+    let policy = Policy {
+        id: policy_id.clone(),
+        rules: vec![Rule {
+            verbs: req.verbs,
+            resources: req.resources,
+            resource_names: req.resource_names,
+        }],
+    };
+    state
+        .store
+        .put_policy(policy)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let binding = Binding {
+        id: binding_id,
+        subject: username.clone(),
+        policy_id,
+    };
+    state
+        .store
+        .put_binding(binding)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let user = User {
+        username: username.clone(),
+        password_hash,
+    };
+    users_tree
+        .insert(
+            username.as_bytes(),
+            serde_json::to_vec(&user)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state
+        .store
+        .db
+        .flush_async()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(UserInfo { username }))
 }
 
 async fn metrics_handler(
@@ -1735,7 +1871,7 @@ async fn nodes_handler(
     }
     let mut sys = System::new_all();
     sys.refresh_all();
-    let master_name = System::host_name().unwrap_or_else(|| "master".to_string());
+    let master_name = state.my_node_name.clone();
     let (master_vram_used, master_vram_total) = query_vram();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2821,8 +2957,7 @@ fn find_peer_ip(state: &AppState, node_name: &str) -> Option<String> {
 }
 
 fn is_current_master_node(state: &AppState, node_name: &str) -> bool {
-    let master_name = System::host_name().unwrap_or_else(|| "master".to_string());
-    node_name == master_name || node_name == state.my_vpn_ip
+    node_name == state.my_node_name || node_name == state.my_vpn_ip
 }
 
 #[derive(Serialize)]
@@ -2844,10 +2979,9 @@ async fn master_containers(
 ) -> Result<Json<Vec<ContainerInfo>>, (StatusCode, String)> {
     let docker = master_docker().await?;
     let mut filters = HashMap::new();
-    let master_name = System::host_name().unwrap_or_else(|| "master".to_string());
     filters.insert(
         "label".to_string(),
-        vec![format!("r4a.node={}", master_name)],
+        vec![format!("r4a.node={}", state.my_node_name)],
     );
     let opts = ListContainersOptions {
         all: true,
@@ -3535,8 +3669,7 @@ async fn logs_setup_handler(
         return Err((StatusCode::BAD_REQUEST, "node is required".to_string()));
     }
 
-    let master_name = System::host_name().unwrap_or_else(|| "master".to_string());
-    let node_ip = if node == master_name || node == state.my_vpn_ip {
+    let node_ip = if node == state.my_node_name || node == state.my_vpn_ip {
         state.my_vpn_ip.clone()
     } else {
         let peers = state.peers.lock().unwrap();

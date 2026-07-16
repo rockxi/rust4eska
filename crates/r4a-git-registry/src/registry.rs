@@ -68,6 +68,34 @@ pub async fn registry_handler(
         Ok(resp) => resp,
         Err(err) => {
             warn!("registry error: {err:#}");
+            if let Some(status) = err.downcast_ref::<StatusCode>() {
+                return match *status {
+                    StatusCode::UNAUTHORIZED => unauthorized_response(),
+                    s => error_response(s, "registry error"),
+                };
+            }
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "registry error")
+        }
+    }
+}
+
+pub async fn registry_root_handler(
+    State(state): State<RegistryState>,
+    method: Method,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    match handle_request(state, method, String::new(), query, headers, req).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            warn!("registry error: {err:#}");
+            if let Some(status) = err.downcast_ref::<StatusCode>() {
+                return match *status {
+                    StatusCode::UNAUTHORIZED => unauthorized_response(),
+                    s => error_response(s, "registry error"),
+                };
+            }
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "registry error")
         }
     }
@@ -84,17 +112,24 @@ async fn handle_request(
     ensure_layout(&state.root).await?;
 
     if path.is_empty() {
-        if method == Method::GET || method == Method::HEAD {
-            return Ok(with_standard_headers(
+        let auth = match authenticate(&state, &headers)? {
+            Some(auth) => auth,
+            None => return Ok(unauthorized_response()),
+        };
+        if !matches!(method, Method::GET | Method::HEAD) {
+            ensure_write_allowed(&state, &auth)?;
+        }
+        return match method {
+            Method::GET | Method::HEAD => Ok(with_standard_headers(
                 Response::builder()
                     .status(StatusCode::OK)
                     .body(Body::empty())?,
-            ));
-        }
-        return Ok(error_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method not allowed",
-        ));
+            )),
+            _ => Ok(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            )),
+        };
     }
 
     let auth = match authenticate(&state, &headers)? {
@@ -226,7 +261,7 @@ fn ensure_write_allowed(state: &RegistryState, auth: &AuthIdentity) -> Result<()
     if allowed {
         Ok(())
     } else {
-        bail!("registry write forbidden for {}", username);
+        Err(anyhow!(StatusCode::FORBIDDEN))
     }
 }
 
@@ -489,12 +524,12 @@ fn resolve_manifest(state: &RegistryState, repo: &str, reference: &str) -> Resul
         reference.to_string()
     } else {
         let Some(raw) = tree.get(tag_key(repo, reference).as_bytes())? else {
-            bail!("manifest tag not found");
+            return Err(anyhow!(StatusCode::NOT_FOUND));
         };
         String::from_utf8(raw.to_vec())?
     };
     let Some(raw) = tree.get(manifest_key(repo, &digest).as_bytes())? else {
-        bail!("manifest digest not found");
+        return Err(anyhow!(StatusCode::NOT_FOUND));
     };
     Ok(serde_json::from_slice(&raw)?)
 }
