@@ -15,6 +15,23 @@
 - **Дашборды** — терминальный UI (`r4a-tui`) и веб-интерфейс на React (`r4a-web`).
 - **Обновление кластера** — одна клавиша в TUI обновляет подписанные бинарники по всему кластеру.
 
+## Быстрая установка
+
+Мастер-нода (ставит зависимости WireGuard через apt/brew, генерит секреты, запускает как сервис):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-server.sh | sudo bash
+```
+
+Агент-нода (подключается к уже работающему мастеру):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-agent.sh | sudo bash -s -- \
+  --master http://<публичный-ip-мастера>:3501 --secret <секрет-кластера> --name friend1
+```
+
+Подробности и ручной пошаговый вариант — в разделах [Настройка мастер-ноды](#настройка-мастер-ноды) и [Настройка агент-ноды](#настройка-агент-ноды) ниже.
+
 ## Установка бинарников
 
 Каждая роль ниже начинается со скачивания нужных ей бинарников из [GitHub Releases](https://github.com/rockxi/rust4eska/releases), для Linux (x86_64, статическая musl-сборка) и macOS (x86_64 / arm64):

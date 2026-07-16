@@ -15,6 +15,23 @@ A lightweight, self-contained cluster management system written in Rust. One mas
 - **Dashboards** — terminal UI (`r4a-tui`) and a React Web UI (`r4a-web`).
 - **Cluster updates** — one keypress in the TUI updates signed binaries across the whole cluster.
 
+## Quick install
+
+Master node (installs WireGuard deps via apt/brew, generates secrets, runs as a service):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-server.sh | sudo bash
+```
+
+Agent node (joins an already-running master):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-agent.sh | sudo bash -s -- \
+  --master http://<master-public-ip>:3501 --secret <cluster-secret> --name friend1
+```
+
+See [Setting up the master node](#setting-up-the-master-node) and [Setting up an agent node](#setting-up-an-agent-node) below for details and the manual step-by-step path.
+
 ## Installing binaries
 
 Every role below starts by downloading the binaries it needs from [GitHub Releases](https://github.com/rockxi/rust4eska/releases), for Linux (x86_64, static musl) and macOS (x86_64 / arm64):
