@@ -33,7 +33,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "==> Downloading r4a-agent (${T})..."
-curl -fL -o "$TMP/r4a-agent" "https://github.com/${REPO}/releases/latest/download/r4a-agent-${T}"
+curl -4 -fL --retry 3 --retry-delay 2 --connect-timeout 10 -o "$TMP/r4a-agent" \
+  "https://github.com/${REPO}/releases/latest/download/r4a-agent-${T}"
 chmod +x "$TMP/r4a-agent"
 
 echo "==> Installing binary to /usr/local/bin..."

@@ -17,7 +17,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 echo "==> Downloading r4a-server, r4a-cli, r4a-tui (${T})..."
 for bin in r4a-server r4a-cli r4a-tui; do
-  curl -fL -o "$TMP/$bin" "https://github.com/${REPO}/releases/latest/download/${bin}-${T}"
+  curl -4 -fL --retry 3 --retry-delay 2 --connect-timeout 10 -o "$TMP/$bin" \
+    "https://github.com/${REPO}/releases/latest/download/${bin}-${T}"
   chmod +x "$TMP/$bin"
 done
 
