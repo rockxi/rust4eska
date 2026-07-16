@@ -40,6 +40,16 @@ If the master is behind a home router, forward `51820/udp` (and `3501/tcp`) to i
 Download from [GitHub Releases](https://github.com/rockxi/rust4eska/releases) and install:
 
 ```bash
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64)  T=x86_64-linux-musl ;;
+  Darwin-x86_64) T=x86_64-macos ;;
+  Darwin-arm64)  T=aarch64-macos ;;
+  *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+for bin in r4a-server r4a-agent r4a-cli r4a-tui; do
+  curl -fL -o "$bin" "https://github.com/rockxi/rust4eska/releases/latest/download/${bin}-${T}"
+  chmod +x "$bin"
+done
 sudo install -m 755 r4a-server r4a-agent r4a-cli r4a-tui /usr/local/bin/
 ```
 
