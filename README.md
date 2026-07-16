@@ -48,8 +48,9 @@ sudo install -m 755 r4a-server r4a-agent r4a-cli r4a-tui /usr/local/bin/
 ### 2. Start the master
 
 ```bash
-export R4A_SECRET=$(openssl rand -hex 16)   # the cluster join secret — share it with your friend
-echo "cluster secret: $R4A_SECRET"
+export R4A_SECRET=$(openssl rand -hex 16)         # cluster join secret — share it with your friend
+export R4A_ADMIN_SECRET=$(openssl rand -hex 16)   # admin secret — for CLI/TUI/Web UI management (keep private)
+echo "cluster secret: $R4A_SECRET"; echo "admin secret: $R4A_ADMIN_SECRET"
 
 # If behind NAT, tell agents your public endpoint:
 export R4A_PUBLIC_ENDPOINT=<your-public-ip>:51820
@@ -88,8 +89,9 @@ r4a-cli connect status
 ```bash
 # on any connected machine:
 ping 10.42.0.1                      # master over VPN
-r4a-cli --master http://10.42.0.1:3501 --secret <cluster-secret> nodes list
-R4A_MASTER=http://10.42.0.1:3501 r4a-tui   # dashboard; "P2P" column shows direct links
+# management commands use the ADMIN secret (not the cluster secret):
+r4a-cli --master http://10.42.0.1:3501 --secret <admin-secret> nodes list
+R4A_MASTER=http://10.42.0.1:3501 R4A_SECRET=<admin-secret> r4a-tui   # dashboard; "P2P" column shows direct links
 ```
 
 Web UI (optional, run on the master): `r4a-web --port 3502` → `http://10.42.0.1:3502`.
@@ -101,8 +103,11 @@ If something breaks, see [Troubleshooting](#troubleshooting).
 Workloads are described by TOML manifests (see `postgres.toml` for an example) and reconciled into Docker containers on the agents. Create/edit manifests in the **Web UI** or **TUI**, or via the API:
 
 ```bash
+# exchange the admin secret for a bearer token, then POST the manifest:
+TOKEN=$(curl -s -X POST http://10.42.0.1:3501/api/tokens/exchange \
+  -H "X-R4A-Secret: <admin-secret>" | jq -r .id)
 curl -X POST http://10.42.0.1:3501/api/manifests \
-  -H "Authorization: Bearer <secret-or-token>" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d @manifest.json
 r4a-cli manifests list        # view deployed manifests
 ```
@@ -119,9 +124,9 @@ make dev-deploy    # recompile and sync binaries into running containers
 make dev-down
 ```
 
-- Web UI: `http://localhost:3502` — secret `test_secret_for_cluster_123`
+- Web UI: `http://localhost:3502` — login with admin secret `test_admin_secret_456`
 - API: `http://localhost:3501`, ingress: `http://localhost:3500`
-- TUI: `R4A_MASTER=http://localhost:3501 r4a-tui` or `docker exec -it node-master r4a-tui`
+- TUI: `R4A_MASTER=http://localhost:3501 R4A_SECRET=test_admin_secret_456 r4a-tui` or `docker exec -it node-master r4a-tui`
 
 Requirements: Rust stable, Node.js (frontend), Docker, musl target (`rustup target add x86_64-unknown-linux-musl`).
 
@@ -145,7 +150,7 @@ Requirements: Rust stable, Node.js (frontend), Docker, musl target (`rustup targ
 | Variable | Purpose |
 |----------|---------|
 | `R4A_SECRET` | Cluster join secret (required to join; auto-generated on master if unset — see `~/.r4a-server/identity.json`) |
-| `R4A_ADMIN_SECRET` | Admin auth for API/Web UI |
+| `R4A_ADMIN_SECRET` | Admin secret — exchanged for a management token (CLI/TUI/Web UI) |
 | `R4A_PUBLIC_ENDPOINT` | Publicly reachable `host:51820` — required behind NAT (master and optionally agents) |
 | `R4A_MASTER` | Master API URL for CLI/TUI (default `http://master.r4a.local:3501`) |
 | `R4A_TOKEN` | RBAC bearer token (alternative to secret) |
