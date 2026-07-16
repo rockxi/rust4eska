@@ -30,6 +30,14 @@ curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/insta
   --master http://<публичный-ip-мастера>:3501 --secret <секрет-кластера> --name friend1
 ```
 
+Только CLI (управление + VPN-клиент, без роли сервера/агента):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rockxi/rust4eska/main/scripts/install-cli.sh | sudo bash
+```
+
+Платформа (Linux x86_64 / macOS Intel / macOS Apple Silicon) во всех трёх скриптах определяется автоматически.
+
 Подробности и ручной пошаговый вариант — в разделах [Настройка мастер-ноды](#настройка-мастер-ноды) и [Настройка агент-ноды](#настройка-агент-ноды) ниже.
 
 ## Установка бинарников
