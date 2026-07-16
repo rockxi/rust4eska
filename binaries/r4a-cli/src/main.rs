@@ -8,9 +8,13 @@ use std::path::PathBuf;
 #[command(name = "r4a-cli", about = "r4a cluster management CLI")]
 struct Cli {
     /// Master node API URL
-    #[arg(long, env = "R4A_MASTER", default_value = "http://master.r4a.local:3501")]
+    #[arg(
+        long,
+        env = "R4A_MASTER",
+        default_value = "http://master.r4a.local:3501"
+    )]
     master: String,
-    
+
     #[arg(long, env = "R4A_SECRET")]
     secret: Option<String>,
 
@@ -179,23 +183,25 @@ enum GitCommands {
 #[derive(Subcommand)]
 enum VaultCommands {
     Configs,
-    CreateConfig { name: String },
+    CreateConfig {
+        name: String,
+    },
     List {
         #[arg(long, default_value = "default")]
         config: String,
     },
-    Get { 
+    Get {
         key: String,
         #[arg(long, default_value = "default")]
         config: String,
     },
-    Set { 
+    Set {
         key: String,
         value: String,
         #[arg(long, default_value = "default")]
         config: String,
     },
-    Delete { 
+    Delete {
         key: String,
         #[arg(long, default_value = "default")]
         config: String,
@@ -235,22 +241,34 @@ enum UpdateCommands {
 async fn install_ca_cert(client: &r4a_client::ApiClient) -> Option<String> {
     let pem = match client.ca_cert().await {
         Ok(p) => p,
-        Err(e) => { eprintln!("Warning: could not download CA cert: {}", e); return None; }
+        Err(e) => {
+            eprintln!("Warning: could not download CA cert: {}", e);
+            return None;
+        }
     };
 
     // Determine OS-specific cert path
     // update_cmd используется только в linux-ветке ниже; на macOS глушим warning
     #[cfg_attr(target_os = "macos", allow(unused_variables))]
     let (cert_path, update_cmd): (&str, &[&str]) = if cfg!(target_os = "macos") {
-        ("/tmp/r4a-ca.crt", &[])  // macOS uses security command directly
+        ("/tmp/r4a-ca.crt", &[]) // macOS uses security command directly
     } else if std::path::Path::new("/usr/sbin/update-ca-certificates").exists()
         || std::path::Path::new("/usr/bin/update-ca-certificates").exists()
     {
-        ("/usr/local/share/ca-certificates/r4a-ca.crt", &["update-ca-certificates"])
+        (
+            "/usr/local/share/ca-certificates/r4a-ca.crt",
+            &["update-ca-certificates"],
+        )
     } else if std::path::Path::new("/usr/bin/update-ca-trust").exists() {
-        ("/etc/pki/ca-trust/source/anchors/r4a-ca.crt", &["update-ca-trust", "extract"])
+        (
+            "/etc/pki/ca-trust/source/anchors/r4a-ca.crt",
+            &["update-ca-trust", "extract"],
+        )
     } else {
-        eprintln!("Warning: unknown system, skipping CA cert install. Save manually:\n{}", pem);
+        eprintln!(
+            "Warning: unknown system, skipping CA cert install. Save manually:\n{}",
+            pem
+        );
         return None;
     };
 
@@ -262,8 +280,15 @@ async fn install_ca_cert(client: &r4a_client::ApiClient) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let status = std::process::Command::new("security")
-            .args(["add-trusted-cert", "-d", "-r", "trustRoot",
-                   "-k", "/Library/Keychains/System.keychain", cert_path])
+            .args([
+                "add-trusted-cert",
+                "-d",
+                "-r",
+                "trustRoot",
+                "-k",
+                "/Library/Keychains/System.keychain",
+                cert_path,
+            ])
             .status();
         match status {
             Ok(s) if s.success() => println!("  CA cert:       installed to macOS keychain"),
@@ -277,8 +302,14 @@ async fn install_ca_cert(client: &r4a_client::ApiClient) -> Option<String> {
             .args(&update_cmd[1..])
             .status();
         match status {
-            Ok(s) if s.success() => println!("  CA cert:       installed to system trust store ({})", cert_path),
-            _ => eprintln!("Warning: could not run {}. Cert saved to {}. Run manually.", update_cmd[0], cert_path),
+            Ok(s) if s.success() => println!(
+                "  CA cert:       installed to system trust store ({})",
+                cert_path
+            ),
+            _ => eprintln!(
+                "Warning: could not run {}. Cert saved to {}. Run manually.",
+                update_cmd[0], cert_path
+            ),
         }
     }
 
@@ -303,7 +334,9 @@ fn remove_ca_cert(cert_path: &str) {
             {
                 let _ = std::process::Command::new("update-ca-certificates").status();
             } else if std::path::Path::new("/usr/bin/update-ca-trust").exists() {
-                let _ = std::process::Command::new("update-ca-trust").args(["extract"]).status();
+                let _ = std::process::Command::new("update-ca-trust")
+                    .args(["extract"])
+                    .status();
             }
         }
     }
@@ -390,9 +423,15 @@ fn install_systemd_service(
 
     let run_ctl = |args: &[&str]| {
         if scope == "user" {
-            std::process::Command::new("systemctl").arg("--user").args(args).status()
+            std::process::Command::new("systemctl")
+                .arg("--user")
+                .args(args)
+                .status()
         } else {
-            std::process::Command::new("sudo").arg("systemctl").args(args).status()
+            std::process::Command::new("sudo")
+                .arg("systemctl")
+                .args(args)
+                .status()
         }
     };
 
@@ -421,9 +460,15 @@ fn uninstall_systemd_service(scope: &str) -> Result<()> {
 
     let run_ctl = |args: &[&str]| {
         if scope == "user" {
-            std::process::Command::new("systemctl").arg("--user").args(args).status()
+            std::process::Command::new("systemctl")
+                .arg("--user")
+                .args(args)
+                .status()
         } else {
-            std::process::Command::new("sudo").arg("systemctl").args(args).status()
+            std::process::Command::new("sudo")
+                .arg("systemctl")
+                .args(args)
+                .status()
         }
     };
 
@@ -442,7 +487,9 @@ fn uninstall_systemd_service(scope: &str) -> Result<()> {
 fn launchd_plist_path() -> Result<PathBuf> {
     // When running as root, install as a system daemon so it can manage WireGuard interfaces
     if unsafe { libc::geteuid() } == 0 {
-        return Ok(PathBuf::from("/Library/LaunchDaemons/com.r4a.connect.plist"));
+        return Ok(PathBuf::from(
+            "/Library/LaunchDaemons/com.r4a.connect.plist",
+        ));
     }
     let home = std::env::var("HOME").context("HOME not set")?;
     Ok(PathBuf::from(home).join("Library/LaunchAgents/com.r4a.connect.plist"))
@@ -451,9 +498,9 @@ fn launchd_plist_path() -> Result<PathBuf> {
 #[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-     .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[cfg(target_os = "macos")]
@@ -605,7 +652,9 @@ fn install_launchd_service(
 fn uninstall_launchd_service() -> Result<()> {
     let plist_path = launchd_plist_path()?;
     let is_system = unsafe { libc::geteuid() } == 0;
-    let domain = if is_system { "system".to_string() } else {
+    let domain = if is_system {
+        "system".to_string()
+    } else {
         format!("gui/{}", unsafe { libc::getuid() })
     };
     let _ = std::process::Command::new("launchctl")
@@ -636,22 +685,33 @@ async fn main() -> Result<()> {
         Commands::Nodes { cmd } => match cmd {
             NodeCommands::List => {
                 let nodes = client.nodes().await?;
-                println!("{:<20} {:<15} {:<10} {:<10} {:<10}", "NAME", "ROLE", "STATUS", "CPU", "RAM");
+                println!(
+                    "{:<20} {:<15} {:<10} {:<10} {:<10}",
+                    "NAME", "ROLE", "STATUS", "CPU", "RAM"
+                );
                 for n in nodes {
-                    let online = n.last_seen.map(|ls| {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        now - ls < 30
-                    }).unwrap_or(false);
+                    let online = n
+                        .last_seen
+                        .map(|ls| {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            now - ls < 30
+                        })
+                        .unwrap_or(false);
 
-                    println!("{:<20} {:<15} {:<10} {:<10} {:<10}", 
-                        n.name, 
+                    println!(
+                        "{:<20} {:<15} {:<10} {:<10} {:<10}",
+                        n.name,
                         n.role,
                         if online { "Online" } else { "Offline" },
-                        n.cpu_percent.map(|c| format!("{:.1}%", c)).unwrap_or_else(|| "—".to_string()),
-                        n.ram_used_mb.map(|r| format!("{:.1}GB", r as f32 / 1024.0)).unwrap_or_else(|| "—".to_string())
+                        n.cpu_percent
+                            .map(|c| format!("{:.1}%", c))
+                            .unwrap_or_else(|| "—".to_string()),
+                        n.ram_used_mb
+                            .map(|r| format!("{:.1}GB", r as f32 / 1024.0))
+                            .unwrap_or_else(|| "—".to_string())
                     );
                 }
             }
@@ -708,27 +768,41 @@ async fn main() -> Result<()> {
                     println!("{:<36} {:<15}", t.id, t.username);
                 }
             }
-            RbacCommands::CreateToken { username, verbs, resources, resource_names } => {
-                use r4a_client::{Verb, Resource};
-                let verbs: Vec<Verb> = verbs.iter().map(|v| match v.as_str() {
-                    "get" | "Get" => Verb::Get,
-                    "list" | "List" => Verb::List,
-                    "create" | "Create" => Verb::Create,
-                    "update" | "Update" => Verb::Update,
-                    "delete" | "Delete" => Verb::Delete,
-                    _ => Verb::All,
-                }).collect();
-                let resources: Vec<Resource> = resources.iter().map(|r| match r.as_str() {
-                    "nodes" | "Nodes" => Resource::Nodes,
-                    "manifests" | "Manifests" => Resource::Manifests,
-                    "vault" | "Vault" => Resource::Vault,
-                    "git" | "GitRepos" => Resource::GitRepos,
-                    "tokens" | "Tokens" => Resource::Tokens,
-                    "policies" | "Policies" => Resource::Policies,
-                    "bindings" | "Bindings" => Resource::Bindings,
-                    _ => Resource::All,
-                }).collect();
-                let token = client.token_create(&username, verbs, resources, resource_names).await?;
+            RbacCommands::CreateToken {
+                username,
+                verbs,
+                resources,
+                resource_names,
+            } => {
+                use r4a_client::{Resource, Verb};
+                let verbs: Vec<Verb> = verbs
+                    .iter()
+                    .map(|v| match v.as_str() {
+                        "get" | "Get" => Verb::Get,
+                        "list" | "List" => Verb::List,
+                        "create" | "Create" => Verb::Create,
+                        "update" | "Update" => Verb::Update,
+                        "delete" | "Delete" => Verb::Delete,
+                        _ => Verb::All,
+                    })
+                    .collect();
+                let resources: Vec<Resource> = resources
+                    .iter()
+                    .map(|r| match r.as_str() {
+                        "nodes" | "Nodes" => Resource::Nodes,
+                        "manifests" | "Manifests" => Resource::Manifests,
+                        "vault" | "Vault" => Resource::Vault,
+                        "git" | "GitRepos" => Resource::GitRepos,
+                        "registry" | "Registry" => Resource::Registry,
+                        "tokens" | "Tokens" => Resource::Tokens,
+                        "policies" | "Policies" => Resource::Policies,
+                        "bindings" | "Bindings" => Resource::Bindings,
+                        _ => Resource::All,
+                    })
+                    .collect();
+                let token = client
+                    .token_create(&username, verbs, resources, resource_names)
+                    .await?;
                 println!("Created token: {}", token.id);
             }
             RbacCommands::DeleteToken { id } => {
@@ -739,11 +813,19 @@ async fn main() -> Result<()> {
         Commands::Update { cmd } => match cmd {
             UpdateCommands::Status => {
                 let status = client.update_status().await?;
-                println!("Master checksum: {}", status.master_checksum.as_deref().unwrap_or("—"));
+                println!(
+                    "Master checksum: {}",
+                    status.master_checksum.as_deref().unwrap_or("—")
+                );
                 println!("Update pending: {}", status.update_pending);
                 println!("\nAgents:");
                 for (name, info) in status.agents {
-                    println!("  {:<20} {:<15} {}", name, info.status, info.checksum.as_deref().unwrap_or("—"));
+                    println!(
+                        "  {:<20} {:<15} {}",
+                        name,
+                        info.status,
+                        info.checksum.as_deref().unwrap_or("—")
+                    );
                 }
             }
             UpdateCommands::Test => {
@@ -766,7 +848,13 @@ async fn main() -> Result<()> {
                 let manifests = client.manifests(node.as_deref()).await?;
                 println!("{:<20} {:<20} {:<20}", "APP", "NODE", "TYPE");
                 for (name, m) in manifests {
-                    let kind = if m.container.is_some() { "Docker" } else if m.systemd.is_some() { "Systemd" } else { "Other" };
+                    let kind = if m.container.is_some() {
+                        "Docker"
+                    } else if m.systemd.is_some() {
+                        "Systemd"
+                    } else {
+                        "Other"
+                    };
                     println!("{:<20} {:<20} {:<20}", name, m.app.node_selector, kind);
                 }
             }
@@ -776,7 +864,9 @@ async fn main() -> Result<()> {
                 // Bring down old WG interface if any, but do NOT delete the server-side
                 // connection — let server evict by label and reuse the same VPN IP.
                 if let Ok(old) = load_connection_state() {
-                    let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin()).args(["down", r4a_vpn::wireguard::wg_conf_path()]).status();
+                    let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin())
+                        .args(["down", r4a_vpn::wireguard::wg_conf_path()])
+                        .status();
                     for host in &old.added_hosts {
                         let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
                     }
@@ -789,16 +879,20 @@ async fn main() -> Result<()> {
                 let keypair = r4a_vpn::wireguard::generate_keypair()
                     .context("Failed to generate WireGuard keypair (is wg installed?)")?;
 
-                let resp = client.connection_create(&keypair.public, label.as_deref()).await?;
+                let resp = client
+                    .connection_create(&keypair.public, label.as_deref())
+                    .await?;
 
                 // Derive WG endpoint: use --wg-endpoint if given, otherwise replace
                 // the host in master_endpoint with the host from --master URL so the
                 // tunnel goes through the same address the user used for the API.
                 let derived_endpoint = wg_endpoint.unwrap_or_else(|| {
-                    let master_host = cli.master
+                    let master_host = cli
+                        .master
                         .trim_start_matches("http://")
                         .trim_start_matches("https://")
-                        .split(':').next()
+                        .split(':')
+                        .next()
                         .unwrap_or("10.42.0.1");
                     let wg_port = resp.master_endpoint.rsplit(':').next().unwrap_or("51820");
                     format!("{}:{}", master_host, wg_port)
@@ -809,7 +903,8 @@ async fn main() -> Result<()> {
                     &resp.vpn_ip,
                     &resp.master_pubkey,
                     endpoint,
-                ).context("Failed to configure WireGuard interface")?;
+                )
+                .context("Failed to configure WireGuard interface")?;
 
                 let mut added_hosts: Vec<String> = Vec::new();
                 let mut resolver_domain: Option<String> = None;
@@ -825,7 +920,9 @@ async fn main() -> Result<()> {
                     let label_host = format!("{}.r4a.local", lbl);
                     match r4a_vpn::dns::set_hosts_entries(&[resp.vpn_ip.as_str()], &label_host) {
                         Ok(_) => added_hosts.push(label_host),
-                        Err(e) => eprintln!("Warning: could not update /etc/hosts for label: {}", e),
+                        Err(e) => {
+                            eprintln!("Warning: could not update /etc/hosts for label: {}", e)
+                        }
                     }
                 }
 
@@ -880,7 +977,8 @@ async fn main() -> Result<()> {
                 ticker.tick().await; // skip immediate first tick
 
                 #[cfg(unix)]
-                let mut term_signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+                let mut term_signal =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
                 #[cfg(not(unix))]
                 let mut term_signal = futures_util::future::pending::<()>(); // Dummy for non-unix
 
@@ -902,7 +1000,9 @@ async fn main() -> Result<()> {
 
                 // Cleanup logic (shared for both signals)
                 let _ = client.connection_delete(&resp.id).await;
-                let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin()).args(["down", r4a_vpn::wireguard::wg_conf_path()]).status();
+                let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin())
+                    .args(["down", r4a_vpn::wireguard::wg_conf_path()])
+                    .status();
                 for host in &added_hosts {
                     let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
                 }
@@ -918,7 +1018,9 @@ async fn main() -> Result<()> {
             ConnectCommands::Down => {
                 let state = load_connection_state()?;
                 let _ = client.connection_delete(&state.id).await;
-                let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin()).args(["down", r4a_vpn::wireguard::wg_conf_path()]).status();
+                let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin())
+                    .args(["down", r4a_vpn::wireguard::wg_conf_path()])
+                    .status();
                 for host in &state.added_hosts {
                     let _ = r4a_vpn::dns::set_hosts_entries(&[], host);
                 }
@@ -931,47 +1033,54 @@ async fn main() -> Result<()> {
                 remove_connection_state();
                 println!("Disconnected.");
             }
-            ConnectCommands::Status => {
-                match load_connection_state() {
-                    Ok(s) => {
-                        println!("Connected to:  {}", s.master);
-                        println!("VPN IP:        {}", s.vpn_ip);
-                        println!("Connection ID: {}", s.id);
-                        println!("Master WG:     {}", s.master_endpoint);
-                    }
-                    Err(e) => println!("Not connected: {}", e),
+            ConnectCommands::Status => match load_connection_state() {
+                Ok(s) => {
+                    println!("Connected to:  {}", s.master);
+                    println!("VPN IP:        {}", s.vpn_ip);
+                    println!("Connection ID: {}", s.id);
+                    println!("Master WG:     {}", s.master_endpoint);
                 }
-            }
+                Err(e) => println!("Not connected: {}", e),
+            },
             ConnectCommands::List => {
                 let conns = client.connections_list().await?;
-                println!("{:<36} {:<15} {:<20} {}", "ID", "VPN IP", "LABEL", "LAST SEEN");
+                println!(
+                    "{:<36} {:<15} {:<20} {}",
+                    "ID", "VPN IP", "LABEL", "LAST SEEN"
+                );
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
                 for c in conns {
                     let age = now.saturating_sub(c.last_seen);
-                    let age_str = if age < 60 { format!("{}s ago", age) }
-                        else if age < 3600 { format!("{}m ago", age / 60) }
-                        else { format!("{}h ago", age / 3600) };
-                    println!("{:<36} {:<15} {:<20} {}",
+                    let age_str = if age < 60 {
+                        format!("{}s ago", age)
+                    } else if age < 3600 {
+                        format!("{}m ago", age / 60)
+                    } else {
+                        format!("{}h ago", age / 3600)
+                    };
+                    println!(
+                        "{:<36} {:<15} {:<20} {}",
                         &c.id[..8.min(c.id.len())],
                         c.vpn_ip,
                         c.label.as_deref().unwrap_or("—"),
-                        age_str);
+                        age_str
+                    );
                 }
             }
             ConnectCommands::Cleanup => {
                 println!("Performing thorough cleanup of r4a network leftovers...");
-                
+
                 // 1. WireGuard down
                 let _ = std::process::Command::new(r4a_vpn::wireguard::wg_quick_bin())
                     .args(["down", r4a_vpn::wireguard::wg_conf_path()])
                     .status();
-                
+
                 // 2. Remove /etc/resolver/r4a.local
                 let _ = r4a_vpn::dns::remove_resolver_domain("r4a.local");
-                
+
                 // 3. Clean /etc/hosts (brute force search for managed entries)
                 let _ = r4a_vpn::dns::set_hosts_entries(&[], "master.r4a.local");
                 // Also try to clean up any labelled hosts if we can find them
@@ -989,7 +1098,14 @@ async fn main() -> Result<()> {
                 #[cfg(target_os = "macos")]
                 {
                     let output = std::process::Command::new("security")
-                        .args(["find-certificate", "-a", "-c", "r4a Local CA", "-Z", "/Library/Keychains/System.keychain"])
+                        .args([
+                            "find-certificate",
+                            "-a",
+                            "-c",
+                            "r4a Local CA",
+                            "-Z",
+                            "/Library/Keychains/System.keychain",
+                        ])
                         .output();
                     if let Ok(out) = output {
                         let out_str = String::from_utf8_lossy(&out.stdout);
@@ -998,7 +1114,12 @@ async fn main() -> Result<()> {
                                 if let Some(hash) = line.split(':').nth(1) {
                                     let hash = hash.trim();
                                     let _ = std::process::Command::new("security")
-                                        .args(["delete-certificate", "-Z", hash, "/Library/Keychains/System.keychain"])
+                                        .args([
+                                            "delete-certificate",
+                                            "-Z",
+                                            hash,
+                                            "/Library/Keychains/System.keychain",
+                                        ])
                                         .status();
                                 }
                             }
@@ -1009,11 +1130,16 @@ async fn main() -> Result<()> {
 
                 // 5. Remove state file
                 remove_connection_state();
-                
+
                 println!("Cleanup complete.");
             }
             ConnectCommands::Service { cmd } => match cmd {
-                ServiceCommands::Install { label, wg_endpoint, scope, reinstall } => {
+                ServiceCommands::Install {
+                    label,
+                    wg_endpoint,
+                    scope,
+                    reinstall,
+                } => {
                     let bin = std::env::current_exe()
                         .context("Could not determine binary path")?
                         .to_string_lossy()
@@ -1043,10 +1169,16 @@ async fn main() -> Result<()> {
                     install_systemd_service(&bin, &up_args, &cli.master, token, is_bearer, &scope)?;
 
                     #[cfg(target_os = "macos")]
-                    { let _ = &scope; install_launchd_service(&bin, &up_args, &cli.master, token, is_bearer)?; }
+                    {
+                        let _ = &scope;
+                        install_launchd_service(&bin, &up_args, &cli.master, token, is_bearer)?;
+                    }
 
                     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-                    { let _ = (scope, bin, up_args, token, is_bearer); eprintln!("Service management is not supported on this platform."); }
+                    {
+                        let _ = (scope, bin, up_args, token, is_bearer);
+                        eprintln!("Service management is not supported on this platform.");
+                    }
 
                     println!("Done. Connection will start automatically on next login/boot.");
                 }
@@ -1057,10 +1189,16 @@ async fn main() -> Result<()> {
                     uninstall_systemd_service(&scope)?;
 
                     #[cfg(target_os = "macos")]
-                    { let _ = &scope; uninstall_launchd_service()?; }
+                    {
+                        let _ = &scope;
+                        uninstall_launchd_service()?;
+                    }
 
                     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-                    { let _ = scope; eprintln!("Service management is not supported on this platform."); }
+                    {
+                        let _ = scope;
+                        eprintln!("Service management is not supported on this platform.");
+                    }
 
                     println!("Service removed.");
                 }

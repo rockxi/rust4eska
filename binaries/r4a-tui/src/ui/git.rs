@@ -1,10 +1,10 @@
 use r4a_client::RepoInfo;
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame,
 };
 
 pub fn render(
@@ -20,7 +20,9 @@ pub fn render(
         .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(area);
 
-    let block = Block::default().title(" Git Repositories ").borders(Borders::ALL);
+    let block = Block::default()
+        .title(" Git Repositories ")
+        .borders(Borders::ALL);
 
     let items: Vec<ListItem> = match (repos, error) {
         (_, Some(e)) => vec![ListItem::new(Line::from(Span::styled(

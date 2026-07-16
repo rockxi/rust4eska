@@ -23,7 +23,7 @@ pub fn set_hosts_entries(ips: &[&str], hostname: &str) -> Result<()> {
     }
 
     let new_content = format!("{filtered}{new_entries}");
-    
+
     if content.lines().eq(new_content.lines()) {
         return Ok(());
     }
@@ -52,4 +52,3 @@ pub fn remove_resolver_domain(domain: &str) -> Result<()> {
     }
     Ok(())
 }
-

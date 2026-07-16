@@ -1,8 +1,14 @@
 use anyhow::Result;
-pub use r4a_core::{NodeInfo, RepoInfo, Manifest, AppConfig, ContainerConfig, models::{Token, Policy, Binding, Verb, Resource, VaultConfig, Connection, ConnectRequest, ConnectResponse}};
+pub use r4a_core::{
+    models::{
+        Binding, ConnectRequest, ConnectResponse, Connection, Policy, Resource, Token, VaultConfig,
+        Verb,
+    },
+    AppConfig, ContainerConfig, Manifest, NodeInfo, RepoInfo,
+};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct AgentUpdateInfo {
@@ -191,8 +197,11 @@ impl ApiClient {
     pub async fn get_tui_checksum(&self) -> Result<String> {
         self.ensure_token().await?;
         #[derive(Deserialize)]
-        struct Resp { checksum: String }
-        let resp: Resp = self.authenticated_get(format!("{}/api/tui-checksum", self.base_url))
+        struct Resp {
+            checksum: String,
+        }
+        let resp: Resp = self
+            .authenticated_get(format!("{}/api/tui-checksum", self.base_url))
             .send()
             .await?
             .error_for_status()?
@@ -204,8 +213,13 @@ impl ApiClient {
     pub async fn fetch_github_release(&self) -> Result<String> {
         self.ensure_token().await?;
         #[derive(Deserialize)]
-        struct Resp { success: bool, message: String, version: Option<String> }
-        let resp: Resp = self.authenticated_post(format!("{}/api/update/fetch-github", self.base_url))
+        struct Resp {
+            success: bool,
+            message: String,
+            version: Option<String>,
+        }
+        let resp: Resp = self
+            .authenticated_post(format!("{}/api/update/fetch-github", self.base_url))
             .send()
             .await?
             .error_for_status()?
@@ -219,7 +233,8 @@ impl ApiClient {
 
     pub async fn download_tui_binary(&self) -> Result<Vec<u8>> {
         self.ensure_token().await?;
-        let bytes = self.authenticated_get(format!("{}/api/tui-binary", self.base_url))
+        let bytes = self
+            .authenticated_get(format!("{}/api/tui-binary", self.base_url))
             .send()
             .await?
             .error_for_status()?
@@ -231,7 +246,10 @@ impl ApiClient {
     pub async fn vault_list(&self, config_id: &str) -> Result<Vec<String>> {
         self.ensure_token().await?;
         let keys = self
-            .authenticated_get(format!("{}/api/vault/list?config_id={}", self.base_url, config_id))
+            .authenticated_get(format!(
+                "{}/api/vault/list?config_id={}",
+                self.base_url, config_id
+            ))
             .send()
             .await?
             .error_for_status()?
@@ -243,7 +261,10 @@ impl ApiClient {
     pub async fn vault_get(&self, config_id: &str, key: &str) -> Result<String> {
         self.ensure_token().await?;
         let val = self
-            .authenticated_get(format!("{}/api/vault?config_id={}&key={}", self.base_url, config_id, key))
+            .authenticated_get(format!(
+                "{}/api/vault?config_id={}&key={}",
+                self.base_url, config_id, key
+            ))
             .send()
             .await?
             .error_for_status()?
@@ -265,10 +286,13 @@ impl ApiClient {
 
     pub async fn vault_delete(&self, config_id: &str, key: &str) -> Result<()> {
         self.ensure_token().await?;
-        self.authenticated_delete(format!("{}/api/vault?config_id={}&key={}", self.base_url, config_id, key))
-            .send()
-            .await?
-            .error_for_status()?;
+        self.authenticated_delete(format!(
+            "{}/api/vault?config_id={}&key={}",
+            self.base_url, config_id, key
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
@@ -319,7 +343,13 @@ impl ApiClient {
         Ok(())
     }
 
-    pub async fn token_create(&self, username: &str, verbs: Vec<Verb>, resources: Vec<Resource>, resource_names: Option<Vec<String>>) -> Result<Token> {
+    pub async fn token_create(
+        &self,
+        username: &str,
+        verbs: Vec<Verb>,
+        resources: Vec<Resource>,
+        resource_names: Option<Vec<String>>,
+    ) -> Result<Token> {
         self.ensure_token().await?;
         let body = serde_json::json!({
             "username": username,
@@ -327,7 +357,8 @@ impl ApiClient {
             "resources": resources,
             "resource_names": resource_names,
         });
-        let token = self.authenticated_post(format!("{}/api/tokens", self.base_url))
+        let token = self
+            .authenticated_post(format!("{}/api/tokens", self.base_url))
             .json(&body)
             .send()
             .await?
@@ -374,52 +405,89 @@ impl ApiClient {
 
     pub async fn connections_list(&self) -> Result<Vec<Connection>> {
         self.ensure_token().await?;
-        Ok(self.authenticated_get(format!("{}/api/connections", self.base_url))
-            .send().await?.error_for_status()?.json().await?)
+        Ok(self
+            .authenticated_get(format!("{}/api/connections", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
-    pub async fn connection_create(&self, pubkey: &str, label: Option<&str>) -> Result<ConnectResponse> {
+    pub async fn connection_create(
+        &self,
+        pubkey: &str,
+        label: Option<&str>,
+    ) -> Result<ConnectResponse> {
         self.ensure_token().await?;
-        Ok(self.authenticated_post(format!("{}/api/connections", self.base_url))
-            .json(&ConnectRequest { pubkey: pubkey.to_string(), label: label.map(|s| s.to_string()) })
-            .send().await?.error_for_status()?.json().await?)
+        Ok(self
+            .authenticated_post(format!("{}/api/connections", self.base_url))
+            .json(&ConnectRequest {
+                pubkey: pubkey.to_string(),
+                label: label.map(|s| s.to_string()),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     pub async fn connection_delete(&self, id: &str) -> Result<()> {
         self.ensure_token().await?;
         self.authenticated_delete(format!("{}/api/connections/{}", self.base_url, id))
-            .send().await?.error_for_status()?;
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
     pub async fn connection_heartbeat(&self, id: &str) -> Result<()> {
         self.ensure_token().await?;
-        self.authenticated_post(format!("{}/api/connections/{}/heartbeat", self.base_url, id))
-            .send().await?.error_for_status()?;
+        self.authenticated_post(format!(
+            "{}/api/connections/{}/heartbeat",
+            self.base_url, id
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
         Ok(())
     }
 
     /// Пары (node, container), по которым на мастере есть логи.
     pub async fn logs_containers(&self) -> Result<Vec<(String, String)>> {
         self.ensure_token().await?;
-        Ok(self.authenticated_get(format!("{}/api/logs/containers", self.base_url))
-            .send().await?.error_for_status()?.json().await?)
+        Ok(self
+            .authenticated_get(format!("{}/api/logs/containers", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     /// Последние `tail` строк лога контейнера.
     pub async fn logs(&self, node: &str, container: &str, tail: usize) -> Result<Vec<LogEntry>> {
         self.ensure_token().await?;
-        Ok(self.authenticated_get(format!(
+        Ok(self
+            .authenticated_get(format!(
                 "{}/api/logs?node={}&container={}&tail={}",
                 self.base_url, node, container, tail
             ))
-            .send().await?.error_for_status()?.json().await?)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     pub async fn ca_cert(&self) -> Result<String> {
-        let resp = self.client
+        let resp = self
+            .client
             .get(format!("{}/api/ca-cert", self.base_url))
-            .send().await?.error_for_status()?;
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(resp.text().await?)
     }
 }

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use pingora::prelude::*;
-use r4a_store::Store;
 use r4a_core::PeerInfo;
+use r4a_store::Store;
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -27,18 +27,27 @@ impl ProxyHttp for IngressProxy {
             Ok(m) => m,
             Err(e) => {
                 warn!("Ingress: failed to load manifests: {}", e);
-                return Err(Error::explain(ErrorType::HTTPStatus(503), "failed to load manifests"));
+                return Err(Error::explain(
+                    ErrorType::HTTPStatus(503),
+                    "failed to load manifests",
+                ));
             }
         };
 
         let manifest = manifests.into_iter().find(|m| {
-            m.ingress.as_ref().map(|ing| ing.domain == host).unwrap_or(false)
+            m.ingress
+                .as_ref()
+                .map(|ing| ing.domain == host)
+                .unwrap_or(false)
         });
 
         let manifest = match manifest {
             Some(m) => m,
             None => {
-                return Err(Error::explain(ErrorType::HTTPStatus(404), "no app for this domain"));
+                return Err(Error::explain(
+                    ErrorType::HTTPStatus(404),
+                    "no app for this domain",
+                ));
             }
         };
 
@@ -54,15 +63,18 @@ impl ProxyHttp for IngressProxy {
             .and_then(|data| serde_json::from_slice(&data).ok())
             .unwrap_or_default();
 
-        let peer = peers.values().find(|p| {
-            p.name == *node_selector || node_selector == "all"
-        });
+        let peer = peers
+            .values()
+            .find(|p| p.name == *node_selector || node_selector == "all");
 
         let peer = match peer {
             Some(p) => p,
             None => {
                 warn!("Ingress: no node found for selector={}", node_selector);
-                return Err(Error::explain(ErrorType::HTTPStatus(503), "no node available for this app"));
+                return Err(Error::explain(
+                    ErrorType::HTTPStatus(503),
+                    "no node available for this app",
+                ));
             }
         };
 

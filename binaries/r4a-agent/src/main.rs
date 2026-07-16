@@ -5,7 +5,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use bollard::container::{ListContainersOptions, LogsOptions, RestartContainerOptions, StopContainerOptions, StartContainerOptions};
+use bollard::container::{
+    ListContainersOptions, LogsOptions, RestartContainerOptions, StartContainerOptions,
+    StopContainerOptions,
+};
 use bollard::Docker;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -18,17 +21,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use sysinfo::System;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 const AGENT_API_PORT: u16 = 8082;
 
 // Must match the public key in r4a-server (C-2).
 // DEV/TEST key — replace before production deployment.
 const RELEASE_SIGNING_PUBKEY: [u8; 32] = [
-    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
-    0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
-    0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
-    0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+    0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
 ];
 
 fn verify_release_signature(data: &[u8], sig_bytes: &[u8]) -> anyhow::Result<()> {
@@ -38,8 +39,12 @@ fn verify_release_signature(data: &[u8], sig_bytes: &[u8]) -> anyhow::Result<()>
     }
     let key = VerifyingKey::from_bytes(&RELEASE_SIGNING_PUBKEY)
         .map_err(|e| anyhow::anyhow!("invalid signing public key: {e}"))?;
-    let sig_arr: [u8; 64] = sig_bytes.try_into()
-        .map_err(|_| anyhow::anyhow!("invalid signature length: expected 64 bytes, got {}", sig_bytes.len()))?;
+    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid signature length: expected 64 bytes, got {}",
+            sig_bytes.len()
+        )
+    })?;
     let sig = Signature::from_bytes(&sig_arr);
     key.verify(data, &sig)
         .map_err(|e| anyhow::anyhow!("signature verification failed: {e}"))?;
@@ -54,18 +59,18 @@ fn state_dir() -> PathBuf {
 fn save_identity(id: &Identity) -> Result<()> {
     let path = state_dir().join("identity.json");
     let tmp_path = path.with_extension("json.tmp");
-    
+
     std::fs::create_dir_all(state_dir())?;
-    
+
     let data = serde_json::to_string_pretty(id)?;
     std::fs::write(&tmp_path, data)?;
-    
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
     }
-    
+
     std::fs::rename(&tmp_path, &path)?;
     Ok(())
 }
@@ -138,7 +143,10 @@ enum ServiceAction {
 
 fn query_vram() -> (Option<u64>, Option<u64>) {
     let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .ok();
     let out = match out {
@@ -162,7 +170,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Connect { master, secret, name, public_endpoint } => connect(&master, secret, name, public_endpoint).await,
+        Cmd::Connect {
+            master,
+            secret,
+            name,
+            public_endpoint,
+        } => connect(&master, secret, name, public_endpoint).await,
         Cmd::Service { action } => handle_service(action),
     }
 }
@@ -170,13 +183,18 @@ async fn main() -> Result<()> {
 fn handle_service(action: ServiceAction) -> Result<()> {
     let manager = r4a_service::ServiceManager::detect()?;
     match action {
-        ServiceAction::Enable { master, secret, name } => {
+        ServiceAction::Enable {
+            master,
+            secret,
+            name,
+        } => {
             // H-4: secret goes into a 0o600 env file, NOT the command line
             let mut exec = format!("/usr/local/bin/r4a-agent connect --master {}", master);
             if let Some(n) = &name {
                 exec.push_str(&format!(" --name {}", n));
             }
-            let env_pairs: Vec<(&str, &str)> = secret.as_deref()
+            let env_pairs: Vec<(&str, &str)> = secret
+                .as_deref()
                 .map(|s| vec![("R4A_SECRET", s)])
                 .unwrap_or_default();
             manager.enable("r4a-agent", "r4a Agent Node", &exec, &env_pairs)?;
@@ -219,26 +237,39 @@ async fn agent_containers_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut filters = HashMap::new();
-    filters.insert("label".to_string(), vec![format!("r4a.node={}", state.node_name)]);
-    let opts = ListContainersOptions { all: true, filters, ..Default::default() };
+    filters.insert(
+        "label".to_string(),
+        vec![format!("r4a.node={}", state.node_name)],
+    );
+    let opts = ListContainersOptions {
+        all: true,
+        filters,
+        ..Default::default()
+    };
 
-    let containers = docker.list_containers(Some(opts)).await
+    let containers = docker
+        .list_containers(Some(opts))
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let result = containers.into_iter().map(|c| {
-        let name = c.names
-            .and_then(|ns| ns.into_iter().next())
-            .unwrap_or_default()
-            .trim_start_matches('/')
-            .to_string();
-        ContainerInfo {
-            id: c.id.unwrap_or_default(),
-            name,
-            image: c.image.unwrap_or_default(),
-            status: c.status.unwrap_or_default(),
-            state: c.state.unwrap_or_default(),
-        }
-    }).collect();
+    let result = containers
+        .into_iter()
+        .map(|c| {
+            let name = c
+                .names
+                .and_then(|ns| ns.into_iter().next())
+                .unwrap_or_default()
+                .trim_start_matches('/')
+                .to_string();
+            ContainerInfo {
+                id: c.id.unwrap_or_default(),
+                name,
+                image: c.image.unwrap_or_default(),
+                status: c.status.unwrap_or_default(),
+                state: c.state.unwrap_or_default(),
+            }
+        })
+        .collect();
 
     Ok(Json(result))
 }
@@ -287,7 +318,9 @@ async fn agent_restart_handler(
     let docker = Docker::connect_with_local_defaults()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    docker.restart_container(&name, Some(RestartContainerOptions { t: 5 })).await
+    docker
+        .restart_container(&name, Some(RestartContainerOptions { t: 5 }))
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
@@ -304,7 +337,9 @@ async fn agent_stop_handler(
     let docker = Docker::connect_with_local_defaults()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    docker.stop_container(&name, Some(StopContainerOptions { t: 5 })).await
+    docker
+        .stop_container(&name, Some(StopContainerOptions { t: 5 }))
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
@@ -321,7 +356,9 @@ async fn agent_start_handler(
     let docker = Docker::connect_with_local_defaults()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    docker.start_container(&name, None::<StartContainerOptions<String>>).await
+    docker
+        .start_container(&name, None::<StartContainerOptions<String>>)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::OK)
@@ -329,7 +366,8 @@ async fn agent_start_handler(
 
 fn check_secret(headers: &axum::http::HeaderMap, expected: &str) -> bool {
     // H-1: constant-time comparison to prevent timing attacks
-    headers.get("X-R4A-Secret")
+    headers
+        .get("X-R4A-Secret")
         .and_then(|v| v.to_str().ok())
         .map(|v| constant_time_eq::constant_time_eq(v.as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
@@ -337,7 +375,10 @@ fn check_secret(headers: &axum::http::HeaderMap, expected: &str) -> bool {
 
 fn spawn_agent_api(cluster_secret: String, node_name: String, bind_ip: String) {
     tokio::spawn(async move {
-        let state = AgentApiState { cluster_secret, node_name };
+        let state = AgentApiState {
+            cluster_secret,
+            node_name,
+        };
         let app = Router::new()
             .route("/containers", get(agent_containers_handler))
             .route("/containers/:name/logs", get(agent_logs_handler))
@@ -350,7 +391,10 @@ fn spawn_agent_api(cluster_secret: String, node_name: String, bind_ip: String) {
         let addr = format!("{}:{}", bind_ip, AGENT_API_PORT);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
-            Err(e) => { error!("Agent API bind failed on {}: {}", addr, e); return; }
+            Err(e) => {
+                error!("Agent API bind failed on {}: {}", addr, e);
+                return;
+            }
         };
         info!("Agent API listening on {}", addr);
         if let Err(e) = axum::serve(listener, app).await {
@@ -359,10 +403,13 @@ fn spawn_agent_api(cluster_secret: String, node_name: String, bind_ip: String) {
     });
 }
 
-async fn connect(master_api: &str, secret: Option<String>, name: Option<String>, my_public_endpoint: Option<String>) -> Result<()> {
-    let name = name.unwrap_or_else(|| {
-        System::host_name().unwrap_or_else(|| "agent".to_string())
-    });
+async fn connect(
+    master_api: &str,
+    secret: Option<String>,
+    name: Option<String>,
+    my_public_endpoint: Option<String>,
+) -> Result<()> {
+    let name = name.unwrap_or_else(|| System::host_name().unwrap_or_else(|| "agent".to_string()));
 
     let identity = load_identity(secret).context("Failed to load or generate identity")?;
     let cluster_secret = identity.cluster_secret.clone().unwrap_or_default();
@@ -372,8 +419,8 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>,
     let resp: JoinResponse = client
         .post(format!("{master_api}/api/join"))
         .header("X-R4A-Secret", &cluster_secret)
-        .json(&JoinRequest { 
-            pub_key: identity.public_key.clone(), 
+        .json(&JoinRequest {
+            pub_key: identity.public_key.clone(),
             name: Some(name.clone()),
             role: Some("agent".to_string()),
             public_endpoint: my_public_endpoint.clone(),
@@ -402,7 +449,8 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>,
         &resp.master_endpoint,
     )?;
 
-    let master_ips: Vec<String> = resp.peers
+    let master_ips: Vec<String> = resp
+        .peers
         .values()
         .filter(|p| p.role == "master")
         .map(|p| p.ip.clone())
@@ -413,12 +461,19 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>,
         hosts_ips.push("10.42.0.1");
     }
 
-    info!("Adding master.r4a.local ({}) to /etc/hosts...", hosts_ips.join(", "));
+    info!(
+        "Adding master.r4a.local ({}) to /etc/hosts...",
+        hosts_ips.join(", ")
+    );
     r4a_vpn::dns::set_hosts_entries(&hosts_ips, "master.r4a.local")?;
 
     info!("Agent '{}' connected. VPN IP: {}", name, resp.agent_vpn_ip);
 
-    spawn_agent_api(cluster_secret.clone(), name.clone(), resp.agent_vpn_ip.clone());
+    spawn_agent_api(
+        cluster_secret.clone(),
+        name.clone(),
+        resp.agent_vpn_ip.clone(),
+    );
 
     // Telemetry: стримим логи r4a-контейнеров в ClickHouse (когда настроен на мастере)
     tokio::spawn(r4a_telemetry::collector::run_collector(
@@ -435,7 +490,10 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>,
     let metrics_secret = cluster_secret.clone();
     let metrics_p2p_direct = p2p_direct.clone();
     tokio::spawn(async move {
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
         let mut sys = System::new_all();
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -467,12 +525,23 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>,
 
     // Report initial checksum so the master knows our current version immediately
     if let Some(cs) = sha256_self() {
-        let _ = report_update_status(&update_client, &master_base, &update_vpn_ip, "idle", &cs, &update_secret).await;
+        let _ = report_update_status(
+            &update_client,
+            &master_base,
+            &update_vpn_ip,
+            "idle",
+            &cs,
+            &update_secret,
+        )
+        .await;
     }
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            if let Err(e) = check_and_apply_update(&update_client, &master_base, &update_vpn_ip, &update_secret).await {
+            if let Err(e) =
+                check_and_apply_update(&update_client, &master_base, &update_vpn_ip, &update_secret)
+                    .await
+            {
                 warn!("Update check failed: {e}");
             }
         }
@@ -483,16 +552,20 @@ async fn connect(master_api: &str, secret: Option<String>, name: Option<String>,
     let reconcile_secret = cluster_secret.clone();
     let reconcile_token = identity.agent_token.clone().unwrap_or_default();
     tokio::spawn(async move {
-        let reconciler = match Reconciler::new(reconciler_node_name.clone(), reconcile_token.clone()) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to initialize Reconciler: {}", e);
-                return;
-            }
-        };
+        let reconciler =
+            match Reconciler::new(reconciler_node_name.clone(), reconcile_token.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Failed to initialize Reconciler: {}", e);
+                    return;
+                }
+            };
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            let url = format!("http://master.r4a.local:3501/api/manifests?node={}", reconciler_node_name);
+            let url = format!(
+                "http://master.r4a.local:3501/api/manifests?node={}",
+                reconciler_node_name
+            );
             let mut req = reconcile_client.get(&url);
             if !reconcile_token.is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", reconcile_token));
@@ -616,7 +689,11 @@ async fn run_p2p_sync(
             if peer.pub_key == my_pubkey || peer.pub_key == master_pubkey || peer.role != "agent" {
                 continue;
             }
-            let endpoint = match peer.public_endpoint.as_ref().or(peer.observed_endpoint.as_ref()) {
+            let endpoint = match peer
+                .public_endpoint
+                .as_ref()
+                .or(peer.observed_endpoint.as_ref())
+            {
                 Some(ep) => ep.clone(),
                 None => continue,
             };
@@ -624,9 +701,16 @@ async fn run_p2p_sync(
             match states.get_mut(&peer.pub_key) {
                 None => {
                     if try_add_p2p_peer(peer, &endpoint) {
-                        states.insert(peer.pub_key.clone(), P2pPeerState {
-                            endpoint, added_at: now, established: false, failures: 0, backoff_until: 0,
-                        });
+                        states.insert(
+                            peer.pub_key.clone(),
+                            P2pPeerState {
+                                endpoint,
+                                added_at: now,
+                                established: false,
+                                failures: 0,
+                                backoff_until: 0,
+                            },
+                        );
                     }
                 }
                 Some(st) if st.backoff_until > 0 => {
@@ -676,7 +760,11 @@ async fn run_p2p_sync(
         }
 
         // Ноды, исчезнувшие из кластера — убираем их p2p-peer'ов
-        let gone: Vec<String> = states.keys().filter(|pk| !peers.contains_key(*pk)).cloned().collect();
+        let gone: Vec<String> = states
+            .keys()
+            .filter(|pk| !peers.contains_key(*pk))
+            .cloned()
+            .collect();
         for pk in gone {
             let st = states.remove(&pk);
             if st.map(|s| s.backoff_until == 0).unwrap_or(false) {
@@ -685,7 +773,8 @@ async fn run_p2p_sync(
         }
 
         // Публикуем список established-пиров для metrics-репорта
-        let mut established: Vec<String> = states.iter()
+        let mut established: Vec<String> = states
+            .iter()
             .filter(|(_, st)| st.established)
             .filter_map(|(pk, _)| peers.get(pk).map(|p| p.name.clone()))
             .collect();
@@ -697,7 +786,10 @@ async fn run_p2p_sync(
 fn try_add_p2p_peer(peer: &PeerInfo, endpoint: &str) -> bool {
     match r4a_vpn::wireguard::add_peer_with_endpoint(&peer.pub_key, &peer.ip, endpoint) {
         Ok(()) => {
-            info!("p2p: trying direct tunnel to '{}' ({}) via {}", peer.name, peer.ip, endpoint);
+            info!(
+                "p2p: trying direct tunnel to '{}' ({}) via {}",
+                peer.name, peer.ip, endpoint
+            );
             true
         }
         Err(e) => {
@@ -721,7 +813,12 @@ fn sha256_self() -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
-async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: &str, secret: &str) -> Result<()> {
+async fn check_and_apply_update(
+    client: &reqwest::Client,
+    master: &str,
+    vpn_ip: &str,
+    secret: &str,
+) -> Result<()> {
     let poll: UpdatePollResponse = client
         .get(format!("{master}/api/update/poll"))
         .header("X-R4A-Secret", secret)
@@ -743,11 +840,16 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
     let self_checksum = sha256_self().unwrap_or_default();
     if self_checksum == master_checksum {
         // Already on latest — report so master can clear update_pending
-        let _ = report_update_status(client, master, vpn_ip, "updated", &self_checksum, secret).await;
+        let _ =
+            report_update_status(client, master, vpn_ip, "updated", &self_checksum, secret).await;
         return Ok(());
     }
 
-    info!("Update available (master={} self={}), downloading...", &master_checksum[..8], &self_checksum[..8]);
+    info!(
+        "Update available (master={} self={}), downloading...",
+        &master_checksum[..8],
+        &self_checksum[..8]
+    );
 
     let _ = report_update_status(client, master, vpn_ip, "updating", &self_checksum, secret).await;
 
@@ -771,18 +873,27 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
 
     if sig_response.status().is_success() {
         let sig_bytes = sig_response.bytes().await?;
-        verify_release_signature(&bytes, &sig_bytes)
-            .map_err(|e| {
-                let _ = tokio::runtime::Handle::current()
-                    .block_on(report_update_status(client, master, vpn_ip, "failed", &master_checksum, secret));
-                e
-            })?;
+        verify_release_signature(&bytes, &sig_bytes).map_err(|e| {
+            let _ = tokio::runtime::Handle::current().block_on(report_update_status(
+                client,
+                master,
+                vpn_ip,
+                "failed",
+                &master_checksum,
+                secret,
+            ));
+            e
+        })?;
         info!("Binary signature verified successfully");
     } else if skip_verify {
         warn!("SECURITY: no signature available from master (R4A_SKIP_SIGNATURE_VERIFY=1) — skipping verification");
     } else {
-        let _ = report_update_status(client, master, vpn_ip, "failed", &master_checksum, secret).await;
-        anyhow::bail!("master has no signature for agent binary (HTTP {}): refusing to apply unsigned update", sig_response.status());
+        let _ =
+            report_update_status(client, master, vpn_ip, "failed", &master_checksum, secret).await;
+        anyhow::bail!(
+            "master has no signature for agent binary (HTTP {}): refusing to apply unsigned update",
+            sig_response.status()
+        );
     }
 
     // Verify SHA256 checksum against what the master advertised
@@ -790,7 +901,15 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
     hasher.update(&bytes);
     let downloaded_checksum = format!("{:x}", hasher.finalize());
     if downloaded_checksum != master_checksum {
-        let _ = report_update_status(client, master, vpn_ip, "failed", &downloaded_checksum, secret).await;
+        let _ = report_update_status(
+            client,
+            master,
+            vpn_ip,
+            "failed",
+            &downloaded_checksum,
+            secret,
+        )
+        .await;
         anyhow::bail!("checksum mismatch: expected {master_checksum} got {downloaded_checksum}");
     }
 
@@ -806,7 +925,10 @@ async fn check_and_apply_update(client: &reqwest::Client, master: &str, vpn_ip: 
     }
 
     std::fs::rename(&tmp_path, target_path)?;
-    info!("Updated to checksum {}, restarting...", &master_checksum[..8]);
+    info!(
+        "Updated to checksum {}, restarting...",
+        &master_checksum[..8]
+    );
 
     let _ = report_update_status(client, master, vpn_ip, "updated", &master_checksum, secret).await;
 
@@ -822,11 +944,19 @@ async fn report_update_status(
     secret: &str,
 ) -> Result<()> {
     #[derive(Serialize)]
-    struct Report<'a> { agent_vpn_ip: &'a str, checksum: &'a str, status: &'a str }
+    struct Report<'a> {
+        agent_vpn_ip: &'a str,
+        checksum: &'a str,
+        status: &'a str,
+    }
     client
         .post(format!("{master}/api/update/report"))
         .header("X-R4A-Secret", secret)
-        .json(&Report { agent_vpn_ip: vpn_ip, checksum, status })
+        .json(&Report {
+            agent_vpn_ip: vpn_ip,
+            checksum,
+            status,
+        })
         .send()
         .await?
         .error_for_status()?;

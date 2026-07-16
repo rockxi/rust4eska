@@ -1,10 +1,10 @@
 use r4a_client::UpdateStatus;
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame,
 };
 
 pub fn render(f: &mut Frame, area: Rect, status: Option<&UpdateStatus>, message: Option<&str>) {
@@ -24,7 +24,10 @@ pub fn render(f: &mut Frame, area: Rect, status: Option<&UpdateStatus>, message:
         let master_color = if master_ok { Color::Green } else { Color::Red };
         items.push(ListItem::new(Line::from(vec![
             Span::styled("master  ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(format!("sha256:{master_short}"), Style::default().fg(master_color)),
+            Span::styled(
+                format!("sha256:{master_short}"),
+                Style::default().fg(master_color),
+            ),
             if s.update_pending {
                 Span::styled("  [UPDATE PENDING]", Style::default().fg(Color::Yellow))
             } else {
@@ -46,8 +49,14 @@ pub fn render(f: &mut Frame, area: Rect, status: Option<&UpdateStatus>, message:
                 _ => Color::DarkGray,
             };
             items.push(ListItem::new(Line::from(vec![
-                Span::styled(format!("{ip:<15} "), Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(format!("sha256:{cs_short}"), Style::default().fg(status_color)),
+                Span::styled(
+                    format!("{ip:<15} "),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("sha256:{cs_short}"),
+                    Style::default().fg(status_color),
+                ),
                 Span::raw(format!("  [{}]", agent.status)),
             ])));
         }
@@ -81,5 +90,9 @@ pub fn render(f: &mut Frame, area: Rect, status: Option<&UpdateStatus>, message:
 }
 
 fn short_cs(cs: &str) -> &str {
-    if cs.len() >= 12 { &cs[..12] } else { cs }
+    if cs.len() >= 12 {
+        &cs[..12]
+    } else {
+        cs
+    }
 }

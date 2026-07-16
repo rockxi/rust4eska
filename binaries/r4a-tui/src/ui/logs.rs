@@ -1,10 +1,10 @@
 use r4a_client::LogEntry;
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    Frame,
 };
 
 fn fmt_ts(ts_ms: u64) -> String {
@@ -35,7 +35,11 @@ pub fn render(
     let empty = items.is_empty();
 
     let list = List::new(items)
-        .block(Block::default().title(" Containers (j/k) ").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(" Containers (j/k) ")
+                .borders(Borders::ALL),
+        )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     let mut list_state = ListState::default();
@@ -80,7 +84,6 @@ pub fn render(
         }
     };
 
-    let logs = Paragraph::new(lines)
-        .block(Block::default().title(title).borders(Borders::ALL));
+    let logs = Paragraph::new(lines).block(Block::default().title(title).borders(Borders::ALL));
     f.render_widget(logs, chunks[1]);
 }

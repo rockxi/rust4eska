@@ -12,7 +12,8 @@ import {
   Server,
   Container,
   Wifi,
-  ScrollText
+  ScrollText,
+  Package
 } from 'lucide-react';
 
 const Layout: React.FC = () => {
@@ -28,6 +29,7 @@ const Layout: React.FC = () => {
     { path: '/', label: 'Dashboard', icon: LayoutDashboard },
     { path: '/containers', label: 'Containers', icon: Container },
     { path: '/logs', label: 'Logs', icon: ScrollText },
+    { path: '/registry', label: 'Registry', icon: Package },
     { path: '/git', label: 'Git', icon: GitBranch },
     { path: '/manifests', label: 'Manifests', icon: FileCode },
     { path: '/vault', label: 'Vault', icon: Lock },

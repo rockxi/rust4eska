@@ -1,2 +1,2 @@
-pub mod wireguard;
 pub mod dns;
+pub mod wireguard;

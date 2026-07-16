@@ -1,10 +1,10 @@
 use r4a_client::Manifest;
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    Frame,
 };
 
 pub fn render(
@@ -44,7 +44,10 @@ pub fn render(
             .map(|(i, manifest)| {
                 let selected = i == selected_idx;
                 let style = if selected {
-                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -74,7 +77,11 @@ pub fn render(
     };
 
     let list = List::new(items)
-        .block(Block::default().title(" Manifests (j/k, d=delete) ").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(" Manifests (j/k, d=delete) ")
+                .borders(Borders::ALL),
+        )
         .highlight_style(Style::default());
 
     f.render_stateful_widget(list, main_chunks[0], &mut list_state);
@@ -87,7 +94,11 @@ pub fn render(
             text
         );
         let para = Paragraph::new(content)
-            .block(Block::default().title(" Create Manifest ").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(" Create Manifest ")
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(Color::Yellow));
         f.render_widget(para, main_chunks[1]);

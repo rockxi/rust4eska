@@ -5,7 +5,7 @@ use bollard::Docker;
 use r4a_core::Manifest;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 
 pub struct Reconciler {
     docker: Docker,
@@ -35,13 +35,20 @@ impl Reconciler {
         info!("Reconciling {} manifests...", manifests.len());
 
         let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![format!("r4a.node={}", self.node_name)]);
+        filters.insert(
+            "label".to_string(),
+            vec![format!("r4a.node={}", self.node_name)],
+        );
 
-        let containers = match self.docker.list_containers(Some(bollard::container::ListContainersOptions {
-            all: true,
-            filters,
-            ..Default::default()
-        })).await {
+        let containers = match self
+            .docker
+            .list_containers(Some(bollard::container::ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            }))
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to list containers: {}", e);
@@ -89,8 +96,13 @@ impl Reconciler {
                                     env_changed = true;
                                 }
 
-                                if env_changed || config.image != Some(container_config.image.clone()) {
-                                    info!("Container {} config or secrets changed, restarting...", container_name);
+                                if env_changed
+                                    || config.image != Some(container_config.image.clone())
+                                {
+                                    info!(
+                                        "Container {} config or secrets changed, restarting...",
+                                        container_name
+                                    );
                                     let _ = self.docker.stop_container(id, None).await;
                                     let _ = self.docker.remove_container(id, None).await;
                                     should_start = true;
@@ -107,7 +119,10 @@ impl Reconciler {
 
                 if should_start {
                     info!("Starting container: {}", container_name);
-                    if let Err(e) = self.start_container(&container_name, container_config, &resolved_env).await {
+                    if let Err(e) = self
+                        .start_container(&container_name, container_config, &resolved_env)
+                        .await
+                    {
                         error!("Failed to start container {}: {}", container_name, e);
                     }
                 }
@@ -116,17 +131,28 @@ impl Reconciler {
             if let Some(systemd_config) = &manifest.systemd {
                 let service_name = format!("r4a-{}", name);
                 info!("Ensuring systemd service: {}", service_name);
-                let _ = self.service_manager.enable(&service_name, &format!("r4a managed {}", name), &systemd_config.exec, &[]);
+                let _ = self.service_manager.enable(
+                    &service_name,
+                    &format!("r4a managed {}", name),
+                    &systemd_config.exec,
+                    &[],
+                );
             }
         }
 
         for (name, id) in managed_containers {
             if let Some(id) = id {
                 info!("Removing orphaned container: {}", name);
-                let _ = self.docker.remove_container(
-                    &id,
-                    Some(bollard::container::RemoveContainerOptions { force: true, ..Default::default() }),
-                ).await;
+                let _ = self
+                    .docker
+                    .remove_container(
+                        &id,
+                        Some(bollard::container::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
             }
         }
 
@@ -149,17 +175,20 @@ impl Reconciler {
                     let r = self.agent_token.read().unwrap();
                     r.clone()
                 };
-                
+
                 if token.is_empty() {
                     warn!("Agent token is empty, skipping vault secret: {}", path);
                     resolved.insert(k.clone(), v.clone());
                     continue;
                 }
 
-                match client.get("http://master.r4a.local:3501/api/vault")
+                match client
+                    .get("http://master.r4a.local:3501/api/vault")
                     .query(&[("config_id", config_id), ("key", key)])
                     .header("Authorization", format!("Bearer {}", token))
-                    .send().await {
+                    .send()
+                    .await
+                {
                     Ok(resp) if resp.status() == 200 => {
                         if let Ok(val) = resp.json::<String>().await {
                             resolved.insert(k.clone(), val);
@@ -175,10 +204,15 @@ impl Reconciler {
         resolved
     }
 
-    async fn start_container(&self, name: &str, config: &r4a_core::ContainerConfig, env: &HashMap<String, String>) -> Result<()> {
+    async fn start_container(
+        &self,
+        name: &str,
+        config: &r4a_core::ContainerConfig,
+        env: &HashMap<String, String>,
+    ) -> Result<()> {
         let node_name = self.node_name.clone();
         use futures_util::stream::StreamExt;
-        
+
         let image_exists = self.docker.inspect_image(&config.image).await.is_ok();
         if !image_exists {
             info!("Image {} not found locally, pulling...", config.image);
@@ -199,7 +233,7 @@ impl Reconciler {
         }
 
         let env_list: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        
+
         let mut port_bindings = HashMap::new();
         let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
         if let Some(ports) = &config.ports {
@@ -209,10 +243,13 @@ impl Reconciler {
                     let host_port = parts[0];
                     let container_port = parts[1];
                     let port_key = format!("{}/tcp", container_port);
-                    port_bindings.insert(port_key.clone(), Some(vec![PortBinding {
-                        host_ip: Some("0.0.0.0".to_string()),
-                        host_port: Some(host_port.to_string()),
-                    }]));
+                    port_bindings.insert(
+                        port_key.clone(),
+                        Some(vec![PortBinding {
+                            host_ip: Some("0.0.0.0".to_string()),
+                            host_port: Some(host_port.to_string()),
+                        }]),
+                    );
                     exposed_ports.insert(port_key, HashMap::new());
                 }
             }
@@ -237,18 +274,35 @@ impl Reconciler {
             cmd: config.command.clone(),
             host_config: Some(host_config),
             labels: Some(labels),
-            exposed_ports: if exposed_ports.is_empty() { None } else { Some(exposed_ports) },
+            exposed_ports: if exposed_ports.is_empty() {
+                None
+            } else {
+                Some(exposed_ports)
+            },
             ..Default::default()
         };
 
-        if let Err(e) = self.docker.create_container(
-            Some(CreateContainerOptions { name: name.to_string(), ..Default::default() }),
-            docker_config.clone(),
-        ).await {
-            if let bollard::errors::Error::DockerResponseServerError { status_code: 409, .. } = e {
+        if let Err(e) = self
+            .docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: name.to_string(),
+                    ..Default::default()
+                }),
+                docker_config.clone(),
+            )
+            .await
+        {
+            if let bollard::errors::Error::DockerResponseServerError {
+                status_code: 409, ..
+            } = e
+            {
                 // Only remove if the existing container is r4a-managed (has our label).
                 // Never touch containers created outside of r4a.
-                let is_ours = self.docker.inspect_container(name, None).await
+                let is_ours = self
+                    .docker
+                    .inspect_container(name, None)
+                    .await
                     .ok()
                     .and_then(|c| c.config)
                     .and_then(|c| c.labels)
@@ -262,28 +316,49 @@ impl Reconciler {
                     ));
                 }
 
-                info!("Container {} already exists with r4a label, recreating...", name);
+                info!(
+                    "Container {} already exists with r4a label, recreating...",
+                    name
+                );
                 let _ = self.docker.stop_container(name, None).await;
-                let _ = self.docker.remove_container(
-                    name,
-                    Some(bollard::container::RemoveContainerOptions { force: true, ..Default::default() }),
-                ).await;
-                self.docker.create_container(
-                    Some(CreateContainerOptions { name: name.to_string(), ..Default::default() }),
-                    docker_config.clone(),
-                ).await?;
+                let _ = self
+                    .docker
+                    .remove_container(
+                        name,
+                        Some(bollard::container::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                self.docker
+                    .create_container(
+                        Some(CreateContainerOptions {
+                            name: name.to_string(),
+                            ..Default::default()
+                        }),
+                        docker_config.clone(),
+                    )
+                    .await?;
             } else {
                 return Err(e.into());
             }
         }
 
-        if let Err(e) = self.docker.start_container(name, None::<StartContainerOptions<String>>).await {
-            if let bollard::errors::Error::DockerResponseServerError { status_code: 304, .. } = e {
+        if let Err(e) = self
+            .docker
+            .start_container(name, None::<StartContainerOptions<String>>)
+            .await
+        {
+            if let bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            } = e
+            {
             } else {
                 return Err(e.into());
             }
         }
-        
+
         info!("Container {} started successfully", name);
         Ok(())
     }

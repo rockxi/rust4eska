@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub mod models;
 pub mod crypto;
+pub mod models;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {

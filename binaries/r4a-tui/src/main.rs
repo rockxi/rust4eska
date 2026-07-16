@@ -1,22 +1,22 @@
 mod ui;
 
-use anyhow::{Result, Context};
-use r4a_client::{ApiClient, Manifest, NodeInfo, RepoInfo, UpdateStatus, Token};
+use anyhow::{Context, Result};
 use clap::Parser;
-use sha2::{Digest, Sha256};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use r4a_client::{ApiClient, Manifest, NodeInfo, RepoInfo, Token, UpdateStatus};
 use ratatui::{
-    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Tabs},
+    Terminal,
 };
+use sha2::{Digest, Sha256};
 use std::{io, time::Duration};
 use ui::Screen;
 
@@ -26,7 +26,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 #[command(name = "r4a-tui", about = "r4a cluster dashboard")]
 struct Cli {
     /// Master node API URL
-    #[arg(long, env = "R4A_MASTER", default_value = "http://master.r4a.local:3501")]
+    #[arg(
+        long,
+        env = "R4A_MASTER",
+        default_value = "http://master.r4a.local:3501"
+    )]
     master: String,
     #[arg(long, env = "R4A_SECRET")]
     secret: Option<String>,
@@ -122,28 +126,39 @@ impl App {
 
         if self.screen == Screen::Git {
             match self.client.git_repos().await {
-                Ok(r) => { self.git_repos = Some(r); self.git_error = None; }
+                Ok(r) => {
+                    self.git_repos = Some(r);
+                    self.git_error = None;
+                }
                 Err(e) => self.git_error = Some(e.to_string()),
             }
         }
 
         if self.screen == Screen::Vault {
             match self.client.vault_configs_list().await {
-                Ok(c) => { self.vault_configs = Some(c); }
+                Ok(c) => {
+                    self.vault_configs = Some(c);
+                }
                 Err(e) => self.vault_message = Some(format!("Error: {e}")),
             }
-            
-            let config_id = self.vault_configs.as_ref()
+
+            let config_id = self
+                .vault_configs
+                .as_ref()
                 .and_then(|c| c.get(self.vault_config_idx))
                 .map(|c| c.id.as_str())
                 .unwrap_or("default");
 
             match self.client.vault_list(config_id).await {
-                Ok(k) => { self.vault_keys = Some(k); }
+                Ok(k) => {
+                    self.vault_keys = Some(k);
+                }
                 Err(e) => self.vault_message = Some(format!("Error: {e}")),
             }
             match self.client.tokens_list().await {
-                Ok(t) => { self.rbac_tokens = Some(t); }
+                Ok(t) => {
+                    self.rbac_tokens = Some(t);
+                }
                 Err(_) => {}
             }
         }
@@ -162,7 +177,9 @@ impl App {
 
         if self.screen == Screen::Rbac {
             match self.client.tokens_list().await {
-                Ok(t) => { self.rbac_tokens = Some(t); }
+                Ok(t) => {
+                    self.rbac_tokens = Some(t);
+                }
                 Err(e) => self.rbac_message = Some(format!("Error: {e}")),
             }
         }
@@ -178,7 +195,9 @@ impl App {
                 }
                 Err(e) => self.logs_message = Some(format!("Error: {e}")),
             }
-            let selected = self.logs_containers.as_ref()
+            let selected = self
+                .logs_containers
+                .as_ref()
                 .and_then(|c| c.get(self.logs_selected_idx))
                 .cloned();
             if let Some((node, container)) = selected {
@@ -225,9 +244,9 @@ async fn main() -> Result<()> {
 
 async fn handle_update_command(master_url: &str, secret: Option<String>) -> Result<()> {
     let client = ApiClient::new(master_url, secret);
-    
+
     println!("Checking for updates on {}...", master_url);
-    
+
     print!("- Fetching latest release from GitHub... ");
     match client.fetch_github_release().await {
         Ok(v) => println!("OK (version {})", v),
@@ -236,7 +255,7 @@ async fn handle_update_command(master_url: &str, secret: Option<String>) -> Resu
             return Err(e);
         }
     }
-    
+
     print!("- Triggering agent updates... ");
     match client.update_trigger().await {
         Ok(()) => println!("OK (agents will update within 30s)"),
@@ -254,7 +273,7 @@ async fn handle_update_command(master_url: &str, secret: Option<String>) -> Resu
         }
         Err(e) => println!("FAIL: {e}"),
     }
-    
+
     print!("- Triggering r4a-server restart... ");
     match client.server_update_trigger().await {
         Ok(()) => println!("OK (server is restarting)"),
@@ -267,7 +286,7 @@ async fn handle_update_command(master_url: &str, secret: Option<String>) -> Resu
 
 async fn tui_self_update(client: &ApiClient) -> Result<bool> {
     let master_checksum = client.get_tui_checksum().await?;
-    
+
     let self_path = std::env::current_exe().context("Failed to get current executable path")?;
     let data = std::fs::read(&self_path)?;
     let mut hasher = Sha256::new();
@@ -289,13 +308,13 @@ async fn tui_self_update(client: &ApiClient) -> Result<bool> {
 
     let tmp_path = format!("{}.new", self_path.display());
     std::fs::write(&tmp_path, &bytes)?;
-    
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
     }
-    
+
     let check_status = std::process::Command::new(&tmp_path).arg("--help").status();
     if match check_status {
         Ok(status) => !status.success(),
@@ -309,7 +328,11 @@ async fn tui_self_update(client: &ApiClient) -> Result<bool> {
     Ok(true)
 }
 
-async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: &str, secret: Option<String>) -> Result<()> {
+async fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    master_url: &str,
+    secret: Option<String>,
+) -> Result<()> {
     let mut app = App::new(master_url, secret);
     app.refresh().await;
 
@@ -323,9 +346,13 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                 // Git input mode intercepts all keys
                 if app.screen == Screen::Git && app.git_input.is_some() {
                     match key.code {
-                        KeyCode::Esc => { app.git_input = None; }
+                        KeyCode::Esc => {
+                            app.git_input = None;
+                        }
                         KeyCode::Backspace => {
-                            if let Some(ref mut s) = app.git_input { s.pop(); }
+                            if let Some(ref mut s) = app.git_input {
+                                s.pop();
+                            }
                         }
                         KeyCode::Enter => {
                             let name = app.git_input.take().unwrap_or_default();
@@ -344,7 +371,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                             }
                         }
                         KeyCode::Char(c) => {
-                            if let Some(ref mut s) = app.git_input { s.push(c); }
+                            if let Some(ref mut s) = app.git_input {
+                                s.push(c);
+                            }
                         }
                         _ => {}
                     }
@@ -354,12 +383,14 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                 // Vault input mode
                 if app.screen == Screen::Vault && app.vault_input.is_some() {
                     match key.code {
-                        KeyCode::Esc => { 
+                        KeyCode::Esc => {
                             app.vault_input = None;
                             app.vault_editing_key = None;
                         }
                         KeyCode::Backspace => {
-                            if let Some(ref mut s) = app.vault_input { s.pop(); }
+                            if let Some(ref mut s) = app.vault_input {
+                                s.pop();
+                            }
                         }
                         KeyCode::Enter => {
                             let input = app.vault_input.take().unwrap_or_default();
@@ -368,7 +399,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                             if parts.len() == 2 {
                                 let key = parts[0].trim();
                                 let val = parts[1].trim();
-                                let config_id = app.vault_configs.as_ref()
+                                let config_id = app
+                                    .vault_configs
+                                    .as_ref()
                                     .and_then(|c| c.get(app.vault_config_idx))
                                     .map(|c| c.id.as_str())
                                     .unwrap_or("default");
@@ -387,7 +420,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                             }
                         }
                         KeyCode::Char(c) => {
-                            if let Some(ref mut s) = app.vault_input { s.push(c); }
+                            if let Some(ref mut s) = app.vault_input {
+                                s.push(c);
+                            }
                         }
                         _ => {}
                     }
@@ -396,18 +431,28 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
 
                 if app.screen == Screen::Vault && app.vault_grant_input.is_some() {
                     match key.code {
-                        KeyCode::Esc => { app.vault_grant_input = None; }
+                        KeyCode::Esc => {
+                            app.vault_grant_input = None;
+                        }
                         KeyCode::Backspace => {
-                            if let Some(ref mut s) = app.vault_grant_input { s.pop(); }
+                            if let Some(ref mut s) = app.vault_grant_input {
+                                s.pop();
+                            }
                         }
                         KeyCode::Enter => {
-                            let input = app.vault_grant_input.take().unwrap_or_default().trim().to_string();
+                            let input = app
+                                .vault_grant_input
+                                .take()
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
                             if input.starts_with("CONFIG: ") {
                                 let name = input.trim_start_matches("CONFIG: ").to_string();
                                 if !name.is_empty() {
                                     match app.client.vault_config_create(&name).await {
                                         Ok(config) => {
-                                            app.vault_message = Some(format!("Created config: {}", config.name));
+                                            app.vault_message =
+                                                Some(format!("Created config: {}", config.name));
                                             app.refresh().await;
                                         }
                                         Err(e) => app.vault_message = Some(format!("Error: {e}")),
@@ -418,20 +463,36 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                                 if !username.is_empty() {
                                     if let Some(ref keys) = app.vault_keys {
                                         if let Some(key) = keys.get(app.vault_selected_idx) {
-                                            let config_id = app.vault_configs.as_ref()
+                                            let config_id = app
+                                                .vault_configs
+                                                .as_ref()
                                                 .and_then(|c| c.get(app.vault_config_idx))
                                                 .map(|c| c.id.as_str())
                                                 .unwrap_or("default");
                                             let full_key = format!("{}/{}", config_id, key);
 
-                                            match app.client.token_create(&username, vec![r4a_core::models::Verb::Get], vec![r4a_core::models::Resource::Vault], Some(vec![full_key])).await {
+                                            match app
+                                                .client
+                                                .token_create(
+                                                    &username,
+                                                    vec![r4a_core::models::Verb::Get],
+                                                    vec![r4a_core::models::Resource::Vault],
+                                                    Some(vec![full_key]),
+                                                )
+                                                .await
+                                            {
                                                 Ok(token) => {
-                                                    app.vault_message = Some(format!("Created token for {}: {}", username, token.id));
+                                                    app.vault_message = Some(format!(
+                                                        "Created token for {}: {}",
+                                                        username, token.id
+                                                    ));
                                                     if let Ok(t) = app.client.tokens_list().await {
                                                         app.rbac_tokens = Some(t);
                                                     }
                                                 }
-                                                Err(e) => app.vault_message = Some(format!("Error: {e}")),
+                                                Err(e) => {
+                                                    app.vault_message = Some(format!("Error: {e}"))
+                                                }
                                             }
                                         }
                                     }
@@ -439,7 +500,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                             }
                         }
                         KeyCode::Char(c) => {
-                            if let Some(ref mut s) = app.vault_grant_input { s.push(c); }
+                            if let Some(ref mut s) = app.vault_grant_input {
+                                s.push(c);
+                            }
                         }
                         _ => {}
                     }
@@ -449,15 +512,27 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                 // Manifests input mode
                 if app.screen == Screen::Manifests && app.manifests_input.is_some() {
                     match key.code {
-                        KeyCode::Esc => { app.manifests_input = None; }
+                        KeyCode::Esc => {
+                            app.manifests_input = None;
+                        }
                         KeyCode::Backspace => {
-                            if let Some(ref mut s) = app.manifests_input { s.pop(); }
+                            if let Some(ref mut s) = app.manifests_input {
+                                s.pop();
+                            }
                         }
                         KeyCode::Enter => {
-                            let name = app.manifests_input.take().unwrap_or_default().trim().to_string();
+                            let name = app
+                                .manifests_input
+                                .take()
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
                             if !name.is_empty() {
                                 let manifest = r4a_client::Manifest {
-                                    app: r4a_client::AppConfig { name: name.clone(), node_selector: "all".to_string() },
+                                    app: r4a_client::AppConfig {
+                                        name: name.clone(),
+                                        node_selector: "all".to_string(),
+                                    },
                                     container: Some(r4a_client::ContainerConfig {
                                         image: "alpine:latest".to_string(),
                                         restart: "always".to_string(),
@@ -471,7 +546,10 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                                 };
                                 match app.client.manifest_upsert(&manifest).await {
                                     Ok(()) => {
-                                        app.manifests_message = Some(format!("Created: {} (edit via API/web to configure)", name));
+                                        app.manifests_message = Some(format!(
+                                            "Created: {} (edit via API/web to configure)",
+                                            name
+                                        ));
                                         app.refresh().await;
                                     }
                                     Err(e) => app.manifests_message = Some(format!("Error: {e}")),
@@ -479,7 +557,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                             }
                         }
                         KeyCode::Char(c) => {
-                            if let Some(ref mut s) = app.manifests_input { s.push(c); }
+                            if let Some(ref mut s) = app.manifests_input {
+                                s.push(c);
+                            }
                         }
                         _ => {}
                     }
@@ -493,8 +573,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                 }
 
                 match (key.code, key.modifiers) {
-                    (KeyCode::Char('q'), _)
-                    | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                    (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
                     (KeyCode::Tab, _) | (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
                         app.screen = app.screen.next();
                         app.update_message = None;
@@ -522,12 +601,16 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                             }
                         }
                     }
-                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) if app.screen == Screen::Manifests => {
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), _)
+                        if app.screen == Screen::Manifests =>
+                    {
                         if app.manifests_selected_idx > 0 {
                             app.manifests_selected_idx -= 1;
                         }
                     }
-                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) if app.screen == Screen::Manifests => {
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), _)
+                        if app.screen == Screen::Manifests =>
+                    {
                         if let Some(ref list) = app.manifests {
                             if app.manifests_selected_idx < list.len().saturating_sub(1) {
                                 app.manifests_selected_idx += 1;
@@ -554,7 +637,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                     (KeyCode::Char('e'), _) if app.screen == Screen::Vault => {
                         if let Some(ref keys) = app.vault_keys {
                             if let Some(key) = keys.get(app.vault_selected_idx) {
-                                let config_id = app.vault_configs.as_ref()
+                                let config_id = app
+                                    .vault_configs
+                                    .as_ref()
                                     .and_then(|c| c.get(app.vault_config_idx))
                                     .map(|c| c.id.as_str())
                                     .unwrap_or("default");
@@ -573,7 +658,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                     (KeyCode::Char('d'), _) if app.screen == Screen::Vault => {
                         if let Some(ref keys) = app.vault_keys {
                             if let Some(key) = keys.get(app.vault_selected_idx) {
-                                let config_id = app.vault_configs.as_ref()
+                                let config_id = app
+                                    .vault_configs
+                                    .as_ref()
                                     .and_then(|c| c.get(app.vault_config_idx))
                                     .map(|c| c.id.as_str())
                                     .unwrap_or("default");
@@ -597,7 +684,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                     (KeyCode::Char('v'), _) if app.screen == Screen::Vault => {
                         if let Some(ref keys) = app.vault_keys {
                             if let Some(key) = keys.get(app.vault_selected_idx) {
-                                let config_id = app.vault_configs.as_ref()
+                                let config_id = app
+                                    .vault_configs
+                                    .as_ref()
                                     .and_then(|c| c.get(app.vault_config_idx))
                                     .map(|c| c.id.as_str())
                                     .unwrap_or("default");
@@ -717,7 +806,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, master_url: 
                     (KeyCode::Char('u'), _) if app.screen == Screen::Update => {
                         match app.client.update_trigger().await {
                             Ok(()) => {
-                                app.update_message = Some("Update triggered. Agents will update within 30s.".to_string());
+                                app.update_message = Some(
+                                    "Update triggered. Agents will update within 30s.".to_string(),
+                                );
                                 if let Ok(s) = app.client.update_status().await {
                                     app.update_status = Some(s);
                                 }

@@ -33,7 +33,10 @@ impl ShipState {
             .ok()
             .and_then(|data| serde_json::from_slice(&data).ok())
             .unwrap_or_default();
-        Self { path, last_ts: Mutex::new(last_ts) }
+        Self {
+            path,
+            last_ts: Mutex::new(last_ts),
+        }
     }
 
     fn get(&self, container: &str) -> u64 {
@@ -78,24 +81,28 @@ pub async fn run_collector(
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<LogsChTarget>().await {
-                    Ok(t) => break t,
-                    Err(e) => debug!("Telemetry: bad agent-config: {}", e),
-                }
-            }
+            Ok(resp) if resp.status().is_success() => match resp.json::<LogsChTarget>().await {
+                Ok(t) => break t,
+                Err(e) => debug!("Telemetry: bad agent-config: {}", e),
+            },
             Ok(_) => {} // 404 — логи не настроены
             Err(e) => debug!("Telemetry: agent-config poll failed: {}", e),
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(CONFIG_POLL_SECS)).await;
     };
 
-    info!("Telemetry collector started (node={}, clickhouse={})", node_name, target.endpoint);
+    info!(
+        "Telemetry collector started (node={}, clickhouse={})",
+        node_name, target.endpoint
+    );
 
     let docker = match Docker::connect_with_local_defaults() {
         Ok(d) => d,
         Err(e) => {
-            warn!("Telemetry collector: Docker connect failed, collector disabled: {}", e);
+            warn!(
+                "Telemetry collector: Docker connect failed, collector disabled: {}",
+                e
+            );
             return;
         }
     };
@@ -118,18 +125,16 @@ pub async fn run_collector(
                 .send()
                 .await
             {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.json::<LogsChTarget>().await {
-                        Ok(next) => {
-                            let mut cur = refresh_target.lock().unwrap();
-                            if cur.endpoint != next.endpoint || cur.password != next.password {
-                                info!("Telemetry: ClickHouse target updated ({})", next.endpoint);
-                                *cur = next;
-                            }
+                Ok(resp) if resp.status().is_success() => match resp.json::<LogsChTarget>().await {
+                    Ok(next) => {
+                        let mut cur = refresh_target.lock().unwrap();
+                        if cur.endpoint != next.endpoint || cur.password != next.password {
+                            info!("Telemetry: ClickHouse target updated ({})", next.endpoint);
+                            *cur = next;
                         }
-                        Err(e) => debug!("Telemetry: bad refreshed agent-config: {}", e),
                     }
-                }
+                    Err(e) => debug!("Telemetry: bad refreshed agent-config: {}", e),
+                },
                 Ok(resp) => debug!("Telemetry: agent-config refresh HTTP {}", resp.status()),
                 Err(e) => debug!("Telemetry: agent-config refresh failed: {}", e),
             }
@@ -143,7 +148,11 @@ pub async fn run_collector(
     loop {
         let mut filters = HashMap::new();
         filters.insert("label".to_string(), vec![format!("r4a.node={}", node_name)]);
-        let opts = ListContainersOptions { all: false, filters, ..Default::default() };
+        let opts = ListContainersOptions {
+            all: false,
+            filters,
+            ..Default::default()
+        };
 
         match docker.list_containers(Some(opts)).await {
             Ok(containers) => {
@@ -220,7 +229,8 @@ async fn follow_container(
 
     let mut stream = docker.logs(&id, Some(opts));
     let mut buf: Vec<LogEntry> = Vec::new();
-    let mut flush_tick = tokio::time::interval(tokio::time::Duration::from_secs(FLUSH_INTERVAL_SECS));
+    let mut flush_tick =
+        tokio::time::interval(tokio::time::Duration::from_secs(FLUSH_INTERVAL_SECS));
 
     loop {
         tokio::select! {
@@ -296,7 +306,10 @@ async fn ship(
     }
     let target = target.lock().unwrap().clone();
     let res = client
-        .post(format!("{}/?query=INSERT%20INTO%20r4a.logs%20FORMAT%20JSONEachRow", target.endpoint))
+        .post(format!(
+            "{}/?query=INSERT%20INTO%20r4a.logs%20FORMAT%20JSONEachRow",
+            target.endpoint
+        ))
         .basic_auth("default", Some(&target.password))
         .body(body)
         .send()
@@ -308,7 +321,10 @@ async fn ship(
             }
         }
         Ok(resp) => {
-            debug!("Telemetry: ClickHouse rejected batch: HTTP {}", resp.status());
+            debug!(
+                "Telemetry: ClickHouse rejected batch: HTTP {}",
+                resp.status()
+            );
             // строки уже взяты из buf — при ошибке возвращаем, чтобы не терять
             buf.extend(entries);
         }

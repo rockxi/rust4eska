@@ -2484,15 +2484,24 @@ name = "r4a-git-registry"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "axum",
+ "base64",
  "bytes",
+ "hex",
  "http",
  "http-body-util",
  "r4a-core",
+ "r4a-store",
  "serde",
+ "serde_json",
+ "sha2",
+ "sled",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

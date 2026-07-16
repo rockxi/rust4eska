@@ -1,11 +1,11 @@
+use r4a_client::Token;
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame,
 };
-use r4a_client::Token;
 
 pub fn render(
     f: &mut Frame,
@@ -22,7 +22,11 @@ pub fn render(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
         .split(area);
 
     let config_names = match configs {
@@ -30,10 +34,23 @@ pub fn render(
         None => vec!["Loading...".to_string()],
     };
 
-    let config_tabs = ratatui::widgets::Tabs::new(config_names.iter().map(|s| Line::from(s.as_str())).collect::<Vec<_>>())
-        .block(Block::default().title(" Vault Config ( [ / ] to switch, Shift+C to new ) ").borders(Borders::ALL))
-        .select(config_idx)
-        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    let config_tabs = ratatui::widgets::Tabs::new(
+        config_names
+            .iter()
+            .map(|s| Line::from(s.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .block(
+        Block::default()
+            .title(" Vault Config ( [ / ] to switch, Shift+C to new ) ")
+            .borders(Borders::ALL),
+    )
+    .select(config_idx)
+    .highlight_style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
     f.render_widget(config_tabs, chunks[0]);
 
     let main_chunks = Layout::default()
@@ -41,7 +58,9 @@ pub fn render(
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[1]);
 
-    let block = Block::default().title(" Vault Secrets ").borders(Borders::ALL);
+    let block = Block::default()
+        .title(" Vault Secrets ")
+        .borders(Borders::ALL);
 
     let mut list_state = ratatui::widgets::ListState::default();
     list_state.select(Some(selected_idx));
@@ -60,7 +79,9 @@ pub fn render(
             .enumerate()
             .map(|(i, key)| {
                 let style = if i == selected_idx {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Cyan)
                 };
@@ -76,12 +97,16 @@ pub fn render(
             .collect(),
     };
 
-    let list = List::new(items).block(block).highlight_style(Style::default().bg(Color::DarkGray));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::DarkGray));
     f.render_stateful_widget(list, main_chunks[0], &mut list_state);
 
     let selected_key = secrets.and_then(|s| s.get(selected_idx));
-    let access_block = Block::default().title(" Access Control ").borders(Borders::ALL);
-    
+    let access_block = Block::default()
+        .title(" Access Control ")
+        .borders(Borders::ALL);
+
     let mut access_items = vec![];
     if let Some(key) = selected_key {
         access_items.push(ListItem::new(Line::from(vec![
@@ -93,9 +118,10 @@ pub fn render(
 
         if let Some(toks) = tokens {
             for token in toks {
-                access_items.push(ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {:<10}", token.username), Style::default().fg(Color::Green)),
-                ])));
+                access_items.push(ListItem::new(Line::from(vec![Span::styled(
+                    format!("  {:<10}", token.username),
+                    Style::default().fg(Color::Green),
+                )])));
             }
         }
     } else {
@@ -124,10 +150,15 @@ pub fn render(
             .style(Style::default().fg(Color::Magenta))
     } else if let Some(val) = revealed_value {
         Paragraph::new(format!(" Value: {}", val))
-            .block(Block::default().title(" Revealed Secret (Press any key to hide) ").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(" Revealed Secret (Press any key to hide) ")
+                    .borders(Borders::ALL),
+            )
             .style(Style::default().fg(Color::Green))
     } else {
-        let hint = message.unwrap_or("[n] New | [e] Edit | [d] Delete | [v] View | [a] Grant Access");
+        let hint =
+            message.unwrap_or("[n] New | [e] Edit | [d] Delete | [v] View | [a] Grant Access");
         let style = if message.is_some() {
             Style::default().fg(Color::Cyan)
         } else {

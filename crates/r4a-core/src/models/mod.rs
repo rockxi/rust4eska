@@ -71,6 +71,7 @@ pub enum Resource {
     Manifests,
     Vault,
     GitRepos,
+    Registry,
     Tokens,
     Policies,
     Bindings,

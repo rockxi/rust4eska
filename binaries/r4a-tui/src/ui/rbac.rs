@@ -1,10 +1,10 @@
 use r4a_client::Token;
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame,
 };
 
 pub fn render(
@@ -19,7 +19,9 @@ pub fn render(
         .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(area);
 
-    let block = Block::default().title(" RBAC Tokens ").borders(Borders::ALL);
+    let block = Block::default()
+        .title(" RBAC Tokens ")
+        .borders(Borders::ALL);
 
     let items: Vec<ListItem> = match (tokens, error) {
         (_, Some(e)) => vec![ListItem::new(Line::from(Span::styled(
@@ -41,7 +43,9 @@ pub fn render(
                     Line::from(vec![
                         Span::styled(
                             format!("{:<8}", token.username),
-                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             format!("{}", token.id),

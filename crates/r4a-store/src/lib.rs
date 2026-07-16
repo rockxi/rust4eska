@@ -1,10 +1,20 @@
-use axum::{extract::State, http::{StatusCode, HeaderMap}, routing::post, Json, Router};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+};
+use r4a_core::crypto;
+use r4a_core::{
+    Manifest,
+    models::{
+        Binding, Connection, KekDek, Policy, Resource, Rule, Token, VaultConfig, VaultSecret, Verb,
+    },
+};
 use serde::{Deserialize, Serialize};
 use sled::Db;
 use std::{path::Path, sync::Arc};
 use tracing::{debug, error, info};
-use r4a_core::crypto;
-use r4a_core::{Manifest, models::{VaultSecret, VaultConfig, KekDek, Token, Policy, Binding, Verb, Resource, Rule, Connection}};
 
 #[derive(Clone)]
 pub struct Store {
@@ -13,6 +23,8 @@ pub struct Store {
     pub vault_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, [u8; 32]>>>,
     // VPN IP других мастеров (например, "10.42.0.1", "10.42.0.2")
     pub masters: Arc<std::sync::RwLock<Vec<String>>>,
+    #[cfg(test)]
+    sync_events: Arc<std::sync::Mutex<Vec<SyncRequest>>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -32,6 +44,8 @@ impl Store {
             cluster_secret: Arc::new(std::sync::RwLock::new(String::new())),
             vault_keys: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             masters: Arc::new(std::sync::RwLock::new(Vec::new())),
+            #[cfg(test)]
+            sync_events: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -70,7 +84,7 @@ impl Store {
         };
 
         let master_key = crypto::derive_key_simple(&secret, &salt)?;
-        
+
         if let Some(kek_dek_bytes) = tree.get("kek_dek")? {
             if let Ok(kek_dek) = serde_json::from_slice::<serde_json::Value>(&kek_dek_bytes) {
                 if kek_dek.get("config_id").is_none() {
@@ -78,16 +92,20 @@ impl Store {
                     let default_config = VaultConfig {
                         id: "default".to_string(),
                         name: "Default".to_string(),
-                        created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+                        created_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_secs(),
                     };
-                    
+
                     let mut legacy_kek_dek: KekDek = serde_json::from_slice(&kek_dek_bytes)?;
                     legacy_kek_dek.config_id = "default".to_string();
-                    
+
                     let id = default_config.id.clone();
                     let value = serde_json::to_vec(&default_config)?;
-                    self.db.open_tree("vault_configs")?.insert(id.as_bytes(), value)?;
-                    
+                    self.db
+                        .open_tree("vault_configs")?
+                        .insert(id.as_bytes(), value)?;
+
                     tree.insert("kek_dek_default", serde_json::to_vec(&legacy_kek_dek)?)?;
                     tree.remove("kek_dek")?;
                 }
@@ -113,7 +131,11 @@ impl Store {
                 };
 
                 // Try current (random) master key first
-                let dek_bytes = match crypto::decrypt(&master_key, &kek_dek.encrypted_dek, &kek_dek.nonce) {
+                let dek_bytes = match crypto::decrypt(
+                    &master_key,
+                    &kek_dek.encrypted_dek,
+                    &kek_dek.nonce,
+                ) {
                     Ok(b) => b,
                     Err(_) => {
                         // Migration path: try legacy hardcoded-salt key
@@ -121,12 +143,18 @@ impl Store {
                             crypto::decrypt(lk, &kek_dek.encrypted_dek, &kek_dek.nonce).ok()
                         }) {
                             Some(b) => {
-                                info!("Vault config '{}': re-encrypting DEK with random salt (one-time migration)", config_id);
+                                info!(
+                                    "Vault config '{}': re-encrypting DEK with random salt (one-time migration)",
+                                    config_id
+                                );
                                 to_reencrypt.push((k, kek_dek));
                                 b
                             }
                             None => {
-                                error!("Vault config '{}': cannot decrypt DEK with any key — skipping", config_id);
+                                error!(
+                                    "Vault config '{}': cannot decrypt DEK with any key — skipping",
+                                    config_id
+                                );
                                 continue;
                             }
                         }
@@ -145,7 +173,11 @@ impl Store {
             if let Some(dek) = keys.get(&config_id) {
                 match crypto::encrypt(&master_key, dek) {
                     Ok((encrypted_dek, nonce)) => {
-                        let new_kek_dek = KekDek { config_id, encrypted_dek, nonce };
+                        let new_kek_dek = KekDek {
+                            config_id,
+                            encrypted_dek,
+                            nonce,
+                        };
                         if let Ok(bytes) = serde_json::to_vec(&new_kek_dek) {
                             let _ = tree.insert(tree_key, bytes);
                         }
@@ -160,14 +192,16 @@ impl Store {
             let default_config = VaultConfig {
                 id: "default".to_string(),
                 name: "Default".to_string(),
-                created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs(),
             };
             self.create_vault_config_internal(&master_key, default_config, &mut keys)?;
         }
 
         let mut w = self.vault_keys.write().unwrap();
         *w = keys;
-        
+
         info!("Vault initialized successfully");
         Ok(())
     }
@@ -194,7 +228,8 @@ impl Store {
     pub async fn create_vault_config(&self, name: String) -> anyhow::Result<VaultConfig> {
         let secret = self.cluster_secret.read().unwrap().clone();
         let tree_meta = self.db.open_tree("vault_meta")?;
-        let salt: Vec<u8> = tree_meta.get("master_salt")?
+        let salt: Vec<u8> = tree_meta
+            .get("master_salt")?
             .map(|s| s.to_vec())
             .ok_or_else(|| anyhow::anyhow!("Vault not initialized: master_salt missing"))?;
         let master_key = crypto::derive_key_simple(&secret, &salt)?;
@@ -203,12 +238,14 @@ impl Store {
         let config = VaultConfig {
             id: id.clone(),
             name,
-            created_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
         };
 
         let mut keys = self.vault_keys.read().unwrap().clone();
         self.create_vault_config_internal(&master_key, config.clone(), &mut keys)?;
-        
+
         {
             let mut w = self.vault_keys.write().unwrap();
             *w = keys;
@@ -218,26 +255,33 @@ impl Store {
         Ok(config)
     }
 
-    fn create_vault_config_internal(&self, master_key: &[u8], config: VaultConfig, keys: &mut std::collections::HashMap<String, [u8; 32]>) -> anyhow::Result<()> {
+    fn create_vault_config_internal(
+        &self,
+        master_key: &[u8],
+        config: VaultConfig,
+        keys: &mut std::collections::HashMap<String, [u8; 32]>,
+    ) -> anyhow::Result<()> {
         let mut dek = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut dek);
-        
-        let master_key_32: &[u8; 32] = master_key.try_into().map_err(|_| anyhow::anyhow!("Master key must be 32 bytes"))?;
+
+        let master_key_32: &[u8; 32] = master_key
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Master key must be 32 bytes"))?;
         let (encrypted_dek, nonce) = crypto::encrypt(master_key_32, &dek)?;
-        
+
         let kek_dek = KekDek {
             config_id: config.id.clone(),
             encrypted_dek,
             nonce,
         };
-        
+
         let tree_meta = self.db.open_tree("vault_meta")?;
         let key_meta = format!("kek_dek_{}", config.id);
         tree_meta.insert(key_meta.as_bytes(), serde_json::to_vec(&kek_dek)?)?;
-        
+
         let tree_configs = self.db.open_tree("vault_configs")?;
         tree_configs.insert(config.id.as_bytes(), serde_json::to_vec(&config)?)?;
-        
+
         keys.insert(config.id, dek);
         Ok(())
     }
@@ -248,7 +292,11 @@ impl Store {
         self.put("vault", full_key.as_bytes(), &value).await
     }
 
-    pub fn get_vault_secret(&self, config_id: &str, key: &str) -> anyhow::Result<Option<VaultSecret>> {
+    pub fn get_vault_secret(
+        &self,
+        config_id: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<VaultSecret>> {
         let full_key = format!("{}/{}", config_id, key);
         if let Some(bytes) = self.get("vault", full_key.as_bytes())? {
             let secret: VaultSecret = serde_json::from_slice(&bytes)?;
@@ -280,7 +328,12 @@ impl Store {
 
     pub fn decrypt_secret(&self, secret: &VaultSecret) -> anyhow::Result<String> {
         let keys = self.vault_keys.read().unwrap();
-        let dek = keys.get(&secret.config_id).ok_or_else(|| anyhow::anyhow!("Vault config {} not found or not initialized", secret.config_id))?;
+        let dek = keys.get(&secret.config_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Vault config {} not found or not initialized",
+                secret.config_id
+            )
+        })?;
         let decrypted = crypto::decrypt(dek, &secret.encrypted_value, &secret.nonce)?;
         Ok(String::from_utf8(decrypted)?)
     }
@@ -338,6 +391,13 @@ impl Store {
     }
 
     fn broadcast_sync(&self, req: SyncRequest) {
+        if !is_sync_tree_allowed(&req.tree) {
+            return;
+        }
+
+        #[cfg(test)]
+        self.sync_events.lock().unwrap().push(req.clone());
+
         let masters = self.masters.read().unwrap().clone();
         let secret = self.cluster_secret.read().unwrap().clone();
         for master_ip in masters {
@@ -348,17 +408,24 @@ impl Store {
                     .timeout(std::time::Duration::from_secs(2))
                     .build()
                     .unwrap_or_default();
-                
+
                 let target = format!("http://{master_ip}:3501/api/store/sync");
-                if let Err(e) = client.post(&target)
+                if let Err(e) = client
+                    .post(&target)
                     .header("X-R4A-Secret", &secret)
                     .json(&req)
                     .send()
-                    .await {
+                    .await
+                {
                     debug!("Store sync to {} failed: {}", master_ip, e);
                 }
             });
         }
+    }
+
+    #[cfg(test)]
+    fn take_sync_events(&self) -> Vec<SyncRequest> {
+        std::mem::take(&mut *self.sync_events.lock().unwrap())
     }
 
     pub fn get(&self, tree_name: &str, key: &[u8]) -> anyhow::Result<Option<sled::IVec>> {
@@ -438,7 +505,13 @@ impl Store {
         Ok(bindings)
     }
 
-    pub fn can(&self, subject: &str, verb: Verb, resource: Resource, resource_name: Option<&str>) -> bool {
+    pub fn can(
+        &self,
+        subject: &str,
+        verb: Verb,
+        resource: Resource,
+        resource_name: Option<&str>,
+    ) -> bool {
         let bindings = match self.get_bindings_for_subject(subject) {
             Ok(b) => b,
             Err(_) => return false,
@@ -448,7 +521,8 @@ impl Store {
             if let Ok(Some(policy)) = self.get_policy(&binding.policy_id) {
                 for rule in &policy.rules {
                     let verb_match = rule.verbs.contains(&verb) || rule.verbs.contains(&Verb::All);
-                    let res_match = rule.resources.contains(&resource) || rule.resources.contains(&Resource::All);
+                    let res_match = rule.resources.contains(&resource)
+                        || rule.resources.contains(&Resource::All);
                     if !verb_match || !res_match {
                         continue;
                     }
@@ -491,16 +565,24 @@ impl Store {
 
         for item in tokens_tree.iter() {
             if let Ok((k, v)) = item {
-                if let Ok(legacy) = serde_json::from_value::<serde_json::Value>(serde_json::from_slice(&v)?) {
+                if let Ok(legacy) =
+                    serde_json::from_value::<serde_json::Value>(serde_json::from_slice(&v)?)
+                {
                     let has_role = legacy.get("role").is_some();
                     let has_permissions = legacy.get("permissions").is_some();
                     if !has_role && !has_permissions {
                         continue;
                     }
 
-                    let username = legacy.get("username").and_then(|u| u.as_str()).unwrap_or("unknown");
+                    let username = legacy
+                        .get("username")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("unknown");
                     let id = legacy.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    let created_at = legacy.get("created_at").and_then(|t| t.as_u64()).unwrap_or(0);
+                    let created_at = legacy
+                        .get("created_at")
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
 
                     let is_admin = legacy.get("role").and_then(|r| r.as_str()) == Some("admin");
 
@@ -520,11 +602,18 @@ impl Store {
                                 resource_names: None,
                             }],
                         };
-                        self.db.open_tree("policies")?.insert(policy_id.as_bytes(), serde_json::to_vec(&admin_policy)?)?;
+                        self.db
+                            .open_tree("policies")?
+                            .insert(policy_id.as_bytes(), serde_json::to_vec(&admin_policy)?)?;
                     } else {
-                        let perms: Vec<String> = legacy.get("permissions")
+                        let perms: Vec<String> = legacy
+                            .get("permissions")
                             .and_then(|p| p.as_array())
-                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
                             .unwrap_or_default();
 
                         let mut resource_names = Vec::new();
@@ -537,7 +626,10 @@ impl Store {
                             resource_names.push(perm.clone());
                         }
 
-                        if resource_names.is_empty() || perms.contains(&"*".to_string()) || perms.contains(&"global/*".to_string()) {
+                        if resource_names.is_empty()
+                            || perms.contains(&"*".to_string())
+                            || perms.contains(&"global/*".to_string())
+                        {
                             let agent_policy = Policy {
                                 id: policy_id.clone(),
                                 rules: vec![Rule {
@@ -546,7 +638,9 @@ impl Store {
                                     resource_names: None,
                                 }],
                             };
-                            self.db.open_tree("policies")?.insert(policy_id.as_bytes(), serde_json::to_vec(&agent_policy)?)?;
+                            self.db
+                                .open_tree("policies")?
+                                .insert(policy_id.as_bytes(), serde_json::to_vec(&agent_policy)?)?;
                         } else {
                             let agent_policy = Policy {
                                 id: policy_id.clone(),
@@ -556,7 +650,9 @@ impl Store {
                                     resource_names: Some(resource_names),
                                 }],
                             };
-                            self.db.open_tree("policies")?.insert(policy_id.as_bytes(), serde_json::to_vec(&agent_policy)?)?;
+                            self.db
+                                .open_tree("policies")?
+                                .insert(policy_id.as_bytes(), serde_json::to_vec(&agent_policy)?)?;
                         }
                     }
 
@@ -565,7 +661,9 @@ impl Store {
                         subject: username.to_string(),
                         policy_id,
                     };
-                    self.db.open_tree("bindings")?.insert(binding_id.as_bytes(), serde_json::to_vec(&binding)?)?;
+                    self.db
+                        .open_tree("bindings")?
+                        .insert(binding_id.as_bytes(), serde_json::to_vec(&binding)?)?;
 
                     let new_token = Token {
                         id: id.to_string(),
@@ -579,7 +677,10 @@ impl Store {
         }
 
         if legacy_count > 0 {
-            info!("Migrated {} legacy RBAC token(s) to Policy/Binding system", legacy_count);
+            info!(
+                "Migrated {} legacy RBAC token(s) to Policy/Binding system",
+                legacy_count
+            );
         }
         Ok(())
     }
@@ -637,7 +738,9 @@ impl Store {
     /// Returns the pinned VPN IP for a label, if one was assigned before.
     pub fn get_label_ip(&self, label: &str) -> anyhow::Result<Option<String>> {
         let tree = self.db.open_tree("connection_labels")?;
-        Ok(tree.get(label.as_bytes())?.map(|v| String::from_utf8_lossy(&v).to_string()))
+        Ok(tree
+            .get(label.as_bytes())?
+            .map(|v| String::from_utf8_lossy(&v).to_string()))
     }
 
     /// Pins label → vpn_ip permanently (survives disconnects).
@@ -657,24 +760,37 @@ pub fn store_router(store: Store) -> Router {
 
 // C-3: only these trees may be replicated between masters
 const ALLOWED_SYNC_TREES: &[&str] = &[
-    "tokens", "bindings", "policies", "manifests", "vault", "vault_configs",
+    "tokens",
+    "bindings",
+    "policies",
+    "manifests",
+    "vault",
+    "vault_configs",
 ];
+
+fn is_sync_tree_allowed(tree: &str) -> bool {
+    ALLOWED_SYNC_TREES.contains(&tree)
+}
 
 async fn sync_handler(
     headers: HeaderMap,
     State(store): State<Store>,
-    Json(req): Json<SyncRequest>
+    Json(req): Json<SyncRequest>,
 ) -> StatusCode {
     if let Some(auth_header) = headers.get("X-R4A-Secret") {
         if let Ok(auth_str) = auth_header.to_str() {
             let is_auth = {
                 let secret = store.cluster_secret.read().unwrap();
-                !secret.is_empty() && constant_time_eq::constant_time_eq(auth_str.as_bytes(), secret.as_bytes())
+                !secret.is_empty()
+                    && constant_time_eq::constant_time_eq(auth_str.as_bytes(), secret.as_bytes())
             };
 
             if is_auth {
-                if !ALLOWED_SYNC_TREES.contains(&req.tree.as_str()) {
-                    error!("Sync rejected: tree '{}' is not in the allowed list", req.tree);
+                if !is_sync_tree_allowed(&req.tree) {
+                    error!(
+                        "Sync rejected: tree '{}' is not in the allowed list",
+                        req.tree
+                    );
                     return StatusCode::FORBIDDEN;
                 }
                 if let Ok(tree) = store.db.open_tree(&req.tree) {
@@ -741,5 +857,47 @@ mod tests {
         assert!(store.can("alice", Verb::Get, Resource::Vault, Some("prod-db")));
         assert!(store.can("alice", Verb::Get, Resource::Vault, Some("prod-")));
         assert!(!store.can("alice", Verb::Get, Resource::Vault, Some("staging-db")));
+    }
+
+    #[tokio::test]
+    async fn put_does_not_broadcast_for_disallowed_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+
+        store.put("core", b"k", b"v").await.unwrap();
+
+        assert!(store.take_sync_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_broadcasts_for_allowed_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+
+        store.put("manifests", b"app", b"value").await.unwrap();
+
+        let events = store.take_sync_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tree, "manifests");
+        assert_eq!(events[0].key, b"app");
+        assert_eq!(events[0].value, b"value");
+        assert!(!events[0].delete);
+    }
+
+    #[tokio::test]
+    async fn delete_broadcasts_for_allowed_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        store.put("manifests", b"app", b"value").await.unwrap();
+        let _ = store.take_sync_events();
+
+        store.delete("manifests", b"app").await.unwrap();
+
+        let events = store.take_sync_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tree, "manifests");
+        assert_eq!(events[0].key, b"app");
+        assert!(events[0].value.is_empty());
+        assert!(events[0].delete);
     }
 }

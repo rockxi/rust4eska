@@ -8,9 +8,15 @@ pub struct KeyPair {
 
 pub fn validate_wg_pubkey(key: &str) -> Result<()> {
     if key.len() != 44 {
-        anyhow::bail!("WireGuard public key must be 44 characters, got {}", key.len());
+        anyhow::bail!(
+            "WireGuard public key must be 44 characters, got {}",
+            key.len()
+        );
     }
-    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=') {
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    {
         anyhow::bail!("WireGuard public key contains invalid characters");
     }
     Ok(())
@@ -20,7 +26,10 @@ pub fn validate_node_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
         anyhow::bail!("Node name must be 1–64 characters");
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
         anyhow::bail!("Node name contains invalid characters (allowed: alphanumeric, -, _, .)");
     }
     Ok(())
@@ -37,7 +46,7 @@ pub fn validate_endpoint(endpoint: &str) -> Result<()> {
 }
 
 pub fn generate_keypair() -> Result<KeyPair> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use rand::rngs::OsRng;
     use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -81,7 +90,10 @@ pub fn setup_master_with_peers(
     }
     write_conf(&conf)?;
     bring_up()?;
-    tracing::info!("WireGuard master interface up at {vpn_ip} ({} peer(s))", peers.len());
+    tracing::info!(
+        "WireGuard master interface up at {vpn_ip} ({} peer(s))",
+        peers.len()
+    );
     Ok(())
 }
 
@@ -134,7 +146,19 @@ pub fn add_peer(pubkey: &str, vpn_ip: &str) -> Result<()> {
         anyhow::bail!("VPN IP contains forbidden control characters");
     }
     let iface = iface_name();
-    run(&wg_bin(), &["set", &iface, "peer", pubkey, "allowed-ips", &format!("{vpn_ip}/32"), "persistent-keepalive", "25"])?;
+    run(
+        &wg_bin(),
+        &[
+            "set",
+            &iface,
+            "peer",
+            pubkey,
+            "allowed-ips",
+            &format!("{vpn_ip}/32"),
+            "persistent-keepalive",
+            "25",
+        ],
+    )?;
     Ok(())
 }
 
@@ -146,12 +170,21 @@ pub fn add_peer_with_endpoint(pubkey: &str, vpn_ip: &str, endpoint: &str) -> Res
         anyhow::bail!("VPN IP contains forbidden control characters");
     }
     let iface = iface_name();
-    run(&wg_bin(), &[
-        "set", &iface, "peer", pubkey,
-        "endpoint", endpoint,
-        "allowed-ips", &format!("{vpn_ip}/32"),
-        "persistent-keepalive", "25",
-    ])?;
+    run(
+        &wg_bin(),
+        &[
+            "set",
+            &iface,
+            "peer",
+            pubkey,
+            "endpoint",
+            endpoint,
+            "allowed-ips",
+            &format!("{vpn_ip}/32"),
+            "persistent-keepalive",
+            "25",
+        ],
+    )?;
     Ok(())
 }
 
@@ -301,10 +334,16 @@ fn wait_for_iface(name: &str) -> Result<()> {
 fn bring_down_macos() {
     if let Ok(data) = std::fs::read_to_string(MACOS_WG_STATE) {
         if let Ok(state) = serde_json::from_str::<MacosWgState>(&data) {
-            let _ = Command::new("kill").args(["-9", &state.pid.to_string()]).output();
-            let _ = Command::new("route").args(["delete", "-net", "10.42.0.0/24"]).output();
+            let _ = Command::new("kill")
+                .args(["-9", &state.pid.to_string()])
+                .output();
+            let _ = Command::new("route")
+                .args(["delete", "-net", "10.42.0.0/24"])
+                .output();
             // Remove interface if still present
-            let _ = Command::new("ifconfig").args([&state.iface, "down"]).output();
+            let _ = Command::new("ifconfig")
+                .args([&state.iface, "down"])
+                .output();
         }
     }
     let _ = std::fs::remove_file(MACOS_WG_STATE);
@@ -335,16 +374,21 @@ fn bring_up_macos(conf_path: &str) -> Result<()> {
     let pid = child.id();
 
     // Persist state so bring_down can kill the process later
-    let state = MacosWgState { iface: iface.clone(), pid };
+    let state = MacosWgState {
+        iface: iface.clone(),
+        pid,
+    };
     std::fs::create_dir_all("/tmp/r4a-wg").ok();
-    let _ = std::fs::write(MACOS_WG_STATE, serde_json::to_string(&state).unwrap_or_default());
+    let _ = std::fs::write(
+        MACOS_WG_STATE,
+        serde_json::to_string(&state).unwrap_or_default(),
+    );
 
     // Wait for the utun interface to appear
     wait_for_iface(&iface).with_context(|| format!("wireguard-go failed to create {}", iface))?;
 
     // Load the config (private key + peer)
-    run(&wg_bin, &["setconf", &iface, conf_path])
-        .context("wg setconf failed")?;
+    run(&wg_bin, &["setconf", &iface, conf_path]).context("wg setconf failed")?;
 
     // Parse the Address= from the conf file to assign to the interface
     let conf_text = std::fs::read_to_string(conf_path).context("read wg conf")?;
@@ -357,13 +401,13 @@ fn bring_up_macos(conf_path: &str) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Address= not found in wg conf"))?;
 
     // Assign the VPN IP to the interface (point-to-point)
-    run("ifconfig", &[&iface, "inet", &vpn_ip, &vpn_ip])
-        .context("ifconfig failed")?;
+    run("ifconfig", &[&iface, "inet", &vpn_ip, &vpn_ip]).context("ifconfig failed")?;
 
     // Add route for the entire VPN subnet through this interface
-    let _ = Command::new("route").args(["delete", "-net", "10.42.0.0/24"]).output();
-    run("route", &["add", "-net", "10.42.0.0/24", &vpn_ip])
-        .context("route add failed")?;
+    let _ = Command::new("route")
+        .args(["delete", "-net", "10.42.0.0/24"])
+        .output();
+    run("route", &["add", "-net", "10.42.0.0/24", &vpn_ip]).context("route add failed")?;
 
     tracing::info!("WireGuard up on {} ip={}", iface, vpn_ip);
     Ok(())
@@ -376,11 +420,9 @@ fn write_conf(conf: &str) -> Result<()> {
     let tmp_path = format!("{}.tmp", path);
     let dir = std::path::Path::new(path).parent().unwrap();
 
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
 
-    std::fs::write(&tmp_path, conf)
-        .with_context(|| format!("write {}", tmp_path))?;
+    std::fs::write(&tmp_path, conf).with_context(|| format!("write {}", tmp_path))?;
 
     {
         use std::os::unix::fs::PermissionsExt;

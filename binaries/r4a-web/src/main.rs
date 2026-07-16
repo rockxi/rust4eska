@@ -52,9 +52,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
                 .body(Body::from(content.data))
                 .unwrap()
         }
-        None => {
-            index_html()
-        }
+        None => index_html(),
     }
 }
 

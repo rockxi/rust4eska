@@ -24,7 +24,13 @@ impl ServiceManager {
     /// Enable a service. `env_vars` are written to a 0o600 env-file and loaded
     /// via EnvironmentFile (systemd) or EnvironmentVariables (launchd), so they
     /// never appear in the process command line.
-    pub fn enable(&self, name: &str, description: &str, exec: &str, env_vars: &[(&str, &str)]) -> Result<()> {
+    pub fn enable(
+        &self,
+        name: &str,
+        description: &str,
+        exec: &str,
+        env_vars: &[(&str, &str)],
+    ) -> Result<()> {
         match self {
             ServiceManager::Systemd => {
                 let env_file_line = if !env_vars.is_empty() {

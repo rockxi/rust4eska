@@ -9,11 +9,7 @@ use axum::{
 };
 use bytes::Bytes;
 use http_body_util::BodyExt;
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    process::Stdio,
-};
+use std::{collections::HashMap, path::PathBuf, process::Stdio};
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
@@ -113,7 +109,12 @@ fn parse_cgi_response(raw: Vec<u8>) -> anyhow::Result<Response<Body>> {
         .ok_or_else(|| anyhow::anyhow!("no header separator in CGI response"))?;
 
     let header_bytes = &raw[..split_pos];
-    let body_start = split_pos + if raw.get(split_pos) == Some(&b'\r') { 4 } else { 2 };
+    let body_start = split_pos
+        + if raw.get(split_pos) == Some(&b'\r') {
+            4
+        } else {
+            2
+        };
     let body_bytes = raw[body_start..].to_vec();
 
     let header_str = std::str::from_utf8(header_bytes)?;
@@ -140,9 +141,7 @@ fn parse_cgi_response(raw: Vec<u8>) -> anyhow::Result<Response<Body>> {
         }
     }
 
-    Ok(resp
-        .status(status)
-        .body(Body::from(body_bytes))?)
+    Ok(resp.status(status).body(Body::from(body_bytes))?)
 }
 
 fn find_header_end(data: &[u8]) -> Option<usize> {

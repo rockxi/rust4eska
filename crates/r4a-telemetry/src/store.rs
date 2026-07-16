@@ -17,7 +17,10 @@ pub struct LogStore {
 impl LogStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let db = sled::open(path)?;
-        Ok(Self { db, seq: Arc::new(AtomicU32::new(0)) })
+        Ok(Self {
+            db,
+            seq: Arc::new(AtomicU32::new(0)),
+        })
     }
 
     /// Точка истории метрик ноды. Ключ: `{node}\0{ts_ms:016x}{seq:08x}`.
@@ -56,7 +59,8 @@ impl LogStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
-            .saturating_sub(max_age_secs)) * 1000;
+            .saturating_sub(max_age_secs))
+            * 1000;
 
         let tree = self.db.open_tree(METRICS_TREE)?;
         let mut removed = 0;
@@ -98,7 +102,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LogStore::open(dir.path()).unwrap();
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
 
         store.append_metric(&point("n1", now - 1000, 10.0)).unwrap();
         store.append_metric(&point("n1", now, 20.0)).unwrap();
@@ -116,7 +122,9 @@ mod tests {
         assert_eq!(got[0].cpu_percent, 20.0);
 
         // prune: старая точка уходит, свежие остаются
-        store.append_metric(&point("n1", now - 10 * 24 * 3600 * 1000, 5.0)).unwrap();
+        store
+            .append_metric(&point("n1", now - 10 * 24 * 3600 * 1000, 5.0))
+            .unwrap();
         let removed = store.prune_metrics(24 * 3600).unwrap();
         assert_eq!(removed, 1);
         assert_eq!(store.query_metrics("n1", 10).unwrap().len(), 2);

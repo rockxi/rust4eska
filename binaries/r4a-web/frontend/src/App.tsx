@@ -13,6 +13,7 @@ import Updates from './pages/Updates';
 import Containers from './pages/Containers';
 import Connections from './pages/Connections';
 import Logs from './pages/Logs';
+import Registry from './pages/Registry';
 
 const queryClient = new QueryClient();
 
@@ -51,6 +52,7 @@ function App() {
               <Route path="containers" element={<Containers />} />
               <Route path="connections" element={<Connections />} />
               <Route path="logs" element={<Logs />} />
+              <Route path="registry" element={<Registry />} />
             </Route>
             
             <Route path="*" element={<Navigate to="/" replace />} />

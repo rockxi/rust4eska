@@ -45,7 +45,8 @@ TTL toDateTime(intDiv(ts_ms, 1000)) + INTERVAL 14 DAY";
 /// (CREATE TABLE IF NOT EXISTS не добавляет колонки/индексы к уже существующей таблице).
 pub const CH_ADD_LOGS_LINE_INDEX: &str =
     "ALTER TABLE r4a.logs ADD INDEX IF NOT EXISTS line_ngram line TYPE ngrambf_v1(3, 4096, 2, 0) GRANULARITY 4";
-pub const CH_MATERIALIZE_LOGS_LINE_INDEX: &str = "ALTER TABLE r4a.logs MATERIALIZE INDEX line_ngram";
+pub const CH_MATERIALIZE_LOGS_LINE_INDEX: &str =
+    "ALTER TABLE r4a.logs MATERIALIZE INDEX line_ngram";
 
 /// Точка истории метрик ноды (CPU/RAM/VRAM на момент времени).
 #[derive(Debug, Clone, Serialize, Deserialize)]

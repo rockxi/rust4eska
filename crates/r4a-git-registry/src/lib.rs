@@ -1,15 +1,16 @@
 use anyhow::{Context, Result};
+use r4a_store::Store;
 use std::path::{Path, PathBuf};
 
 pub mod handler;
+pub mod registry;
 
 /// Инициализировать bare-репозиторий если его ещё нет
 pub fn init_repo(path: &Path) -> Result<()> {
     if path.join("HEAD").exists() {
         return Ok(());
     }
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("create {}", path.display()))?;
+    std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
 
     let status = std::process::Command::new("git")
         .args(["init", "--bare", "--initial-branch=main"])
@@ -36,6 +37,23 @@ pub fn default_git_root() -> PathBuf {
     PathBuf::from(home).join(".r4a-server").join("git")
 }
 
+pub fn default_registry_root() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".r4a-server").join("registry")
+}
+
+#[derive(Clone)]
+pub struct RegistryState {
+    pub root: PathBuf,
+    pub store: Store,
+}
+
+impl RegistryState {
+    pub fn new(root: PathBuf, store: Store) -> Self {
+        Self { root, store }
+    }
+}
+
 pub fn list_files(repo_path: &Path, branch: &str, pattern: &str) -> Result<Vec<String>> {
     let out = std::process::Command::new("git")
         .args(["-C"])
@@ -54,7 +72,7 @@ pub fn list_files(repo_path: &Path, branch: &str, pattern: &str) -> Result<Vec<S
         .filter(|line| line.ends_with(pattern))
         .map(|s| s.to_string())
         .collect();
-    
+
     Ok(files)
 }
 
@@ -70,7 +88,13 @@ pub fn read_file(repo_path: &Path, branch: &str, file_path: &str) -> Result<Stri
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-pub fn write_and_commit_file(repo_path: &Path, branch: &str, file_path: &str, content: &str, commit_message: &str) -> Result<()> {
+pub fn write_and_commit_file(
+    repo_path: &Path,
+    branch: &str,
+    file_path: &str,
+    content: &str,
+    commit_message: &str,
+) -> Result<()> {
     let tmp_dir = tempfile::tempdir()?;
     let tmp_path = tmp_dir.path();
 
@@ -87,7 +111,7 @@ pub fn write_and_commit_file(repo_path: &Path, branch: &str, file_path: &str, co
         .current_dir(tmp_path)
         .args(["checkout", "-b", branch])
         .status();
-    
+
     let _ = std::process::Command::new("git")
         .current_dir(tmp_path)
         .args(["checkout", branch])
@@ -99,36 +123,55 @@ pub fn write_and_commit_file(repo_path: &Path, branch: &str, file_path: &str, co
     }
     std::fs::write(&file_full_path, content)?;
 
-    std::process::Command::new("git").current_dir(tmp_path).args(["config", "user.name", "r4a-web"]).status()?;
-    std::process::Command::new("git").current_dir(tmp_path).args(["config", "user.email", "r4a-web@master.local"]).status()?;
+    std::process::Command::new("git")
+        .current_dir(tmp_path)
+        .args(["config", "user.name", "r4a-web"])
+        .status()?;
+    std::process::Command::new("git")
+        .current_dir(tmp_path)
+        .args(["config", "user.email", "r4a-web@master.local"])
+        .status()?;
 
-    std::process::Command::new("git").current_dir(tmp_path).args(["add", file_path]).status()?;
-    let commit_status = std::process::Command::new("git").current_dir(tmp_path).args(["commit", "-m", commit_message]).status()?;
-    
+    std::process::Command::new("git")
+        .current_dir(tmp_path)
+        .args(["add", file_path])
+        .status()?;
+    let commit_status = std::process::Command::new("git")
+        .current_dir(tmp_path)
+        .args(["commit", "-m", commit_message])
+        .status()?;
+
     if commit_status.success() {
-        let push_status = std::process::Command::new("git").current_dir(tmp_path).args(["push", "origin", branch]).status()?;
+        let push_status = std::process::Command::new("git")
+            .current_dir(tmp_path)
+            .args(["push", "origin", branch])
+            .status()?;
         anyhow::ensure!(push_status.success(), "git push failed");
     }
 
     Ok(())
 }
 
-pub fn get_history(repo_path: &Path, branch: &str, file_path: Option<&str>) -> Result<Vec<r4a_core::models::CommitInfo>> {
+pub fn get_history(
+    repo_path: &Path,
+    branch: &str,
+    file_path: Option<&str>,
+) -> Result<Vec<r4a_core::models::CommitInfo>> {
     let mut cmd = std::process::Command::new("git");
     cmd.args(["-C"]);
     cmd.arg(repo_path);
     cmd.args(["log", branch, "--pretty=format:%H|%an|%ad|%s", "--date=iso"]);
-    
+
     if let Some(f) = file_path {
         cmd.arg("--");
         cmd.arg(f);
     }
-    
+
     let out = cmd.output()?;
     if !out.status.success() {
         return Ok(vec![]);
     }
-    
+
     let text = String::from_utf8_lossy(&out.stdout);
     let mut history = vec![];
     for line in text.lines() {
@@ -145,7 +188,12 @@ pub fn get_history(repo_path: &Path, branch: &str, file_path: Option<&str>) -> R
     Ok(history)
 }
 
-pub fn rollback_file(repo_path: &Path, branch: &str, file_path: &str, commit_hash: &str) -> Result<()> {
+pub fn rollback_file(
+    repo_path: &Path,
+    branch: &str,
+    file_path: &str,
+    commit_hash: &str,
+) -> Result<()> {
     let tmp_dir = tempfile::tempdir()?;
     let tmp_path = tmp_dir.path();
 
@@ -159,16 +207,28 @@ pub fn rollback_file(repo_path: &Path, branch: &str, file_path: &str, commit_has
         .current_dir(tmp_path)
         .args(["checkout", commit_hash, "--", file_path])
         .status()?;
-        
+
     anyhow::ensure!(checkout_status.success(), "git checkout failed");
 
-    std::process::Command::new("git").current_dir(tmp_path).args(["config", "user.name", "r4a-web"]).status()?;
-    std::process::Command::new("git").current_dir(tmp_path).args(["config", "user.email", "r4a-web@master.local"]).status()?;
+    std::process::Command::new("git")
+        .current_dir(tmp_path)
+        .args(["config", "user.name", "r4a-web"])
+        .status()?;
+    std::process::Command::new("git")
+        .current_dir(tmp_path)
+        .args(["config", "user.email", "r4a-web@master.local"])
+        .status()?;
 
     let commit_message = format!("Rollback {} to {}", file_path, commit_hash);
-    std::process::Command::new("git").current_dir(tmp_path).args(["commit", "-m", &commit_message]).status()?;
-    
-    let push_status = std::process::Command::new("git").current_dir(tmp_path).args(["push", "origin", branch]).status()?;
+    std::process::Command::new("git")
+        .current_dir(tmp_path)
+        .args(["commit", "-m", &commit_message])
+        .status()?;
+
+    let push_status = std::process::Command::new("git")
+        .current_dir(tmp_path)
+        .args(["push", "origin", branch])
+        .status()?;
     anyhow::ensure!(push_status.success(), "git push failed");
 
     Ok(())
