@@ -38,6 +38,12 @@ interface RegistryTagInfo {
     tag: string;
 }
 
+interface NodeInfo {
+    name: string;
+    ip: string;
+    role: string;
+}
+
 const emptyManifest = (): Manifest => ({
     app: { name: '', node_selector: '' },
     container: { image: '', restart: 'always', ports: [] },
@@ -73,6 +79,11 @@ const fetchRegistryImages = async (): Promise<string[]> => {
     return tagLists.flat().sort((a, b) => a.localeCompare(b));
 };
 
+const fetchNodes = async (): Promise<NodeInfo[]> => {
+    const response = await apiClient.get('/nodes');
+    return response.data;
+};
+
 const Manifests: React.FC = () => {
     const queryClient = useQueryClient();
     const [editing, setEditing] = useState<Manifest | null>(null);
@@ -88,6 +99,13 @@ const Manifests: React.FC = () => {
     const { data: registryImages } = useQuery({
         queryKey: ['registry-image-suggestions'],
         queryFn: fetchRegistryImages,
+        staleTime: 10000,
+        retry: false,
+    });
+
+    const { data: nodes } = useQuery({
+        queryKey: ['node-selector-suggestions'],
+        queryFn: fetchNodes,
         staleTime: 10000,
         retry: false,
     });
@@ -290,6 +308,21 @@ const Manifests: React.FC = () => {
                                         <label className="block text-xs text-gray-400 mb-1">
                                             node_selector <span className="text-red-400">*</span>
                                         </label>
+                                        <select
+                                            value=""
+                                            onChange={e => {
+                                                if (e.target.value) {
+                                                    updateField(['app', 'node_selector'], e.target.value);
+                                                }
+                                            }}
+                                            className="w-full bg-deep-dark border border-gray-700 rounded px-3 py-2 text-white text-sm font-mono focus:outline-none focus:border-accent-teal/50 mb-2"
+                                        >
+                                            <option value="">Select node...</option>
+                                            <option value="all">all</option>
+                                            {(nodes ?? []).map((node) => (
+                                                <option key={node.name} value={node.name}>{node.name}</option>
+                                            ))}
+                                        </select>
                                         <input
                                             type="text"
                                             value={editing.app.node_selector}
