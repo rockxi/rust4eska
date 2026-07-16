@@ -533,9 +533,28 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
     let git_root = r4a_git_registry::default_git_root();
 
     let saved_peers = load_peers(&store);
+    // Account for connection IPs too (pinned labels + active connections),
+    // otherwise a master restart could hand out an already-taken IP
+    let connection_ips: Vec<String> = store
+        .list_connections()
+        .map(|conns| conns.into_iter().map(|c| c.vpn_ip).collect())
+        .unwrap_or_default();
+    let label_ips: Vec<String> = store
+        .db
+        .open_tree("connection_labels")
+        .map(|tree| {
+            tree.iter()
+                .filter_map(|item| item.ok())
+                .map(|(_, v)| String::from_utf8_lossy(&v).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     let next_ip = saved_peers
         .values()
-        .filter_map(|p| p.ip.split('.').last()?.parse::<u16>().ok())
+        .map(|p| p.ip.as_str())
+        .chain(connection_ips.iter().map(String::as_str))
+        .chain(label_ips.iter().map(String::as_str))
+        .filter_map(|ip| ip.split('.').last()?.parse::<u16>().ok())
         .max()
         .map(|m| m + 1)
         .unwrap_or(2);
@@ -844,16 +863,23 @@ async fn start_server(identity: Identity, my_vpn_ip: String, store: Store) -> Re
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(|origin, _| {
+                    // Parse the Origin and match the host exactly — prefix checks
+                    // are bypassable (e.g. http://10.42.evil.com, http://localhost.evil.com)
                     let s = origin.to_str().unwrap_or("");
-                    s.starts_with("http://10.42.")
-                        || s.starts_with("https://10.42.")
-                        || s.starts_with("http://master.r4a.local")
-                        || s.starts_with("http://master.r4a.local")
-                        || s.starts_with("https://master.r4a.local")
-                        || s.starts_with("https://web.master.r4a.local")
-                        || s.starts_with("https://api.master.r4a.local")
-                        || s.starts_with("http://localhost")
-                        || s.starts_with("http://127.0.0.1")
+                    let rest = match s.split_once("://") {
+                        Some(("http", rest)) | Some(("https", rest)) => rest,
+                        _ => return false,
+                    };
+                    let host = rest.split(':').next().unwrap_or("");
+                    matches!(host,
+                        "master.r4a.local"
+                        | "web.master.r4a.local"
+                        | "api.master.r4a.local"
+                        | "localhost"
+                        | "127.0.0.1")
+                        || host
+                            .parse::<std::net::Ipv4Addr>()
+                            .is_ok_and(|ip| ip.octets()[0] == 10 && ip.octets()[1] == 42)
                 }))
                 .allow_methods(tower_http::cors::Any)
                 .allow_headers(vec![

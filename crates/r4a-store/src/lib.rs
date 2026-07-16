@@ -20,6 +20,8 @@ pub struct SyncRequest {
     pub tree: String,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
+    #[serde(default)]
+    pub delete: bool,
 }
 
 impl Store {
@@ -326,12 +328,16 @@ impl Store {
         tree.insert(key, value)?;
         self.db.flush_async().await?;
 
-        let req = SyncRequest {
+        self.broadcast_sync(SyncRequest {
             tree: tree_name.to_string(),
             key: key.to_vec(),
             value: value.to_vec(),
-        };
+            delete: false,
+        });
+        Ok(())
+    }
 
+    fn broadcast_sync(&self, req: SyncRequest) {
         let masters = self.masters.read().unwrap().clone();
         let secret = self.cluster_secret.read().unwrap().clone();
         for master_ip in masters {
@@ -353,7 +359,6 @@ impl Store {
                 }
             });
         }
-        Ok(())
     }
 
     pub fn get(&self, tree_name: &str, key: &[u8]) -> anyhow::Result<Option<sled::IVec>> {
@@ -365,6 +370,13 @@ impl Store {
         let tree = self.db.open_tree(tree_name)?;
         tree.remove(key)?;
         self.db.flush_async().await?;
+
+        self.broadcast_sync(SyncRequest {
+            tree: tree_name.to_string(),
+            key: key.to_vec(),
+            value: Vec::new(),
+            delete: true,
+        });
         Ok(())
     }
 
@@ -442,7 +454,11 @@ impl Store {
                     }
                     if let Some(ref names) = rule.resource_names {
                         if let Some(name) = resource_name {
-                            if names.iter().any(|n| name.starts_with(n.as_str()) || n == name) {
+                            // Exact match only; prefix match requires an explicit trailing '*'
+                            if names.iter().any(|n| match n.strip_suffix('*') {
+                                Some(prefix) => name.starts_with(prefix),
+                                None => n == name,
+                            }) {
                                 return true;
                             }
                         }
@@ -517,12 +533,8 @@ impl Store {
                                 resource_names.clear();
                                 break;
                             }
-                            if perm.ends_with('*') {
-                                let prefix = &perm[..perm.len() - 1];
-                                resource_names.push(prefix.to_string());
-                            } else {
-                                resource_names.push(perm.clone());
-                            }
+                            // Keep the trailing '*' — can() treats it as an explicit prefix match
+                            resource_names.push(perm.clone());
                         }
 
                         if resource_names.is_empty() || perms.contains(&"*".to_string()) || perms.contains(&"global/*".to_string()) {
@@ -666,7 +678,12 @@ async fn sync_handler(
                     return StatusCode::FORBIDDEN;
                 }
                 if let Ok(tree) = store.db.open_tree(&req.tree) {
-                    if let Err(e) = tree.insert(req.key, req.value) {
+                    let result = if req.delete {
+                        tree.remove(req.key).map(|_| ())
+                    } else {
+                        tree.insert(req.key, req.value).map(|_| ())
+                    };
+                    if let Err(e) = result {
                         error!("Sync write failed: {}", e);
                         return StatusCode::INTERNAL_SERVER_ERROR;
                     }
@@ -677,4 +694,52 @@ async fn sync_handler(
         }
     }
     StatusCode::UNAUTHORIZED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn store_with_names(names: Vec<String>) -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("db")).unwrap();
+        store
+            .put_policy(Policy {
+                id: "p1".to_string(),
+                rules: vec![Rule {
+                    verbs: vec![Verb::Get],
+                    resources: vec![Resource::Vault],
+                    resource_names: Some(names),
+                }],
+            })
+            .await
+            .unwrap();
+        store
+            .put_binding(Binding {
+                id: "b1".to_string(),
+                subject: "alice".to_string(),
+                policy_id: "p1".to_string(),
+            })
+            .await
+            .unwrap();
+        std::mem::forget(dir);
+        store
+    }
+
+    #[tokio::test]
+    async fn can_matches_resource_names_exactly() {
+        let store = store_with_names(vec!["db-pass".to_string()]).await;
+        assert!(store.can("alice", Verb::Get, Resource::Vault, Some("db-pass")));
+        // no implicit prefix match
+        assert!(!store.can("alice", Verb::Get, Resource::Vault, Some("db-pass-prod")));
+        assert!(!store.can("alice", Verb::Get, Resource::Vault, Some("db")));
+    }
+
+    #[tokio::test]
+    async fn can_matches_explicit_wildcard_prefix() {
+        let store = store_with_names(vec!["prod-*".to_string()]).await;
+        assert!(store.can("alice", Verb::Get, Resource::Vault, Some("prod-db")));
+        assert!(store.can("alice", Verb::Get, Resource::Vault, Some("prod-")));
+        assert!(!store.can("alice", Verb::Get, Resource::Vault, Some("staging-db")));
+    }
 }

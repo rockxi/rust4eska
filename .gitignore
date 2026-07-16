@@ -1,1 +1,18 @@
 target*
+.DS_Store
+**/.DS_Store
+
+# local AI-assistant scaffolding (symlinks to outside the repo)
+.memory
+AGENTS.md
+
+# local sync/test dirs
+remote_sync*
+sync_back
+
+# prebuilt binaries (distributed via GitHub Releases)
+r4a-*-x86_64-unknown-linux-musl
+r4a-*-aarch64-unknown-linux-musl
+
+# frontend
+binaries/r4a-web/frontend/node_modules
