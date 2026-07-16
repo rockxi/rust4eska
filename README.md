@@ -15,29 +15,9 @@ A lightweight, self-contained cluster management system written in Rust. One mas
 - **Dashboards** — terminal UI (`r4a-tui`) and a React Web UI (`r4a-web`).
 - **Cluster updates** — one keypress in the TUI updates signed binaries across the whole cluster.
 
-## First run: two machines over the internet
+## Installing binaries
 
-This is the fastest way to try r4a with a friend: one machine becomes the **master**, the other joins as an **agent** (or as a plain VPN client).
-
-### Prerequisites (both machines)
-
-- Linux x86_64 (binaries are static musl builds; macOS works for `r4a-cli connect` / TUI)
-- WireGuard support (any modern kernel) + `wireguard-tools`, `iproute2`, `iptables`
-- Docker — only needed on nodes that will run workloads
-- root access (VPN interface setup)
-
-On the **master**, these ports must be reachable from outside:
-
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| `51820` | UDP | WireGuard (must be open / port-forwarded — critical) |
-| `3501` | TCP | Control API (only `/` and `/api/join` are served to non-VPN IPs) |
-
-If the master is behind a home router, forward `51820/udp` (and `3501/tcp`) to it.
-
-### 1. Install binaries
-
-Download from [GitHub Releases](https://github.com/rockxi/rust4eska/releases) and install:
+Every role below starts by downloading the binaries it needs from [GitHub Releases](https://github.com/rockxi/rust4eska/releases), for Linux (x86_64, static musl) and macOS (x86_64 / arm64):
 
 ```bash
 case "$(uname -s)-$(uname -m)" in
@@ -53,12 +33,25 @@ done
 sudo install -m 755 r4a-server r4a-agent r4a-cli r4a-tui /usr/local/bin/
 ```
 
-(master needs `r4a-server`; the joining machine needs `r4a-agent` or `r4a-cli`.)
+You don't need all four binaries on every machine — see which ones each role below actually uses.
 
-### 2. Start the master
+General requirements (Linux and macOS): WireGuard support (any modern Linux kernel, or `wireguard-go` on macOS) + `wireguard-tools`, `iproute2`, `iptables` on Linux; root access (VPN interface setup); Docker only on nodes that will run workloads.
+
+## Setting up the master node
+
+The master runs `r4a-server`: it holds the WireGuard mesh (`10.42.0.0/16`), the control API, DNS for `*.r4a.local`, ingress and cluster state. Needs `r4a-server` (plus `r4a-cli` / `r4a-tui` for management) from [Installing binaries](#installing-binaries).
+
+These ports must be reachable from outside the master:
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| `51820` | UDP | WireGuard (must be open / port-forwarded — critical) |
+| `3501` | TCP | Control API (only `/` and `/api/join` are served to non-VPN IPs) |
+
+If the master is behind a home router, forward `51820/udp` (and `3501/tcp`) to it. Allow the same ports through `iptables`/`ufw`/`firewalld` on Linux, or through Firewall in System Settings on macOS, if enabled.
 
 ```bash
-export R4A_SECRET=$(openssl rand -hex 16)         # cluster join secret — share it with your friend
+export R4A_SECRET=$(openssl rand -hex 16)         # cluster join secret — share it with agents/clients
 export R4A_ADMIN_SECRET=$(openssl rand -hex 16)   # admin secret — for CLI/TUI/Web UI management (keep private)
 echo "cluster secret: $R4A_SECRET"; echo "admin secret: $R4A_ADMIN_SECRET"
 
@@ -66,26 +59,42 @@ echo "cluster secret: $R4A_SECRET"; echo "admin secret: $R4A_ADMIN_SECRET"
 export R4A_PUBLIC_ENDPOINT=<your-public-ip>:51820
 
 sudo -E r4a-server init          # foreground, good for the first test
-# or install as a systemd/launchd service:
+# or install as a systemd (Linux) / launchd (macOS) service, using the same env vars:
 sudo -E r4a-server service enable
 ```
 
 The master takes VPN IP `10.42.0.1`. State lives in `~/.r4a-server/`.
 
-### 3. Join from the second machine
+Verify:
 
-As a **full agent** (can run workloads):
+```bash
+r4a-cli --master http://10.42.0.1:3501 --secret <admin-secret> nodes list
+R4A_MASTER=http://10.42.0.1:3501 R4A_SECRET=<admin-secret> r4a-tui   # dashboard; "P2P" column shows direct links
+```
+
+## Setting up an agent node
+
+An agent joins an existing master and can run workloads (Docker containers reconciled from TOML manifests). Needs `r4a-agent` (plus Docker) from [Installing binaries](#installing-binaries), and a master already running.
 
 ```bash
 sudo r4a-agent connect \
   --master http://<master-public-ip>:3501 \
   --secret <cluster-secret> \
   --name friend1
-# permanent (systemd/launchd service):
+# permanent (systemd on Linux / launchd on macOS):
 sudo r4a-agent service enable --master http://<master-public-ip>:3501 --secret <cluster-secret> --name friend1
 ```
 
-Or as a **VPN client only** (access the cluster, run nothing):
+Verify (from the agent, or from any machine already on the VPN):
+
+```bash
+ping 10.42.0.1                      # master over VPN
+r4a-cli --master http://10.42.0.1:3501 --secret <admin-secret> nodes list   # agent should be listed
+```
+
+## Connecting as a VPN client only
+
+Use this if you just want access to an existing cluster (ping nodes, reach `*.r4a.local`, use the API/TUI) without running any workloads. Needs only `r4a-cli` (add `r4a-tui` for the dashboard) from [Installing binaries](#installing-binaries), and a master already running.
 
 ```bash
 export R4A_MASTER=http://<master-public-ip>:3501
@@ -94,23 +103,32 @@ sudo -E r4a-cli connect up --label my-laptop
 r4a-cli connect status
 ```
 
-### 4. Verify
+Verify:
 
 ```bash
-# on any connected machine:
 ping 10.42.0.1                      # master over VPN
-# management commands use the ADMIN secret (not the cluster secret):
 r4a-cli --master http://10.42.0.1:3501 --secret <admin-secret> nodes list
-R4A_MASTER=http://10.42.0.1:3501 R4A_SECRET=<admin-secret> r4a-tui   # dashboard; "P2P" column shows direct links
 ```
 
-Web UI (optional, run on the master): `r4a-web --port 3502` → `http://10.42.0.1:3502`.
+Disconnect: `r4a-cli connect down` (or `r4a-cli connect cleanup` if something is left over after a failed disconnect).
 
 If something breaks, see [Troubleshooting](#troubleshooting).
 
-## Deploying a workload
+## Deploying the frontend and workloads
 
-Workloads are described by TOML manifests (see `postgres.toml` for an example) and reconciled into Docker containers on the agents. Create/edit manifests in the **Web UI** or **TUI**, or via the API:
+### Web UI
+
+Run on the master (Linux or macOS):
+
+```bash
+r4a-web --port 3502
+```
+
+Open `http://10.42.0.1:3502` and log in with the admin secret. Use it to create/edit workload manifests visually, or manage nodes, secrets and RBAC.
+
+### Deploying a workload via the API
+
+Workloads are described by TOML manifests (see `postgres.toml` for an example) and reconciled into Docker containers on the agents.
 
 ```bash
 # exchange the admin secret for a bearer token, then POST the manifest:
